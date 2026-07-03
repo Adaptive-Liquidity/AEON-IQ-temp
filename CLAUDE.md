@@ -11,14 +11,14 @@ cargo build                        # debug build
 cargo build --release              # production build
 
 # Unit tests only (no database required)
-cargo test -- --skip memory::store::tests
+cargo test -- --skip memory::store::tests --skip rmk_worker::tests
 
 # All tests including DB integration tests (requires DATABASE_URL → pgvector Postgres)
 # Run `docker compose up postgres` first, then:
 cargo test
 ```
 
-The 4 integration tests in `src/memory/store.rs` (marked `#[sqlx::test]`) each create an isolated test database, run all migrations, execute the test, then drop the database. They need a Postgres instance with pgvector installed and a user with `CREATEDB` privilege — the `docker compose up postgres` service satisfies this. They will panic with "DATABASE_URL must be set" if no database is available, which is expected in environments without Postgres.
+The `#[sqlx::test]` integration tests (in `src/memory/store.rs` and `src/rmk_worker.rs`) each create an isolated test database, run all migrations, execute the test, then drop the database. They need a Postgres instance with pgvector installed and a user with `CREATEDB` privilege — the `docker compose up postgres` service satisfies this. They will panic with "DATABASE_URL must be set" if no database is available, which is expected in environments without Postgres.
 
 ### Full stack (Docker)
 ```bash

@@ -65,6 +65,7 @@ subtle = "2"
 
 # SHA-256 for query hashing in retrieval logs
 sha2 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex  = "0.4"
 
 [dev-dependencies]

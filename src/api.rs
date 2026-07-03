@@ -446,6 +446,11 @@ pub struct MemorySearchResponse {
     pub results: Vec<SearchResult>,
     pub relations: Vec<RelationDto>,
     pub total: usize,
+    /// Ed25519 counter-signature over the served hit set (agent, session
+    /// filter, hit IDs, hit content digests).  Lets callers — notably the
+    /// Nexus hypervisor — verify the hits were not altered in transit before
+    /// reporting Attested* memory-evidence modes.
+    pub evidence: crate::attestation::EvidenceEnvelope,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -852,7 +857,7 @@ pub async fn search_memories_semantic(
     };
 
     let total = rows.len();
-    let results = rows
+    let results: Vec<SearchResult> = rows
         .into_iter()
         .map(|r| SearchResult {
             id: r.id.to_string(),
@@ -867,11 +872,46 @@ pub async fn search_memories_semantic(
         })
         .collect();
 
+    // Counter-sign exactly what is being served (see attestation.rs).
+    let payload = crate::attestation::EvidencePayload::new(
+        &req.agent_id,
+        req.session_id.as_deref(),
+        results.iter().map(|r| (r.id.clone(), r.content.clone())),
+    );
+    let evidence = state.evidence_signer.sign(&payload).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Evidence signing: {}", e),
+        )
+    })?;
+
     Ok(Json(MemorySearchResponse {
         results,
         relations,
         total,
+        evidence,
     }))
+}
+
+#[derive(Serialize)]
+pub struct VerifyingKeyResponse {
+    pub version: String,
+    pub key_id: String,
+    /// False when the key is ephemeral (AEON_EVIDENCE_SIGNING_KEY unset) —
+    /// verifiers must not pin an ephemeral key.
+    pub persistent: bool,
+}
+
+/// Expose the evidence-signature verifying key so operators can provision
+/// Nexus (`NEXUS_AEON_VERIFYING_KEY`) and doctor scripts can cross-check it.
+pub async fn get_evidence_verifying_key(
+    State(state): State<AppState>,
+) -> Json<VerifyingKeyResponse> {
+    Json(VerifyingKeyResponse {
+        version: crate::attestation::EVIDENCE_SIG_VERSION.to_string(),
+        key_id: state.evidence_signer.key_id().to_string(),
+        persistent: state.evidence_signer.persistent,
+    })
 }
 
 pub async fn get_stats(

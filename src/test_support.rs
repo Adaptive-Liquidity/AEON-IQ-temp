@@ -52,6 +52,7 @@ pub fn test_state(pool: sqlx::PgPool) -> AppState {
             rmk_config: crate::memory::rmk::config::RmkConfig::default(),
         }),
         db: pool,
+        evidence_signer: Arc::new(crate::attestation::EvidenceSigner::from_env().unwrap()),
         http_client: reqwest::Client::new(),
         metrics: Arc::new(Metrics::new().unwrap()),
         provider: Provider::OpenAI,
