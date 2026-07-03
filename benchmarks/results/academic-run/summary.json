@@ -1,0 +1,621 @@
+{
+  "artifacts": {
+    "k6": {
+      "optional": true,
+      "reason": "k6 artifacts were not produced",
+      "status": "not_run"
+    },
+    "latency": {
+      "proxy_latency": [
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 2.915,
+          "mean_ms": 0.51,
+          "min_ms": 0.348,
+          "p50_ms": 0.536,
+          "p90_ms": 0.616,
+          "p95_ms": 0.65,
+          "p99_ms": 0.778,
+          "request_count": 200,
+          "scenario": "direct_mock_upstream"
+        },
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 121.779,
+          "mean_ms": 5.614,
+          "mean_overhead_vs_direct_ms": 5.104,
+          "min_ms": 2.686,
+          "p50_ms": 3.394,
+          "p90_ms": 4.954,
+          "p95_ms": 6.175,
+          "p95_overhead_vs_direct_ms": 5.525,
+          "p99_ms": 101.897,
+          "request_count": 200,
+          "scenario": "proxy_empty_memory"
+        },
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 3023.392,
+          "mean_ms": 56.111,
+          "mean_overhead_vs_direct_ms": 55.601,
+          "min_ms": 5.181,
+          "p50_ms": 10.078,
+          "p90_ms": 19.769,
+          "p95_ms": 29.478,
+          "p95_overhead_vs_direct_ms": 28.828,
+          "p99_ms": 1030.844,
+          "request_count": 200,
+          "scenario": "proxy_seeded_memory"
+        },
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 18.897,
+          "mean_candidate_count": 5.0,
+          "mean_injected_count": 5.0,
+          "mean_ms": 9.932,
+          "mean_overhead_vs_direct_ms": 9.422,
+          "min_ms": 4.855,
+          "p50_ms": 9.621,
+          "p90_ms": 12.65,
+          "p95_ms": 14.301,
+          "p95_overhead_vs_direct_ms": 13.651,
+          "p99_ms": 17.543,
+          "request_count": 66,
+          "retrieval_log": {
+            "error_count": 0,
+            "error_rate": 0.0,
+            "max_ms": 10.0,
+            "mean_ms": 4.5,
+            "min_ms": 2.0,
+            "p50_ms": 4.0,
+            "p90_ms": 7.0,
+            "p95_ms": 7.75,
+            "p99_ms": 10.0,
+            "request_count": 66
+          },
+          "scenario": "proxy_seeded_with_retrieval_log"
+        }
+      ],
+      "retrieval_latency": [
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 4.041,
+          "mean_ms": 2.917,
+          "mean_result_count": 5.0,
+          "min_ms": 2.544,
+          "p50_ms": 2.847,
+          "p90_ms": 3.25,
+          "p95_ms": 3.347,
+          "p99_ms": 3.514,
+          "request_count": 100,
+          "scenario": "retrieval_search_100",
+          "seed_memory_count": 100
+        },
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 51.691,
+          "mean_ms": 11.407,
+          "mean_result_count": 5.0,
+          "min_ms": 9.852,
+          "p50_ms": 10.716,
+          "p90_ms": 11.863,
+          "p95_ms": 13.83,
+          "p99_ms": 17.933,
+          "request_count": 100,
+          "scenario": "retrieval_search_1000",
+          "seed_memory_count": 1000
+        },
+        {
+          "error_count": 0,
+          "error_rate": 0.0,
+          "max_ms": 128.638,
+          "mean_ms": 96.443,
+          "mean_result_count": 5.0,
+          "min_ms": 91.26,
+          "p50_ms": 95.069,
+          "p90_ms": 101.113,
+          "p95_ms": 101.715,
+          "p99_ms": 123.707,
+          "request_count": 50,
+          "scenario": "retrieval_search_10000",
+          "seed_memory_count": 10000
+        }
+      ],
+      "status": "ok"
+    },
+    "narrative_archival": {
+      "agent_id": "bench-archival",
+      "batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+      "checks": {
+        "batch_record_completed": true,
+        "has_l3_narrative_memory": true,
+        "narrative_count_is_one": true,
+        "narrative_has_version_entry": true,
+        "same_archival_batch_linkage": true,
+        "source_l2_memories_tombstoned": true,
+        "trigger_http_ok": true,
+        "trigger_not_skipped": true
+      },
+      "details": {
+        "batch": {
+          "l3_count": 4,
+          "source_count": 12,
+          "status": "completed"
+        },
+        "l2_source_count": 12,
+        "l3_memory_count": 4,
+        "narrative_memory": [
+          {
+            "archival_batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+            "archived_at": null,
+            "content": "Mira's Nimbus work repeatedly emphasized Rust service design, weekly planning, and auditable memory history. The archived material forms one cohesive benchmark storyline.",
+            "id": "9d23b6a3-2cbc-4d44-84dc-b6543e521429",
+            "memory_type": "narrative",
+            "tier": "L3"
+          }
+        ],
+        "narrative_version_count": 1,
+        "trigger_response": {
+          "batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+          "l3_count": 3,
+          "narrative_count": 1,
+          "source_count": 12,
+          "status": "completed"
+        }
+      },
+      "status": "pass"
+    },
+    "recall_quality": {
+      "method": "Search/retrieval-log IDs are compared to deterministic seeded labels; LLM answer text is ignored.",
+      "rows": [
+        {
+          "expected_id": "50fbede0-94ea-474b-a245-8d4a9d8b436c",
+          "expected_label": "favorite_language",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Which language does the benchmark user prefer for backend service architecture?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 5,
+          "status_code": 200,
+          "top_result_id": "50fbede0-94ea-474b-a245-8d4a9d8b436c"
+        },
+        {
+          "expected_id": "50fbede0-94ea-474b-a245-8d4a9d8b436c",
+          "expected_label": "favorite_language",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the user's Rust backend preference.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 4,
+          "status_code": 200,
+          "top_result_id": "50fbede0-94ea-474b-a245-8d4a9d8b436c"
+        },
+        {
+          "expected_id": "7352988a-6548-4648-82ea-e2ee75437221",
+          "expected_label": "planning_cadence",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "When are Nimbus planning reviews scheduled?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 3,
+          "status_code": 200,
+          "top_result_id": "7352988a-6548-4648-82ea-e2ee75437221"
+        },
+        {
+          "expected_id": "7352988a-6548-4648-82ea-e2ee75437221",
+          "expected_label": "planning_cadence",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the Wednesday morning Nimbus planning cadence.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 3,
+          "status_code": 200,
+          "top_result_id": "7352988a-6548-4648-82ea-e2ee75437221"
+        },
+        {
+          "expected_id": "9c4d8e1b-d74b-4540-bf29-980d308f1054",
+          "expected_label": "database_choice",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Which database stores Nimbus vector memories?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 4,
+          "status_code": 200,
+          "top_result_id": "9c4d8e1b-d74b-4540-bf29-980d308f1054"
+        },
+        {
+          "expected_id": "9c4d8e1b-d74b-4540-bf29-980d308f1054",
+          "expected_label": "database_choice",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the Postgres pgvector choice.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 1,
+          "status_code": 200,
+          "top_result_id": "9c4d8e1b-d74b-4540-bf29-980d308f1054"
+        },
+        {
+          "expected_id": "dcf524ae-0e98-4437-8853-d43686a6348d",
+          "expected_label": "security_requirement",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "What is required before memory deletion workflows ship?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 1,
+          "status_code": 200,
+          "top_result_id": "dcf524ae-0e98-4437-8853-d43686a6348d"
+        },
+        {
+          "expected_id": "dcf524ae-0e98-4437-8853-d43686a6348d",
+          "expected_label": "security_requirement",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the audit trail deletion requirement.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 1,
+          "status_code": 200,
+          "top_result_id": "dcf524ae-0e98-4437-8853-d43686a6348d"
+        },
+        {
+          "expected_id": "69be8cf1-3553-4955-bdd3-ef254d108284",
+          "expected_label": "ui_preference",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "What dashboard style does the benchmark user prefer?",
+          "recall_at_1": false,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 5,
+          "status_code": 200,
+          "top_result_id": "50fbede0-94ea-474b-a245-8d4a9d8b436c"
+        },
+        {
+          "expected_id": "69be8cf1-3553-4955-bdd3-ef254d108284",
+          "expected_label": "ui_preference",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the dense restrained operator dashboard preference.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 2,
+          "status_code": 200,
+          "top_result_id": "69be8cf1-3553-4955-bdd3-ef254d108284"
+        },
+        {
+          "expected_id": "d1dffc4f-636b-44f5-a718-c3c9b1d11445",
+          "expected_label": "cost_policy",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "When may Nimbus benchmark runs use live provider calls?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 5,
+          "status_code": 200,
+          "top_result_id": "d1dffc4f-636b-44f5-a718-c3c9b1d11445"
+        },
+        {
+          "expected_id": "d1dffc4f-636b-44f5-a718-c3c9b1d11445",
+          "expected_label": "cost_policy",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the live provider opt-in policy.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 1,
+          "status_code": 200,
+          "top_result_id": "d1dffc4f-636b-44f5-a718-c3c9b1d11445"
+        },
+        {
+          "expected_id": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44",
+          "expected_label": "archival_goal",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "What must narrative archival proof verify?",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 2,
+          "status_code": 200,
+          "top_result_id": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44"
+        },
+        {
+          "expected_id": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44",
+          "expected_label": "archival_goal",
+          "injected_expected_memory": true,
+          "precision_at_5": 0.2,
+          "query": "Recall the L3 narrative batch linkage requirement.",
+          "recall_at_1": true,
+          "recall_at_3": true,
+          "recall_at_5": true,
+          "result_count": 1,
+          "status_code": 200,
+          "top_result_id": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44"
+        }
+      ],
+      "status": "ok",
+      "summary": {
+        "injected_expected_memory_rate": 1.0,
+        "precision_at_5": 0.2,
+        "queries": 14,
+        "recall_at_1": 0.9286,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0
+      }
+    },
+    "seed": {
+      "agents": {
+        "bench-archival": {
+          "memory_count": 12
+        },
+        "bench-latency-empty": {
+          "memory_count": 0
+        },
+        "bench-latency-seeded": {
+          "memory_count": 100
+        },
+        "bench-recall": {
+          "memory_count": 7
+        },
+        "bench-retrieval-100": {
+          "memory_count": 100
+        },
+        "bench-retrieval-1000": {
+          "memory_count": 1000
+        },
+        "bench-retrieval-10000": {
+          "memory_count": 10000
+        }
+      },
+      "generated_at": "2026-07-03T05:50:38.574142Z",
+      "labels": {
+        "archival_goal": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44",
+        "cost_policy": "d1dffc4f-636b-44f5-a718-c3c9b1d11445",
+        "database_choice": "9c4d8e1b-d74b-4540-bf29-980d308f1054",
+        "favorite_language": "50fbede0-94ea-474b-a245-8d4a9d8b436c",
+        "planning_cadence": "7352988a-6548-4648-82ea-e2ee75437221",
+        "security_requirement": "dcf524ae-0e98-4437-8853-d43686a6348d",
+        "ui_preference": "69be8cf1-3553-4955-bdd3-ef254d108284"
+      },
+      "seed_memory_counts": [
+        100,
+        1000,
+        10000
+      ],
+      "status": "ok"
+    },
+    "temporal_correctness": {
+      "agent_id": "bench-temporal",
+      "checks": {
+        "archive_http_ok": true,
+        "create_http_ok": true,
+        "diff_reports_added": true,
+        "diff_reports_archived": true,
+        "diff_reports_modified": true,
+        "diff_reports_status_changed": true,
+        "patch_http_ok": true,
+        "snapshot_after_archive_excludes_memory": true,
+        "snapshot_after_creation_includes_v1": true,
+        "snapshot_after_status_records_candidate": true,
+        "snapshot_after_update_includes_latest_version": true,
+        "snapshot_before_creation_excludes_memory": true,
+        "status_http_ok": true,
+        "versions_include_initial_patch_status": true
+      },
+      "memory_id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+      "response_excerpts": {
+        "after_archive": [],
+        "after_create": [
+          {
+            "confidence": 1.0,
+            "content": "Temporal benchmark fact v1: Nimbus stores memories in Postgres.",
+            "created_at": "2026-07-03T05:55:20.507093+00:00",
+            "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+            "importance_score": 1.0,
+            "importance_source": "user_stated",
+            "memory_type": "semantic",
+            "provenance": "user_stated",
+            "sensitivity": "unknown",
+            "source_turn": null,
+            "status": "active",
+            "valid_from": null,
+            "valid_to": null,
+            "version_created_at": "2026-07-03T05:55:20.507093+00:00",
+            "version_number": 1
+          }
+        ],
+        "after_update": [
+          {
+            "confidence": 1.0,
+            "content": "Temporal benchmark fact v2: Nimbus stores vector memories in Postgres with pgvector.",
+            "created_at": "2026-07-03T05:55:20.507093+00:00",
+            "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+            "importance_score": 1.0,
+            "importance_source": "user_stated",
+            "memory_type": "semantic",
+            "provenance": "user_stated",
+            "sensitivity": "unknown",
+            "source_turn": null,
+            "status": "active",
+            "valid_from": null,
+            "valid_to": null,
+            "version_created_at": "2026-07-03T05:55:21.745336+00:00",
+            "version_number": 2
+          }
+        ],
+        "archive_response": {
+          "body": {
+            "affected": 1
+          },
+          "status": 200
+        },
+        "create_response": {
+          "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+          "success": true
+        },
+        "diff_added_summary": {
+          "added": 1,
+          "archived": 0,
+          "modified": 0,
+          "status_changed": 0,
+          "total_retrievals": 0,
+          "unique_memories_recalled": 0
+        },
+        "diff_archived_summary": {
+          "added": 0,
+          "archived": 1,
+          "modified": 0,
+          "status_changed": 0,
+          "total_retrievals": 0,
+          "unique_memories_recalled": 0
+        },
+        "diff_modified_summary": {
+          "added": 0,
+          "archived": 0,
+          "modified": 1,
+          "status_changed": 0,
+          "total_retrievals": 0,
+          "unique_memories_recalled": 0
+        },
+        "diff_status_summary": {
+          "added": 0,
+          "archived": 0,
+          "modified": 0,
+          "status_changed": 1,
+          "total_retrievals": 0,
+          "unique_memories_recalled": 0
+        },
+        "patch_response": {
+          "body": {
+            "updated": true
+          },
+          "status": 200
+        },
+        "status_response": {
+          "body": {
+            "status": "candidate",
+            "updated": true
+          },
+          "status": 200
+        },
+        "versions_total": 3
+      },
+      "status": "pass",
+      "timestamps": {
+        "archived": "2026-07-03T05:55:25.081180Z",
+        "before": "2026-07-03T05:55:20.099182Z",
+        "created": "2026-07-03T05:55:21.621284Z",
+        "status": "2026-07-03T05:55:23.973318Z",
+        "updated": "2026-07-03T05:55:22.861307Z"
+      }
+    },
+    "token_savings": {
+      "method": "cl100k_base tokenizer; estimated prompt token reduction on benchmark dataset",
+      "rows": [
+        {
+          "aeon_iq_tokens": 46,
+          "aeon_uses_more_tokens": false,
+          "baseline_tokens": 73,
+          "delta": 27,
+          "injected_memory_tokens": 10,
+          "percent_savings": 36.99,
+          "scenario": "profile_recall"
+        },
+        {
+          "aeon_iq_tokens": 47,
+          "aeon_uses_more_tokens": false,
+          "baseline_tokens": 61,
+          "delta": 14,
+          "injected_memory_tokens": 14,
+          "percent_savings": 22.95,
+          "scenario": "archival_question"
+        },
+        {
+          "aeon_iq_tokens": 53,
+          "aeon_uses_more_tokens": true,
+          "baseline_tokens": 16,
+          "delta": -37,
+          "injected_memory_tokens": 26,
+          "percent_savings": -231.25,
+          "scenario": "small_context_overhead"
+        }
+      ],
+      "status": "ok"
+    }
+  },
+  "dependency_gated_artifacts": [
+    "seed",
+    "token_savings",
+    "recall_quality",
+    "narrative_archival"
+  ],
+  "environment": {
+    "aeon_base_url": "http://localhost:8080",
+    "amp_enabled": "false",
+    "cpu": "x86_64",
+    "docker_compose_version": "Docker Compose version v5.1.1",
+    "docker_version": "Docker version 29.3.1, build c2be9cc",
+    "generated_at": "2026-07-03T06:02:55.209893Z",
+    "git_commit": "852f7cb634aac8261a2d0915c7edf7a1f465a640",
+    "mock_base_url": "http://localhost:11435",
+    "os": "Linux-6.18.5-x86_64-with-glibc2.39",
+    "postgres_image": "pgvector/pgvector:pg16",
+    "python": "3.11.15",
+    "ram": "15Gi",
+    "rmk_enabled": "false",
+    "seed_memory_counts": [
+      100,
+      1000,
+      10000
+    ],
+    "upstream_mode": "mock"
+  },
+  "failures": [],
+  "not_run": [],
+  "notes": [
+    "Results are benchmark-dataset specific and should not be generalized without fresh runs.",
+    "Primary latency baseline is the deterministic mock upstream.",
+    "Generated raw result folders are intentionally ignored by git."
+  ],
+  "optional_artifacts": [
+    "k6"
+  ],
+  "optional_failures": [],
+  "optional_not_run": [
+    {
+      "artifact": "k6",
+      "reason": "k6 artifacts were not produced"
+    }
+  ],
+  "overall_status": "pass_with_skips",
+  "proof_status": "pass",
+  "required_artifacts": [
+    "latency",
+    "temporal_correctness"
+  ],
+  "status": "pass_with_skips"
+}

@@ -1,0 +1,5 @@
+scenario,request_count,error_count,error_rate,p50_ms,p90_ms,p95_ms,p99_ms,mean_ms,min_ms,max_ms,mean_overhead_vs_direct_ms,p95_overhead_vs_direct_ms
+direct_mock_upstream,200,0,0.0,0.536,0.616,0.65,0.778,0.51,0.348,2.915,,
+proxy_empty_memory,200,0,0.0,3.394,4.954,6.175,101.897,5.614,2.686,121.779,5.104,5.525
+proxy_seeded_memory,200,0,0.0,10.078,19.769,29.478,1030.844,56.111,5.181,3023.392,55.601,28.828
+proxy_seeded_with_retrieval_log,66,0,0.0,9.621,12.65,14.301,17.543,9.932,4.855,18.897,9.422,13.651

@@ -1,0 +1,15 @@
+query,expected_label,expected_id,top_result_id,recall_at_1,recall_at_3,recall_at_5,precision_at_5,injected_expected_memory,result_count,status_code
+Which language does the benchmark user prefer for backend service architecture?,favorite_language,50fbede0-94ea-474b-a245-8d4a9d8b436c,50fbede0-94ea-474b-a245-8d4a9d8b436c,True,True,True,0.2,True,5,200
+Recall the user's Rust backend preference.,favorite_language,50fbede0-94ea-474b-a245-8d4a9d8b436c,50fbede0-94ea-474b-a245-8d4a9d8b436c,True,True,True,0.2,True,4,200
+When are Nimbus planning reviews scheduled?,planning_cadence,7352988a-6548-4648-82ea-e2ee75437221,7352988a-6548-4648-82ea-e2ee75437221,True,True,True,0.2,True,3,200
+Recall the Wednesday morning Nimbus planning cadence.,planning_cadence,7352988a-6548-4648-82ea-e2ee75437221,7352988a-6548-4648-82ea-e2ee75437221,True,True,True,0.2,True,3,200
+Which database stores Nimbus vector memories?,database_choice,9c4d8e1b-d74b-4540-bf29-980d308f1054,9c4d8e1b-d74b-4540-bf29-980d308f1054,True,True,True,0.2,True,4,200
+Recall the Postgres pgvector choice.,database_choice,9c4d8e1b-d74b-4540-bf29-980d308f1054,9c4d8e1b-d74b-4540-bf29-980d308f1054,True,True,True,0.2,True,1,200
+What is required before memory deletion workflows ship?,security_requirement,dcf524ae-0e98-4437-8853-d43686a6348d,dcf524ae-0e98-4437-8853-d43686a6348d,True,True,True,0.2,True,1,200
+Recall the audit trail deletion requirement.,security_requirement,dcf524ae-0e98-4437-8853-d43686a6348d,dcf524ae-0e98-4437-8853-d43686a6348d,True,True,True,0.2,True,1,200
+What dashboard style does the benchmark user prefer?,ui_preference,69be8cf1-3553-4955-bdd3-ef254d108284,50fbede0-94ea-474b-a245-8d4a9d8b436c,False,True,True,0.2,True,5,200
+Recall the dense restrained operator dashboard preference.,ui_preference,69be8cf1-3553-4955-bdd3-ef254d108284,69be8cf1-3553-4955-bdd3-ef254d108284,True,True,True,0.2,True,2,200
+When may Nimbus benchmark runs use live provider calls?,cost_policy,d1dffc4f-636b-44f5-a718-c3c9b1d11445,d1dffc4f-636b-44f5-a718-c3c9b1d11445,True,True,True,0.2,True,5,200
+Recall the live provider opt-in policy.,cost_policy,d1dffc4f-636b-44f5-a718-c3c9b1d11445,d1dffc4f-636b-44f5-a718-c3c9b1d11445,True,True,True,0.2,True,1,200
+What must narrative archival proof verify?,archival_goal,f64077b9-3de3-4f40-97ca-0c4bfc96ff44,f64077b9-3de3-4f40-97ca-0c4bfc96ff44,True,True,True,0.2,True,2,200
+Recall the L3 narrative batch linkage requirement.,archival_goal,f64077b9-3de3-4f40-97ca-0c4bfc96ff44,f64077b9-3de3-4f40-97ca-0c4bfc96ff44,True,True,True,0.2,True,1,200

@@ -1,0 +1,21 @@
+{
+  "aeon_base_url": "http://localhost:8080",
+  "amp_enabled": "false",
+  "cpu": "x86_64",
+  "docker_compose_version": "Docker Compose version v5.1.1",
+  "docker_version": "Docker version 29.3.1, build c2be9cc",
+  "generated_at": "2026-07-03T06:02:55.209893Z",
+  "git_commit": "852f7cb634aac8261a2d0915c7edf7a1f465a640",
+  "mock_base_url": "http://localhost:11435",
+  "os": "Linux-6.18.5-x86_64-with-glibc2.39",
+  "postgres_image": "pgvector/pgvector:pg16",
+  "python": "3.11.15",
+  "ram": "15Gi",
+  "rmk_enabled": "false",
+  "seed_memory_counts": [
+    100,
+    1000,
+    10000
+  ],
+  "upstream_mode": "mock"
+}

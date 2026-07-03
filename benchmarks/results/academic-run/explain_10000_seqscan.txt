@@ -1,0 +1,26 @@
+                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                              
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit (actual rows=5 loops=1)
+   InitPlan 1 (returns $0)
+     ->  Limit (actual rows=1 loops=1)
+           ->  Seq Scan on memories memories_1 (actual rows=1 loops=1)
+                 Filter: (agent_id = 'bench-retrieval-10000'::text)
+                 Rows Removed by Filter: 1046
+   InitPlan 2 (returns $1)
+     ->  Limit (actual rows=1 loops=1)
+           ->  Seq Scan on memories memories_2 (actual rows=1 loops=1)
+                 Filter: (agent_id = 'bench-retrieval-10000'::text)
+                 Rows Removed by Filter: 1046
+   ->  Sort (actual rows=5 loops=1)
+         Sort Key: ((((memories.embedding <=> $0) * (exp((0.0 * (EXTRACT(epoch FROM (now() - COALESCE(memories.last_accessed_at, memories.created_at))) / 86400.0))))::double precision) * ('1'::double precision + ('0'::double precision * ('1'::double precision - (memories.importance_score)::double precision)))))
+         Sort Method: top-N heapsort  Memory: 25kB
+         ->  Bitmap Heap Scan on memories (actual rows=10000 loops=1)
+               Recheck Cond: (agent_id = 'bench-retrieval-10000'::text)
+               Filter: ((archived_at IS NULL) AND (NOT soft_evicted) AND (status = 'active'::text) AND ((((embedding <=> $1) * (exp((0.0 * (EXTRACT(epoch FROM (now() - COALESCE(last_accessed_at, created_at))) / 86400.0))))::double precision) * ('1'::double precision + ('0'::double precision * ('1'::double precision - (importance_score)::double precision)))) < '0.95'::double precision))
+               Heap Blocks: exact=436
+               ->  Bitmap Index Scan on idx_memories_agent_id (actual rows=10000 loops=1)
+                     Index Cond: (agent_id = 'bench-retrieval-10000'::text)
+ Planning Time: 1.679 ms
+ Execution Time: 188.642 ms
+(22 rows)
+

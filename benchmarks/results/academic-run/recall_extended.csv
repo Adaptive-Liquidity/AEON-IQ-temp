@@ -1,0 +1,361 @@
+label,cluster,query_type,query,rank,recall_at_1,recall_at_3,recall_at_5,recall_at_10,reciprocal_rank,ndcg_at_10,precision_at_5,result_count,latency_ms,status_code
+deployment_0,deployment,full_paraphrase,Which region cluster does the Zephyr service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,11.365,200
+deployment_0,deployment,partial_paraphrase,Recall the rollout cadence for Zephyr.,1,True,True,True,True,1.0,1.0,0.2,10,12.866,200
+deployment_0,deployment,keyword,Zephyr deploy window,1,True,True,True,True,1.0,1.0,0.2,10,10.391,200
+deployment_1,deployment,full_paraphrase,Which region cluster does the Kestrel service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,9.421,200
+deployment_1,deployment,partial_paraphrase,Recall the rollout cadence for Kestrel.,1,True,True,True,True,1.0,1.0,0.2,10,17.282,200
+deployment_1,deployment,keyword,Kestrel deploy window,1,True,True,True,True,1.0,1.0,0.2,10,9.535,200
+deployment_2,deployment,full_paraphrase,Which region cluster does the Auriga service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,9.277,200
+deployment_2,deployment,partial_paraphrase,Recall the rollout cadence for Auriga.,1,True,True,True,True,1.0,1.0,0.2,10,12.1,200
+deployment_2,deployment,keyword,Auriga deploy window,1,True,True,True,True,1.0,1.0,0.2,10,8.886,200
+deployment_3,deployment,full_paraphrase,Which region cluster does the Brontes service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,8.654,200
+deployment_3,deployment,partial_paraphrase,Recall the rollout cadence for Brontes.,1,True,True,True,True,1.0,1.0,0.2,10,11.316,200
+deployment_3,deployment,keyword,Brontes deploy window,1,True,True,True,True,1.0,1.0,0.2,10,7.851,200
+deployment_4,deployment,full_paraphrase,Which region cluster does the Caldera service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,7.896,200
+deployment_4,deployment,partial_paraphrase,Recall the rollout cadence for Caldera.,1,True,True,True,True,1.0,1.0,0.2,10,11.152,200
+deployment_4,deployment,keyword,Caldera deploy window,1,True,True,True,True,1.0,1.0,0.2,10,7.962,200
+deployment_5,deployment,full_paraphrase,Which region cluster does the Dynamo service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,9.405,200
+deployment_5,deployment,partial_paraphrase,Recall the rollout cadence for Dynamo.,1,True,True,True,True,1.0,1.0,0.2,10,12.169,200
+deployment_5,deployment,keyword,Dynamo deploy window,1,True,True,True,True,1.0,1.0,0.2,10,8.09,200
+deployment_6,deployment,full_paraphrase,Which region cluster does the Erebus service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,8.986,200
+deployment_6,deployment,partial_paraphrase,Recall the rollout cadence for Erebus.,1,True,True,True,True,1.0,1.0,0.2,10,11.543,200
+deployment_6,deployment,keyword,Erebus deploy window,1,True,True,True,True,1.0,1.0,0.2,10,7.938,200
+deployment_7,deployment,full_paraphrase,Which region cluster does the Fennec service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,9.302,200
+deployment_7,deployment,partial_paraphrase,Recall the rollout cadence for Fennec.,,False,False,False,False,0.0,0.0,0.0,10,11.621,200
+deployment_7,deployment,keyword,Fennec deploy window,1,True,True,True,True,1.0,1.0,0.2,10,8.345,200
+deployment_8,deployment,full_paraphrase,Which region cluster does the Gyrfalcon service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,8.025,200
+deployment_8,deployment,partial_paraphrase,Recall the rollout cadence for Gyrfalcon.,1,True,True,True,True,1.0,1.0,0.2,10,11.687,200
+deployment_8,deployment,keyword,Gyrfalcon deploy window,1,True,True,True,True,1.0,1.0,0.2,10,8.473,200
+deployment_9,deployment,full_paraphrase,Which region cluster does the Halcyon service deploy to and how often?,1,True,True,True,True,1.0,1.0,0.2,10,8.449,200
+deployment_9,deployment,partial_paraphrase,Recall the rollout cadence for Halcyon.,1,True,True,True,True,1.0,1.0,0.2,10,11.635,200
+deployment_9,deployment,keyword,Halcyon deploy window,1,True,True,True,True,1.0,1.0,0.2,10,8.566,200
+database_0,database,full_paraphrase,What is the partition key and retention for the ledgerbook table?,1,True,True,True,True,1.0,1.0,0.2,10,8.035,200
+database_0,database,partial_paraphrase,Recall how ledgerbook rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,8.562,200
+database_0,database,keyword,ledgerbook partition retention,1,True,True,True,True,1.0,1.0,0.2,10,8.068,200
+database_1,database,full_paraphrase,What is the partition key and retention for the eventlog table?,1,True,True,True,True,1.0,1.0,0.2,10,8.385,200
+database_1,database,partial_paraphrase,Recall how eventlog rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,8.164,200
+database_1,database,keyword,eventlog partition retention,1,True,True,True,True,1.0,1.0,0.2,10,7.861,200
+database_2,database,full_paraphrase,What is the partition key and retention for the sessionmap table?,1,True,True,True,True,1.0,1.0,0.2,10,7.553,200
+database_2,database,partial_paraphrase,Recall how sessionmap rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,7.964,200
+database_2,database,keyword,sessionmap partition retention,1,True,True,True,True,1.0,1.0,0.2,10,7.615,200
+database_3,database,full_paraphrase,What is the partition key and retention for the auditrail table?,1,True,True,True,True,1.0,1.0,0.2,10,7.476,200
+database_3,database,partial_paraphrase,Recall how auditrail rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,7.772,200
+database_3,database,keyword,auditrail partition retention,1,True,True,True,True,1.0,1.0,0.2,10,7.454,200
+database_4,database,full_paraphrase,What is the partition key and retention for the vectordex table?,1,True,True,True,True,1.0,1.0,0.2,10,7.757,200
+database_4,database,partial_paraphrase,Recall how vectordex rows are kept.,2,False,True,True,True,0.5,0.6309,0.2,10,10.364,200
+database_4,database,keyword,vectordex partition retention,2,False,True,True,True,0.5,0.6309,0.2,10,8.805,200
+database_5,database,full_paraphrase,What is the partition key and retention for the graphedge table?,1,True,True,True,True,1.0,1.0,0.2,10,7.935,200
+database_5,database,partial_paraphrase,Recall how graphedge rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,8.279,200
+database_5,database,keyword,graphedge partition retention,1,True,True,True,True,1.0,1.0,0.2,10,8.055,200
+database_6,database,full_paraphrase,What is the partition key and retention for the policyreg table?,1,True,True,True,True,1.0,1.0,0.2,10,9.025,200
+database_6,database,partial_paraphrase,Recall how policyreg rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,13.228,200
+database_6,database,keyword,policyreg partition retention,1,True,True,True,True,1.0,1.0,0.2,10,8.298,200
+database_7,database,full_paraphrase,What is the partition key and retention for the capstore table?,1,True,True,True,True,1.0,1.0,0.2,10,8.17,200
+database_7,database,partial_paraphrase,Recall how capstore rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,9.993,200
+database_7,database,keyword,capstore partition retention,1,True,True,True,True,1.0,1.0,0.2,10,10.621,200
+database_8,database,full_paraphrase,What is the partition key and retention for the timequeue table?,1,True,True,True,True,1.0,1.0,0.2,10,9.035,200
+database_8,database,partial_paraphrase,Recall how timequeue rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,9.974,200
+database_8,database,keyword,timequeue partition retention,1,True,True,True,True,1.0,1.0,0.2,10,9.493,200
+database_9,database,full_paraphrase,What is the partition key and retention for the snapindex table?,1,True,True,True,True,1.0,1.0,0.2,10,8.747,200
+database_9,database,partial_paraphrase,Recall how snapindex rows are kept.,1,True,True,True,True,1.0,1.0,0.2,10,8.98,200
+database_9,database,keyword,snapindex partition retention,1,True,True,True,True,1.0,1.0,0.2,10,8.058,200
+security_0,security,full_paraphrase,What approval does the Aegis policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.444,200
+security_0,security,partial_paraphrase,Recall the Aegis rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.796,200
+security_0,security,keyword,Aegis token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.442,200
+security_1,security,full_paraphrase,What approval does the Bastion policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.185,200
+security_1,security,partial_paraphrase,Recall the Bastion rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.209,200
+security_1,security,keyword,Bastion token approval,1,True,True,True,True,1.0,1.0,0.2,10,7.761,200
+security_2,security,full_paraphrase,What approval does the Citadel policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,8.954,200
+security_2,security,partial_paraphrase,Recall the Citadel rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.515,200
+security_2,security,keyword,Citadel token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.5,200
+security_3,security,full_paraphrase,What approval does the Drawbridge policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.146,200
+security_3,security,partial_paraphrase,Recall the Drawbridge rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.485,200
+security_3,security,keyword,Drawbridge token approval,1,True,True,True,True,1.0,1.0,0.2,10,9.177,200
+security_4,security,full_paraphrase,What approval does the Enclave policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.3,200
+security_4,security,partial_paraphrase,Recall the Enclave rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,9.541,200
+security_4,security,keyword,Enclave token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.845,200
+security_5,security,full_paraphrase,What approval does the Fortress policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.314,200
+security_5,security,partial_paraphrase,Recall the Fortress rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.247,200
+security_5,security,keyword,Fortress token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.216,200
+security_6,security,full_paraphrase,What approval does the Garrison policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,8.223,200
+security_6,security,partial_paraphrase,Recall the Garrison rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.679,200
+security_6,security,keyword,Garrison token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.028,200
+security_7,security,full_paraphrase,What approval does the Keystone policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,8.265,200
+security_7,security,partial_paraphrase,Recall the Keystone rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,7.959,200
+security_7,security,keyword,Keystone token approval,1,True,True,True,True,1.0,1.0,0.2,10,7.995,200
+security_8,security,full_paraphrase,What approval does the Palisade policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,8.759,200
+security_8,security,partial_paraphrase,Recall the Palisade rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,9.134,200
+security_8,security,keyword,Palisade token approval,1,True,True,True,True,1.0,1.0,0.2,10,8.924,200
+security_9,security,full_paraphrase,What approval does the Rampart policy require before token rotation?,1,True,True,True,True,1.0,1.0,0.2,10,9.373,200
+security_9,security,partial_paraphrase,Recall the Rampart rotation rule.,,False,False,False,False,0.0,0.0,0.0,10,8.43,200
+security_9,security,keyword,Rampart token approval,1,True,True,True,True,1.0,1.0,0.2,10,9.48,200
+budget_0,budget,full_paraphrase,What is the monthly spend cap for project Atlas?,1,True,True,True,True,1.0,1.0,0.2,10,12.026,200
+budget_0,budget,partial_paraphrase,Recall who is alerted about Atlas costs.,,False,False,False,False,0.0,0.0,0.0,10,12.444,200
+budget_0,budget,keyword,Atlas spend cap,1,True,True,True,True,1.0,1.0,0.2,10,14.225,200
+budget_1,budget,full_paraphrase,What is the monthly spend cap for project Borealis?,1,True,True,True,True,1.0,1.0,0.2,10,9.977,200
+budget_1,budget,partial_paraphrase,Recall who is alerted about Borealis costs.,1,True,True,True,True,1.0,1.0,0.2,10,13.159,200
+budget_1,budget,keyword,Borealis spend cap,1,True,True,True,True,1.0,1.0,0.2,10,9.606,200
+budget_2,budget,full_paraphrase,What is the monthly spend cap for project Cascade?,1,True,True,True,True,1.0,1.0,0.2,10,10.126,200
+budget_2,budget,partial_paraphrase,Recall who is alerted about Cascade costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.755,200
+budget_2,budget,keyword,Cascade spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.653,200
+budget_3,budget,full_paraphrase,What is the monthly spend cap for project Denali?,1,True,True,True,True,1.0,1.0,0.2,10,8.763,200
+budget_3,budget,partial_paraphrase,Recall who is alerted about Denali costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.552,200
+budget_3,budget,keyword,Denali spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.246,200
+budget_4,budget,full_paraphrase,What is the monthly spend cap for project Everest?,1,True,True,True,True,1.0,1.0,0.2,10,9.175,200
+budget_4,budget,partial_paraphrase,Recall who is alerted about Everest costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.404,200
+budget_4,budget,keyword,Everest spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.432,200
+budget_5,budget,full_paraphrase,What is the monthly spend cap for project Fuji?,1,True,True,True,True,1.0,1.0,0.2,10,8.551,200
+budget_5,budget,partial_paraphrase,Recall who is alerted about Fuji costs.,1,True,True,True,True,1.0,1.0,0.2,10,11.8,200
+budget_5,budget,keyword,Fuji spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.245,200
+budget_6,budget,full_paraphrase,What is the monthly spend cap for project Grampian?,1,True,True,True,True,1.0,1.0,0.2,10,8.894,200
+budget_6,budget,partial_paraphrase,Recall who is alerted about Grampian costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.173,200
+budget_6,budget,keyword,Grampian spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.907,200
+budget_7,budget,full_paraphrase,What is the monthly spend cap for project Himal?,1,True,True,True,True,1.0,1.0,0.2,10,9.071,200
+budget_7,budget,partial_paraphrase,Recall who is alerted about Himal costs.,1,True,True,True,True,1.0,1.0,0.2,10,11.926,200
+budget_7,budget,keyword,Himal spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.259,200
+budget_8,budget,full_paraphrase,What is the monthly spend cap for project Iguazu?,1,True,True,True,True,1.0,1.0,0.2,10,8.66,200
+budget_8,budget,partial_paraphrase,Recall who is alerted about Iguazu costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.257,200
+budget_8,budget,keyword,Iguazu spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.11,200
+budget_9,budget,full_paraphrase,What is the monthly spend cap for project Jotun?,1,True,True,True,True,1.0,1.0,0.2,10,8.29,200
+budget_9,budget,partial_paraphrase,Recall who is alerted about Jotun costs.,1,True,True,True,True,1.0,1.0,0.2,10,12.609,200
+budget_9,budget,keyword,Jotun spend cap,1,True,True,True,True,1.0,1.0,0.2,10,8.124,200
+oncall_0,oncall,full_paraphrase,How long before the puma rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.459,200
+oncall_0,oncall,partial_paraphrase,Recall the paging path for puma.,1,True,True,True,True,1.0,1.0,0.2,1,7.549,200
+oncall_0,oncall,keyword,puma escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.391,200
+oncall_1,oncall,full_paraphrase,How long before the lynx rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.261,200
+oncall_1,oncall,partial_paraphrase,Recall the paging path for lynx.,1,True,True,True,True,1.0,1.0,0.2,1,7.608,200
+oncall_1,oncall,keyword,lynx escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.209,200
+oncall_2,oncall,full_paraphrase,How long before the ocelot rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.203,200
+oncall_2,oncall,partial_paraphrase,Recall the paging path for ocelot.,1,True,True,True,True,1.0,1.0,0.2,1,8.007,200
+oncall_2,oncall,keyword,ocelot escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.105,200
+oncall_3,oncall,full_paraphrase,How long before the serval rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.843,200
+oncall_3,oncall,partial_paraphrase,Recall the paging path for serval.,1,True,True,True,True,1.0,1.0,0.2,1,7.433,200
+oncall_3,oncall,keyword,serval escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.415,200
+oncall_4,oncall,full_paraphrase,How long before the caracal rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,7.788,200
+oncall_4,oncall,partial_paraphrase,Recall the paging path for caracal.,1,True,True,True,True,1.0,1.0,0.2,2,7.487,200
+oncall_4,oncall,keyword,caracal escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,7.876,200
+oncall_5,oncall,full_paraphrase,How long before the margay rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.705,200
+oncall_5,oncall,partial_paraphrase,Recall the paging path for margay.,1,True,True,True,True,1.0,1.0,0.2,1,7.408,200
+oncall_5,oncall,keyword,margay escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.344,200
+oncall_6,oncall,full_paraphrase,How long before the bobcat rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,7.982,200
+oncall_6,oncall,partial_paraphrase,Recall the paging path for bobcat.,1,True,True,True,True,1.0,1.0,0.2,10,8.132,200
+oncall_6,oncall,keyword,bobcat escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.417,200
+oncall_7,oncall,full_paraphrase,How long before the jaguarundi rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.295,200
+oncall_7,oncall,partial_paraphrase,Recall the paging path for jaguarundi.,1,True,True,True,True,1.0,1.0,0.2,1,7.592,200
+oncall_7,oncall,keyword,jaguarundi escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.14,200
+oncall_8,oncall,full_paraphrase,How long before the kodkod rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.514,200
+oncall_8,oncall,partial_paraphrase,Recall the paging path for kodkod.,1,True,True,True,True,1.0,1.0,0.2,2,7.132,200
+oncall_8,oncall,keyword,kodkod escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.045,200
+oncall_9,oncall,full_paraphrase,How long before the oncilla rotation escalates a page?,1,True,True,True,True,1.0,1.0,0.2,10,8.276,200
+oncall_9,oncall,partial_paraphrase,Recall the paging path for oncilla.,1,True,True,True,True,1.0,1.0,0.2,1,7.876,200
+oncall_9,oncall,keyword,oncilla escalation minutes,1,True,True,True,True,1.0,1.0,0.2,10,8.743,200
+compliance_0,compliance,full_paraphrase,Who signs the audit packet for control SOX-A and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.109,200
+compliance_0,compliance,partial_paraphrase,Recall the evidence export rule for SOX-A.,1,True,True,True,True,1.0,1.0,0.2,10,8.515,200
+compliance_0,compliance,keyword,SOX-A audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.211,200
+compliance_1,compliance,full_paraphrase,Who signs the audit packet for control GDPR-B and when?,1,True,True,True,True,1.0,1.0,0.2,10,8.716,200
+compliance_1,compliance,partial_paraphrase,Recall the evidence export rule for GDPR-B.,1,True,True,True,True,1.0,1.0,0.2,10,7.887,200
+compliance_1,compliance,keyword,GDPR-B audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,9.129,200
+compliance_2,compliance,full_paraphrase,Who signs the audit packet for control HIPAA-C and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.03,200
+compliance_2,compliance,partial_paraphrase,Recall the evidence export rule for HIPAA-C.,1,True,True,True,True,1.0,1.0,0.2,10,8.403,200
+compliance_2,compliance,keyword,HIPAA-C audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.688,200
+compliance_3,compliance,full_paraphrase,Who signs the audit packet for control PCI-D and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.069,200
+compliance_3,compliance,partial_paraphrase,Recall the evidence export rule for PCI-D.,1,True,True,True,True,1.0,1.0,0.2,10,8.747,200
+compliance_3,compliance,keyword,PCI-D audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.742,200
+compliance_4,compliance,full_paraphrase,Who signs the audit packet for control FEDRAMP-E and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.23,200
+compliance_4,compliance,partial_paraphrase,Recall the evidence export rule for FEDRAMP-E.,1,True,True,True,True,1.0,1.0,0.2,10,8.666,200
+compliance_4,compliance,keyword,FEDRAMP-E audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.93,200
+compliance_5,compliance,full_paraphrase,Who signs the audit packet for control ISO-F and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.478,200
+compliance_5,compliance,partial_paraphrase,Recall the evidence export rule for ISO-F.,1,True,True,True,True,1.0,1.0,0.2,10,8.69,200
+compliance_5,compliance,keyword,ISO-F audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.209,200
+compliance_6,compliance,full_paraphrase,Who signs the audit packet for control SOC2-G and when?,1,True,True,True,True,1.0,1.0,0.2,10,9.681,200
+compliance_6,compliance,partial_paraphrase,Recall the evidence export rule for SOC2-G.,1,True,True,True,True,1.0,1.0,0.2,10,9.412,200
+compliance_6,compliance,keyword,SOC2-G audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,9.051,200
+compliance_7,compliance,full_paraphrase,Who signs the audit packet for control CCPA-H and when?,1,True,True,True,True,1.0,1.0,0.2,10,8.931,200
+compliance_7,compliance,partial_paraphrase,Recall the evidence export rule for CCPA-H.,1,True,True,True,True,1.0,1.0,0.2,10,8.035,200
+compliance_7,compliance,keyword,CCPA-H audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.187,200
+compliance_8,compliance,full_paraphrase,Who signs the audit packet for control NIST-I and when?,1,True,True,True,True,1.0,1.0,0.2,10,8.33,200
+compliance_8,compliance,partial_paraphrase,Recall the evidence export rule for NIST-I.,1,True,True,True,True,1.0,1.0,0.2,10,8.221,200
+compliance_8,compliance,keyword,NIST-I audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.031,200
+compliance_9,compliance,full_paraphrase,Who signs the audit packet for control DORA-J and when?,1,True,True,True,True,1.0,1.0,0.2,10,8.143,200
+compliance_9,compliance,partial_paraphrase,Recall the evidence export rule for DORA-J.,1,True,True,True,True,1.0,1.0,0.2,10,11.652,200
+compliance_9,compliance,keyword,DORA-J audit evidence,1,True,True,True,True,1.0,1.0,0.2,10,8.413,200
+model_0,model,full_paraphrase,What context size does the quasar endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.294,200
+model_0,model,partial_paraphrase,Recall the quasar model settings.,3,False,True,True,True,0.3333,0.5,0.2,10,8.121,200
+model_0,model,keyword,quasar context tokens,1,True,True,True,True,1.0,1.0,0.2,10,8.405,200
+model_1,model,full_paraphrase,What context size does the pulsar endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,7.803,200
+model_1,model,partial_paraphrase,Recall the pulsar model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,8.154,200
+model_1,model,keyword,pulsar context tokens,1,True,True,True,True,1.0,1.0,0.2,10,8.044,200
+model_2,model,full_paraphrase,What context size does the magnetar endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,7.792,200
+model_2,model,partial_paraphrase,Recall the magnetar model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,8.657,200
+model_2,model,keyword,magnetar context tokens,1,True,True,True,True,1.0,1.0,0.2,10,9.548,200
+model_3,model,full_paraphrase,What context size does the blazar endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.756,200
+model_3,model,partial_paraphrase,Recall the blazar model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,8.659,200
+model_3,model,keyword,blazar context tokens,1,True,True,True,True,1.0,1.0,0.2,10,8.812,200
+model_4,model,full_paraphrase,What context size does the cepheid endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.101,200
+model_4,model,partial_paraphrase,Recall the cepheid model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,7.883,200
+model_4,model,keyword,cepheid context tokens,1,True,True,True,True,1.0,1.0,0.2,10,8.384,200
+model_5,model,full_paraphrase,What context size does the wolfrayet endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.004,200
+model_5,model,partial_paraphrase,Recall the wolfrayet model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,8.336,200
+model_5,model,keyword,wolfrayet context tokens,1,True,True,True,True,1.0,1.0,0.2,10,9.349,200
+model_6,model,full_paraphrase,What context size does the protostar endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.941,200
+model_6,model,partial_paraphrase,Recall the protostar model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,9.019,200
+model_6,model,keyword,protostar context tokens,1,True,True,True,True,1.0,1.0,0.2,10,9.162,200
+model_7,model,full_paraphrase,What context size does the reddwarf endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.526,200
+model_7,model,partial_paraphrase,Recall the reddwarf model settings.,1,True,True,True,True,1.0,1.0,0.2,10,8.286,200
+model_7,model,keyword,reddwarf context tokens,1,True,True,True,True,1.0,1.0,0.2,10,8.88,200
+model_8,model,full_paraphrase,What context size does the neutron endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,8.405,200
+model_8,model,partial_paraphrase,Recall the neutron model settings.,2,False,True,True,True,0.5,0.6309,0.2,10,9.194,200
+model_8,model,keyword,neutron context tokens,1,True,True,True,True,1.0,1.0,0.2,10,10.875,200
+model_9,model,full_paraphrase,What context size does the supergiant endpoint serve?,1,True,True,True,True,1.0,1.0,0.2,10,9.551,200
+model_9,model,partial_paraphrase,Recall the supergiant model settings.,1,True,True,True,True,1.0,1.0,0.2,10,8.144,200
+model_9,model,keyword,supergiant context tokens,1,True,True,True,True,1.0,1.0,0.2,10,10.048,200
+storage_0,storage,full_paraphrase,When does the ambervault bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,8.682,200
+storage_0,storage,partial_paraphrase,Recall replication for ambervault.,1,True,True,True,True,1.0,1.0,0.2,1,8.393,200
+storage_0,storage,keyword,ambervault lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,8.294,200
+storage_1,storage,full_paraphrase,When does the bluecrate bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,8.083,200
+storage_1,storage,partial_paraphrase,Recall replication for bluecrate.,,False,False,False,False,0.0,0.0,0.0,10,7.483,200
+storage_1,storage,keyword,bluecrate lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.624,200
+storage_2,storage,full_paraphrase,When does the cindershelf bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,8.518,200
+storage_2,storage,partial_paraphrase,Recall replication for cindershelf.,1,True,True,True,True,1.0,1.0,0.2,1,7.797,200
+storage_2,storage,keyword,cindershelf lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.806,200
+storage_3,storage,full_paraphrase,When does the dunecache bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.699,200
+storage_3,storage,partial_paraphrase,Recall replication for dunecache.,2,False,True,True,True,0.5,0.6309,0.2,2,6.989,200
+storage_3,storage,keyword,dunecache lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.826,200
+storage_4,storage,full_paraphrase,When does the embercask bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.841,200
+storage_4,storage,partial_paraphrase,Recall replication for embercask.,1,True,True,True,True,1.0,1.0,0.2,1,7.693,200
+storage_4,storage,keyword,embercask lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.747,200
+storage_5,storage,full_paraphrase,When does the frostbin bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.641,200
+storage_5,storage,partial_paraphrase,Recall replication for frostbin.,1,True,True,True,True,1.0,1.0,0.2,1,7.089,200
+storage_5,storage,keyword,frostbin lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.258,200
+storage_6,storage,full_paraphrase,When does the gladehold bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.603,200
+storage_6,storage,partial_paraphrase,Recall replication for gladehold.,1,True,True,True,True,1.0,1.0,0.2,1,7.55,200
+storage_6,storage,keyword,gladehold lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,7.722,200
+storage_7,storage,full_paraphrase,When does the hazelloft bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.557,200
+storage_7,storage,partial_paraphrase,Recall replication for hazelloft.,1,True,True,True,True,1.0,1.0,0.2,1,8.183,200
+storage_7,storage,keyword,hazelloft lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,8.317,200
+storage_8,storage,full_paraphrase,When does the ironcellar bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,8.438,200
+storage_8,storage,partial_paraphrase,Recall replication for ironcellar.,1,True,True,True,True,1.0,1.0,0.2,1,7.787,200
+storage_8,storage,keyword,ironcellar lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,8.565,200
+storage_9,storage,full_paraphrase,When does the junipershed bucket move data to cold storage?,1,True,True,True,True,1.0,1.0,0.2,10,7.801,200
+storage_9,storage,partial_paraphrase,Recall replication for junipershed.,1,True,True,True,True,1.0,1.0,0.2,1,8.04,200
+storage_9,storage,keyword,junipershed lifecycle cold,1,True,True,True,True,1.0,1.0,0.2,10,8.282,200
+network_0,network,full_paraphrase,What timeout does the viaduct gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.264,200
+network_0,network,partial_paraphrase,Recall how viaduct traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.434,200
+network_0,network,keyword,viaduct gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.634,200
+network_1,network,full_paraphrase,What timeout does the causeway gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,9.368,200
+network_1,network,partial_paraphrase,Recall how causeway traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,9.075,200
+network_1,network,keyword,causeway gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.684,200
+network_2,network,full_paraphrase,What timeout does the trestle gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.266,200
+network_2,network,partial_paraphrase,Recall how trestle traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.19,200
+network_2,network,keyword,trestle gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.614,200
+network_3,network,full_paraphrase,What timeout does the aqueduct gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.654,200
+network_3,network,partial_paraphrase,Recall how aqueduct traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.434,200
+network_3,network,keyword,aqueduct gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.995,200
+network_4,network,full_paraphrase,What timeout does the skybridge gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.599,200
+network_4,network,partial_paraphrase,Recall how skybridge traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.689,200
+network_4,network,keyword,skybridge gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.842,200
+network_5,network,full_paraphrase,What timeout does the underpass gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.909,200
+network_5,network,partial_paraphrase,Recall how underpass traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.855,200
+network_5,network,keyword,underpass gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,9.021,200
+network_6,network,full_paraphrase,What timeout does the culvert gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,9.511,200
+network_6,network,partial_paraphrase,Recall how culvert traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.759,200
+network_6,network,keyword,culvert gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.613,200
+network_7,network,full_paraphrase,What timeout does the flyover gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.87,200
+network_7,network,partial_paraphrase,Recall how flyover traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.572,200
+network_7,network,keyword,flyover gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.866,200
+network_8,network,full_paraphrase,What timeout does the pontoon gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.687,200
+network_8,network,partial_paraphrase,Recall how pontoon traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.488,200
+network_8,network,keyword,pontoon gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.249,200
+network_9,network,full_paraphrase,What timeout does the bascule gateway apply?,1,True,True,True,True,1.0,1.0,0.2,10,8.99,200
+network_9,network,partial_paraphrase,Recall how bascule traffic is routed.,1,True,True,True,True,1.0,1.0,0.2,10,8.406,200
+network_9,network,keyword,bascule gateway timeout,1,True,True,True,True,1.0,1.0,0.2,10,8.186,200
+release_0,release,full_paraphrase,How long is the freeze before the harvest release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,8.587,200
+release_0,release,partial_paraphrase,Recall the gating for the harvest train.,1,True,True,True,True,1.0,1.0,0.2,10,8.203,200
+release_0,release,keyword,harvest release freeze,1,True,True,True,True,1.0,1.0,0.2,10,7.923,200
+release_1,release,full_paraphrase,How long is the freeze before the solstice release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,8.375,200
+release_1,release,partial_paraphrase,Recall the gating for the solstice train.,1,True,True,True,True,1.0,1.0,0.2,10,7.883,200
+release_1,release,keyword,solstice release freeze,1,True,True,True,True,1.0,1.0,0.2,10,7.862,200
+release_2,release,full_paraphrase,How long is the freeze before the equinox release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,8.492,200
+release_2,release,partial_paraphrase,Recall the gating for the equinox train.,1,True,True,True,True,1.0,1.0,0.2,10,8.068,200
+release_2,release,keyword,equinox release freeze,1,True,True,True,True,1.0,1.0,0.2,10,8.569,200
+release_3,release,full_paraphrase,How long is the freeze before the perihelion release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,8.869,200
+release_3,release,partial_paraphrase,Recall the gating for the perihelion train.,1,True,True,True,True,1.0,1.0,0.2,10,8.891,200
+release_3,release,keyword,perihelion release freeze,1,True,True,True,True,1.0,1.0,0.2,10,8.826,200
+release_4,release,full_paraphrase,How long is the freeze before the aphelion release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,8.89,200
+release_4,release,partial_paraphrase,Recall the gating for the aphelion train.,1,True,True,True,True,1.0,1.0,0.2,10,9.058,200
+release_4,release,keyword,aphelion release freeze,1,True,True,True,True,1.0,1.0,0.2,10,10.761,200
+release_5,release,full_paraphrase,How long is the freeze before the zenith release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,9.775,200
+release_5,release,partial_paraphrase,Recall the gating for the zenith train.,1,True,True,True,True,1.0,1.0,0.2,10,9.389,200
+release_5,release,keyword,zenith release freeze,1,True,True,True,True,1.0,1.0,0.2,10,9.528,200
+release_6,release,full_paraphrase,How long is the freeze before the nadir release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,9.354,200
+release_6,release,partial_paraphrase,Recall the gating for the nadir train.,1,True,True,True,True,1.0,1.0,0.2,10,8.788,200
+release_6,release,keyword,nadir release freeze,1,True,True,True,True,1.0,1.0,0.2,10,8.58,200
+release_7,release,full_paraphrase,How long is the freeze before the meridian release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,9.472,200
+release_7,release,partial_paraphrase,Recall the gating for the meridian train.,1,True,True,True,True,1.0,1.0,0.2,10,8.689,200
+release_7,release,keyword,meridian release freeze,1,True,True,True,True,1.0,1.0,0.2,10,11.954,200
+release_8,release,full_paraphrase,How long is the freeze before the twilight release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,12.27,200
+release_8,release,partial_paraphrase,Recall the gating for the twilight train.,1,True,True,True,True,1.0,1.0,0.2,10,13.157,200
+release_8,release,keyword,twilight release freeze,1,True,True,True,True,1.0,1.0,0.2,10,13.487,200
+release_9,release,full_paraphrase,How long is the freeze before the auroral release train launches?,1,True,True,True,True,1.0,1.0,0.2,10,13.817,200
+release_9,release,partial_paraphrase,Recall the gating for the auroral train.,1,True,True,True,True,1.0,1.0,0.2,10,12.72,200
+release_9,release,keyword,auroral release freeze,1,True,True,True,True,1.0,1.0,0.2,10,9.508,200
+team_0,team,full_paraphrase,How many engineers staff the Foxtrot squad?,1,True,True,True,True,1.0,1.0,0.2,10,12.855,200
+team_0,team,partial_paraphrase,Recall what the Foxtrot squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,9.689,200
+team_0,team,keyword,Foxtrot squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.624,200
+team_1,team,full_paraphrase,How many engineers staff the Gavotte squad?,1,True,True,True,True,1.0,1.0,0.2,10,7.93,200
+team_1,team,partial_paraphrase,Recall what the Gavotte squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,7.82,200
+team_1,team,keyword,Gavotte squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.445,200
+team_2,team,full_paraphrase,How many engineers staff the Habanera squad?,1,True,True,True,True,1.0,1.0,0.2,10,8.362,200
+team_2,team,partial_paraphrase,Recall what the Habanera squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,8.382,200
+team_2,team,keyword,Habanera squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,10.67,200
+team_3,team,full_paraphrase,How many engineers staff the Iberia squad?,1,True,True,True,True,1.0,1.0,0.2,10,9.503,200
+team_3,team,partial_paraphrase,Recall what the Iberia squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,9.86,200
+team_3,team,keyword,Iberia squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.89,200
+team_4,team,full_paraphrase,How many engineers staff the Jitterbug squad?,1,True,True,True,True,1.0,1.0,0.2,10,8.368,200
+team_4,team,partial_paraphrase,Recall what the Jitterbug squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,9.119,200
+team_4,team,keyword,Jitterbug squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,9.46,200
+team_5,team,full_paraphrase,How many engineers staff the Kalinka squad?,1,True,True,True,True,1.0,1.0,0.2,10,8.853,200
+team_5,team,partial_paraphrase,Recall what the Kalinka squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,8.363,200
+team_5,team,keyword,Kalinka squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.067,200
+team_6,team,full_paraphrase,How many engineers staff the Lambada squad?,1,True,True,True,True,1.0,1.0,0.2,10,8.954,200
+team_6,team,partial_paraphrase,Recall what the Lambada squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,7.944,200
+team_6,team,keyword,Lambada squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.01,200
+team_7,team,full_paraphrase,How many engineers staff the Mazurka squad?,1,True,True,True,True,1.0,1.0,0.2,10,7.876,200
+team_7,team,partial_paraphrase,Recall what the Mazurka squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,8.63,200
+team_7,team,keyword,Mazurka squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,8.894,200
+team_8,team,full_paraphrase,How many engineers staff the Nocturne squad?,1,True,True,True,True,1.0,1.0,0.2,10,8.502,200
+team_8,team,partial_paraphrase,Recall what the Nocturne squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,8.148,200
+team_8,team,keyword,Nocturne squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,7.982,200
+team_9,team,full_paraphrase,How many engineers staff the Oberek squad?,1,True,True,True,True,1.0,1.0,0.2,10,7.826,200
+team_9,team,partial_paraphrase,Recall what the Oberek squad owns.,1,True,True,True,True,1.0,1.0,0.2,10,7.667,200
+team_9,team,keyword,Oberek squad engineers,1,True,True,True,True,1.0,1.0,0.2,10,7.833,200
+incident_0,incident,full_paraphrase,How quickly must the INC-Umber postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.438,200
+incident_0,incident,partial_paraphrase,Recall the review required for INC-Umber.,1,True,True,True,True,1.0,1.0,0.2,10,8.307,200
+incident_0,incident,keyword,INC-Umber postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.711,200
+incident_1,incident,full_paraphrase,How quickly must the INC-Vermel postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.062,200
+incident_1,incident,partial_paraphrase,Recall the review required for INC-Vermel.,1,True,True,True,True,1.0,1.0,0.2,10,8.175,200
+incident_1,incident,keyword,INC-Vermel postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.739,200
+incident_2,incident,full_paraphrase,How quickly must the INC-Willow postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,9.934,200
+incident_2,incident,partial_paraphrase,Recall the review required for INC-Willow.,1,True,True,True,True,1.0,1.0,0.2,10,8.834,200
+incident_2,incident,keyword,INC-Willow postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,8.211,200
+incident_3,incident,full_paraphrase,How quickly must the INC-Xenon postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,7.82,200
+incident_3,incident,partial_paraphrase,Recall the review required for INC-Xenon.,1,True,True,True,True,1.0,1.0,0.2,10,7.698,200
+incident_3,incident,keyword,INC-Xenon postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.425,200
+incident_4,incident,full_paraphrase,How quickly must the INC-Yarrow postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.906,200
+incident_4,incident,partial_paraphrase,Recall the review required for INC-Yarrow.,1,True,True,True,True,1.0,1.0,0.2,10,9.128,200
+incident_4,incident,keyword,INC-Yarrow postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,8.398,200
+incident_5,incident,full_paraphrase,How quickly must the INC-Zircon postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.595,200
+incident_5,incident,partial_paraphrase,Recall the review required for INC-Zircon.,1,True,True,True,True,1.0,1.0,0.2,10,8.474,200
+incident_5,incident,keyword,INC-Zircon postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.626,200
+incident_6,incident,full_paraphrase,How quickly must the INC-Amber postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,11.244,200
+incident_6,incident,partial_paraphrase,Recall the review required for INC-Amber.,,False,False,False,False,0.0,0.0,0.0,10,11.476,200
+incident_6,incident,keyword,INC-Amber postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,11.404,200
+incident_7,incident,full_paraphrase,How quickly must the INC-Basalt postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.103,200
+incident_7,incident,partial_paraphrase,Recall the review required for INC-Basalt.,1,True,True,True,True,1.0,1.0,0.2,10,8.229,200
+incident_7,incident,keyword,INC-Basalt postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.737,200
+incident_8,incident,full_paraphrase,How quickly must the INC-Coral postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,8.088,200
+incident_8,incident,partial_paraphrase,Recall the review required for INC-Coral.,1,True,True,True,True,1.0,1.0,0.2,10,8.199,200
+incident_8,incident,keyword,INC-Coral postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.666,200
+incident_9,incident,full_paraphrase,How quickly must the INC-Dolomite postmortem be filed?,1,True,True,True,True,1.0,1.0,0.2,10,7.982,200
+incident_9,incident,partial_paraphrase,Recall the review required for INC-Dolomite.,1,True,True,True,True,1.0,1.0,0.2,10,7.832,200
+incident_9,incident,keyword,INC-Dolomite postmortem hours,1,True,True,True,True,1.0,1.0,0.2,10,7.339,200
