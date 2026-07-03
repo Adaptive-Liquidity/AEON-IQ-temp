@@ -266,14 +266,18 @@ pub fn validate_provider_url(var_name: &str, raw: &str) -> anyhow::Result<String
 
 /// Validation for the **local embedding lane** (`LOCAL_EMBEDDING_BASE_URL`).
 ///
-/// Unlike `validate_provider_url`, this lane exists precisely so
-/// sensitivity-labeled content can be embedded by a model running on this
-/// host or private network — so `http`, loopback, and RFC-1918 private
+/// Unlike `validate_provider_url` (a deny-list — public HTTPS endpoints are
+/// the expected target, only dangerous ranges are blocked), this is an
+/// **allow-list**: every resolved address MUST be loopback or RFC-1918
+/// private or IPv6 unique-local (`is_dev_allowed`), or the URL is rejected —
+/// including ordinary public addresses. `http`, loopback, and private
 /// addresses are permitted *for this variable only*, without the global
 /// `AEON_ALLOW_INSECURE_PROVIDER_URLS` escape hatch (which would also loosen
-/// the upstream and extractor guards).  Link-local (169.254.0.0/16 — the
-/// cloud-metadata range), multicast, and unspecified addresses remain
-/// blocked unconditionally.
+/// the upstream and extractor guards). This lane exists precisely so
+/// sensitivity-labeled content can be embedded by a model running on this
+/// host or private network — a public address here would silently defeat
+/// that guarantee, so it is never permitted, not even the ordinary public
+/// addresses `validate_provider_url` allows.
 pub fn validate_local_provider_url(var_name: &str, raw: &str) -> anyhow::Result<String> {
     let url = Url::parse(raw)
         .map_err(|e| anyhow::anyhow!("{var_name}: failed to parse URL {raw:?}: {e}"))?;
@@ -306,7 +310,13 @@ pub fn validate_local_provider_url(var_name: &str, raw: &str) -> anyhow::Result<
     }
 
     for addr in &addrs {
-        // Loopback and private ranges are the expected targets of this lane.
+        // Loopback and private ranges are the expected — and ONLY permitted —
+        // targets of this lane. Anything else (including an ordinary public
+        // address that isn't in blocked_reason's always-blocked set) must
+        // also be rejected: this function exists specifically so
+        // private/secret content never leaves the host/private network, so a
+        // public host here would silently defeat that guarantee — even from
+        // an innocent misconfiguration, not just an attacker.
         if is_dev_allowed(addr) {
             continue;
         }
@@ -315,6 +325,9 @@ pub fn validate_local_provider_url(var_name: &str, raw: &str) -> anyhow::Result<
                 "{var_name}: URL {raw:?} resolved to {addr} which is a {reason} —                  blocked even for the local lane (metadata/link-local/multicast                  addresses are never legitimate embedding targets)."
             );
         }
+        bail!(
+            "{var_name}: URL {raw:?} resolved to {addr}, a public address —              the local embedding lane only accepts loopback or RFC-1918/ULA              private addresses, so that private/secret content never leaves              this host or private network. Point it at a locally-reachable              embedding service instead."
+        );
     }
 
     Ok(url.to_string())
@@ -446,6 +459,24 @@ mod tests {
         );
         assert!(
             validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "ftp://127.0.0.1").is_err()
+        );
+    }
+
+    /// Regression test: the local embedding lane must be an allow-list
+    /// (loopback/private only), not a deny-list. A public address — even a
+    /// perfectly ordinary one with no SSRF properties at all — must be
+    /// rejected, because this lane's entire purpose is keeping
+    /// private/secret content off the public internet. Prior to this fix,
+    /// `validate_local_provider_url` only consulted `blocked_reason` (which
+    /// is a deny-list scoped to metadata/link-local/multicast/unspecified)
+    /// and silently accepted any other address, including public ones.
+    #[test]
+    fn local_lane_rejects_public_address() {
+        let err =
+            validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "https://1.1.1.1").unwrap_err();
+        assert!(
+            err.to_string().contains("1.1.1.1"),
+            "public address must be rejected: {err}"
         );
     }
 
