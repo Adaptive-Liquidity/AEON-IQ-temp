@@ -1,0 +1,33 @@
+{
+  "method": "cl100k_base tokenizer; estimated prompt token reduction on benchmark dataset",
+  "rows": [
+    {
+      "aeon_iq_tokens": 46,
+      "aeon_uses_more_tokens": false,
+      "baseline_tokens": 73,
+      "delta": 27,
+      "injected_memory_tokens": 10,
+      "percent_savings": 36.99,
+      "scenario": "profile_recall"
+    },
+    {
+      "aeon_iq_tokens": 47,
+      "aeon_uses_more_tokens": false,
+      "baseline_tokens": 61,
+      "delta": 14,
+      "injected_memory_tokens": 14,
+      "percent_savings": 22.95,
+      "scenario": "archival_question"
+    },
+    {
+      "aeon_iq_tokens": 53,
+      "aeon_uses_more_tokens": true,
+      "baseline_tokens": 16,
+      "delta": -37,
+      "injected_memory_tokens": 26,
+      "percent_savings": -231.25,
+      "scenario": "small_context_overhead"
+    }
+  ],
+  "status": "ok"
+}

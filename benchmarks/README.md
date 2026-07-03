@@ -74,6 +74,22 @@ python3 benchmarks/scripts/run_narrative_archival.py --results-dir benchmarks/re
 Use `BENCHMARK_INCLUDE_10000=true` or `seed_memories.py --include-10000` to add
 the optional 10,000-memory retrieval seed. This can be slow on laptops.
 
+## Semantic Recall (Optional, Env-Gated)
+
+`scripts/run_semantic_quality.py` measures semantic recall on public
+long-memory datasets (LongMemEval, LoCoMo) with a kernel pointed at a REAL
+embedding provider — unlike the deterministic hash-embedding suite above. It
+only runs when `AEON_SEMANTIC_BENCHMARK=true` (otherwise it writes a `not_run`
+artifact and exits 0) and is never a required CI gate. See the "Semantic
+Recall Benchmark" section in [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) for
+setup, dataset files, conditions (aeon-full vs cosine-baseline), and metrics.
+
+```bash
+AEON_SEMANTIC_BENCHMARK=true python3 benchmarks/scripts/run_semantic_quality.py \
+  --dataset locomo --dataset-file /path/to/locomo10.json --sample-size 100 \
+  --condition aeon-full --results-dir benchmarks/results/manual
+```
+
 ## k6
 
 ```bash

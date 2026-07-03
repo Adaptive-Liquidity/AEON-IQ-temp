@@ -7,8 +7,8 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  KERNEL_IMAGE: ghcr.io/adaptive-liquidity/aeon-iq
-  DASHBOARD_IMAGE: ghcr.io/adaptive-liquidity/aeon-iq-dashboard
+  KERNEL_IMAGE: ghcr.io/adaptiveliquidity/aeon-iq
+  DASHBOARD_IMAGE: ghcr.io/adaptiveliquidity/aeon-iq-dashboard
 
 jobs:
   publish-kernel:
@@ -17,6 +17,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write # cosign keyless (GitHub OIDC)
 
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +43,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push kernel image
+        id: push
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -51,12 +53,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign kernel image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${KERNEL_IMAGE}@${DIGEST}"
+
   publish-dashboard:
     name: Publish Dashboard Image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      id-token: write # cosign keyless (GitHub OIDC)
 
     steps:
       - uses: actions/checkout@v4
@@ -82,6 +93,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push dashboard image
+        id: push
         uses: docker/build-push-action@v5
         with:
           context: ./dashboard
@@ -90,3 +102,11 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign dashboard image (keyless, by digest)
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${DASHBOARD_IMAGE}@${DIGEST}"

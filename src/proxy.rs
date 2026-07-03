@@ -110,6 +110,7 @@ pub async fn handle_chat_completions(
 
     let mut memories_retrieved: usize = 0;
     let mut injected_chars: usize = 0;
+    let mut injected_memory_ids: Vec<Uuid> = Vec::new();
     let total_prompt_chars: usize = chat_req
         .messages
         .iter()
@@ -138,6 +139,7 @@ pub async fn handle_chat_completions(
 
                     if !injection.is_empty() {
                         injected_chars = injection.len();
+                        injected_memory_ids = memories.iter().map(|m| m.id).collect();
                         info!(agent_id = %agent_id, count = memories_retrieved, "Injecting memories");
                         chat_req.messages.insert(
                             0,
@@ -223,8 +225,10 @@ pub async fn handle_chat_completions(
             state.db.clone(),
             state.config.clone(),
             agent_id.clone(),
+            session_id.clone(),
             rmk_policy_id,
             memories_retrieved,
+            injected_memory_ids.clone(),
             injected_chars,
             total_prompt_chars,
         ))
@@ -281,7 +285,9 @@ pub async fn handle_chat_completions(
     };
 
     // ── 7. Log RMK episode (background, fire-and-forget) ─────────────────────
-    if let Some((db, cfg, aid, policy_id, mem_count, inj_chars, prompt_chars)) = rmk_log {
+    if let Some((db, cfg, aid, sid, policy_id, mem_count, inj_ids, inj_chars, prompt_chars)) =
+        rmk_log
+    {
         tokio::spawn(async move {
             const RETRIEVAL_LIMIT: f64 = 5.0;
             let precision = (mem_count as f64 / RETRIEVAL_LIMIT).min(1.0);
@@ -311,8 +317,10 @@ pub async fn handle_chat_completions(
             .unwrap_or(0.0);
 
             let metrics = EpisodeMetrics {
-                // task_success stays 1.0 (proxy can't observe task outcome);
-                // real signal should come from the /feedback endpoint in the future.
+                // task_success starts at the documented "assumed" default of
+                // 1.0; the background aggregation job backfills a real value
+                // (and recomputes the reward) for episodes whose injected
+                // memories later receive /api/v1/feedback.
                 task_success: 1.0,
                 token_savings,
                 retrieval_precision: precision,
@@ -320,7 +328,9 @@ pub async fn handle_chat_completions(
             };
             let reward =
                 RewardModel::new(cfg.rmk_config.reward_weights.clone()).compute_reward(&metrics);
-            if let Err(e) = rmk_store::insert_episode(&db, &aid, policy_id, &metrics, reward).await
+            if let Err(e) =
+                rmk_store::insert_episode(&db, &aid, policy_id, &sid, &inj_ids, &metrics, reward)
+                    .await
             {
                 warn!(agent_id = %aid, "RMK episode logging failed: {}", e);
             }

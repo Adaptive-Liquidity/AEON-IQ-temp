@@ -1,0 +1,4 @@
+scenario,seed_memory_count,request_count,error_count,error_rate,p50_ms,p95_ms,p99_ms,mean_ms,min_ms,max_ms,mean_result_count
+retrieval_search_100,100,100,0,0.0,2.847,3.347,3.514,2.917,2.544,4.041,5.0
+retrieval_search_1000,1000,100,0,0.0,10.716,13.83,17.933,11.407,9.852,51.691,5.0
+retrieval_search_10000,10000,50,0,0.0,95.069,101.715,123.707,96.443,91.26,128.638,5.0

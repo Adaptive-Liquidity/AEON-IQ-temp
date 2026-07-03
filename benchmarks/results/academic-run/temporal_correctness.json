@@ -1,0 +1,125 @@
+{
+  "agent_id": "bench-temporal",
+  "checks": {
+    "archive_http_ok": true,
+    "create_http_ok": true,
+    "diff_reports_added": true,
+    "diff_reports_archived": true,
+    "diff_reports_modified": true,
+    "diff_reports_status_changed": true,
+    "patch_http_ok": true,
+    "snapshot_after_archive_excludes_memory": true,
+    "snapshot_after_creation_includes_v1": true,
+    "snapshot_after_status_records_candidate": true,
+    "snapshot_after_update_includes_latest_version": true,
+    "snapshot_before_creation_excludes_memory": true,
+    "status_http_ok": true,
+    "versions_include_initial_patch_status": true
+  },
+  "memory_id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+  "response_excerpts": {
+    "after_archive": [],
+    "after_create": [
+      {
+        "confidence": 1.0,
+        "content": "Temporal benchmark fact v1: Nimbus stores memories in Postgres.",
+        "created_at": "2026-07-03T05:55:20.507093+00:00",
+        "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+        "importance_score": 1.0,
+        "importance_source": "user_stated",
+        "memory_type": "semantic",
+        "provenance": "user_stated",
+        "sensitivity": "unknown",
+        "source_turn": null,
+        "status": "active",
+        "valid_from": null,
+        "valid_to": null,
+        "version_created_at": "2026-07-03T05:55:20.507093+00:00",
+        "version_number": 1
+      }
+    ],
+    "after_update": [
+      {
+        "confidence": 1.0,
+        "content": "Temporal benchmark fact v2: Nimbus stores vector memories in Postgres with pgvector.",
+        "created_at": "2026-07-03T05:55:20.507093+00:00",
+        "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+        "importance_score": 1.0,
+        "importance_source": "user_stated",
+        "memory_type": "semantic",
+        "provenance": "user_stated",
+        "sensitivity": "unknown",
+        "source_turn": null,
+        "status": "active",
+        "valid_from": null,
+        "valid_to": null,
+        "version_created_at": "2026-07-03T05:55:21.745336+00:00",
+        "version_number": 2
+      }
+    ],
+    "archive_response": {
+      "body": {
+        "affected": 1
+      },
+      "status": 200
+    },
+    "create_response": {
+      "id": "369c1a75-504e-4bc5-8edd-439bb3c7ebbd",
+      "success": true
+    },
+    "diff_added_summary": {
+      "added": 1,
+      "archived": 0,
+      "modified": 0,
+      "status_changed": 0,
+      "total_retrievals": 0,
+      "unique_memories_recalled": 0
+    },
+    "diff_archived_summary": {
+      "added": 0,
+      "archived": 1,
+      "modified": 0,
+      "status_changed": 0,
+      "total_retrievals": 0,
+      "unique_memories_recalled": 0
+    },
+    "diff_modified_summary": {
+      "added": 0,
+      "archived": 0,
+      "modified": 1,
+      "status_changed": 0,
+      "total_retrievals": 0,
+      "unique_memories_recalled": 0
+    },
+    "diff_status_summary": {
+      "added": 0,
+      "archived": 0,
+      "modified": 0,
+      "status_changed": 1,
+      "total_retrievals": 0,
+      "unique_memories_recalled": 0
+    },
+    "patch_response": {
+      "body": {
+        "updated": true
+      },
+      "status": 200
+    },
+    "status_response": {
+      "body": {
+        "status": "candidate",
+        "updated": true
+      },
+      "status": 200
+    },
+    "versions_total": 3
+  },
+  "status": "pass",
+  "timestamps": {
+    "archived": "2026-07-03T05:55:25.081180Z",
+    "before": "2026-07-03T05:55:20.099182Z",
+    "created": "2026-07-03T05:55:21.621284Z",
+    "status": "2026-07-03T05:55:23.973318Z",
+    "updated": "2026-07-03T05:55:22.861307Z"
+  }
+}

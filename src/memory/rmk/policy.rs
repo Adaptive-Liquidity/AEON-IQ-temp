@@ -28,7 +28,23 @@ impl Default for PolicyParams {
             kp: 0.15,
             ki: 0.02,
             graph_bonus_weight: 0.15,
-            retrieval_threshold: 0.20,
+            // A freshly seeded RMK policy must not silently change retrieval
+            // strictness relative to a non-RMK deployment; the meta-learner
+            // explores from here within BOUNDS.
+            retrieval_threshold: crate::config::DEFAULT_RETRIEVAL_THRESHOLD,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_policy_threshold_matches_static_default() {
+        assert_eq!(
+            PolicyParams::default().retrieval_threshold,
+            crate::config::DEFAULT_RETRIEVAL_THRESHOLD,
+        );
     }
 }

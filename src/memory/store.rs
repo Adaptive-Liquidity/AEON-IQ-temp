@@ -415,18 +415,83 @@ async fn search_memories_impl(
     let decay_rate = state.config.memory_decay_rate;
     let importance_boost = state.config.importance_boost_factor;
 
-    // Two-CTE pattern:
-    //   base   — computes cosine distance, days_stale, and surfaces importance columns
-    //   ranked — applies decay + importance penalty; outer query filters and orders
-    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-        r#"WITH base AS (
-    SELECT id, agent_id, session_id, content, memory_type, confidence, provenance,
-           created_at, source_turn, importance_score, importance_source,
-           (embedding <=> "#,
+    // Stage-1 candidate count: at least the caller's limit, normally the
+    // configured ANN candidate budget.
+    let ann_limit = state.config.ann_candidate_limit.max(limit);
+    // ef_search must cover the candidate budget or pgvector falls into its
+    // slow post-ef "overflow" scan; also never go below pgvector's default.
+    let ef_search = (state.config.hnsw_ef_search as i64).max(ann_limit).max(40) as u32;
+
+    let qb = build_search_query(
+        "",
+        vec,
+        agent_id,
+        limit,
+        threshold,
+        ann_limit,
+        decay_rate,
+        importance_boost,
+        memory_type,
+        session_id,
+        filter_sensitive,
     );
+
+    // set_config(..., true) has SET LOCAL semantics (scoped to this
+    // transaction) while accepting a bind parameter, unlike bare SET.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+        .bind(ef_search.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let mut qb = qb;
+    let rows = qb
+        .build_query_as::<MemorySearchRow>()
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Builds the two-stage retrieval query.  Split out from
+/// `search_memories_impl` so the EXPLAIN regression test can verify the plan
+/// of the exact SQL the hot path executes (`prefix` is empty in production,
+/// `"EXPLAIN (ANALYZE, FORMAT JSON) "` in the test).
+///
+/// Three-CTE, two-stage pattern:
+///   q      — binds the query vector exactly once
+///   ann    — index-served nearest-neighbour probe: the ORDER BY uses the
+///            bare `embedding <=> vec` operator with a LIMIT so pgvector
+///            can serve it from the HNSW index (wrapping the operator in
+///            the decay arithmetic forces a sequential scan — the ranking
+///            formula must therefore only ever touch the ann CTE's output)
+///   ranked — decay + importance re-rank over the ≤ ann_limit candidates
+/// With decay_rate = importance_boost = 0 (defaults) the re-rank is the
+/// identity and the result equals pure cosine ranking, so the two-stage
+/// split is exact; with non-zero factors it is exact whenever the true
+/// top-`limit` re-ranked rows lie within the top-`ann_limit` cosine rows.
+#[allow(clippy::too_many_arguments)]
+fn build_search_query<'a>(
+    prefix: &str,
+    vec: Vector,
+    agent_id: &'a str,
+    limit: i64,
+    threshold: f64,
+    ann_limit: i64,
+    decay_rate: f64,
+    importance_boost: f64,
+    memory_type: Option<&'a str>,
+    session_id: Option<&'a str>,
+    filter_sensitive: bool,
+) -> QueryBuilder<sqlx::Postgres> {
+    let mut qb: QueryBuilder<sqlx::Postgres> =
+        QueryBuilder::new(format!("{prefix}WITH q AS (SELECT "));
     qb.push_bind(vec);
     qb.push(
-        r#")::double precision AS cosine_dist,
+        r#"::vector AS vec),
+ann AS (
+    SELECT id, agent_id, session_id, content, memory_type, confidence, provenance,
+           created_at, source_turn, importance_score, importance_source,
+           (embedding <=> (SELECT vec FROM q))::double precision AS cosine_dist,
            EXTRACT(EPOCH FROM (NOW() - COALESCE(last_accessed_at, created_at))) / 86400.0 AS days_stale
     FROM memories
     WHERE agent_id = "#,
@@ -446,6 +511,9 @@ async fn search_memories_impl(
         qb.push_bind(sid);
     }
 
+    qb.push("\n    ORDER BY embedding <=> (SELECT vec FROM q)\n    LIMIT ");
+    qb.push_bind(ann_limit);
+
     // Exponential decay: exp(decay_rate × days_stale).
     // When decay_rate = 0.0, exp(0) = 1.0 → collapses to pure cosine similarity.
     // This gives a smoother, bounded penalty compared to the linear (1 + k·d) form.
@@ -456,7 +524,7 @@ async fn search_memories_impl(
     qb.push(
         r#" * (1.0 - importance_score::double precision))
            AS distance
-    FROM base
+    FROM ann
 )
 SELECT id, agent_id, session_id, content, memory_type, confidence, provenance,
        created_at, source_turn, importance_score, importance_source, distance
@@ -466,11 +534,7 @@ FROM ranked WHERE distance < "#,
     qb.push(" ORDER BY distance LIMIT ");
     qb.push_bind(limit);
 
-    let rows = qb
-        .build_query_as::<MemorySearchRow>()
-        .fetch_all(&state.db)
-        .await?;
-    Ok(rows)
+    qb
 }
 
 /// Bump the access counter, record the access timestamp, and apply a small
@@ -1779,6 +1843,9 @@ mod tests {
                 memory_decay_rate: decay_rate,
                 importance_boost_factor,
                 importance_refresh_boost: 0.05,
+                ann_candidate_limit: 100,
+                hnsw_ef_search: 100,
+                local_embedding_base_url: None,
                 management_api_key: None,
                 allow_unauth_management: true,
                 max_body_bytes: 10 * 1024 * 1024,
@@ -1803,6 +1870,7 @@ mod tests {
                 rmk_config: crate::memory::rmk::config::RmkConfig::default(),
             }),
             db: pool,
+            evidence_signer: Arc::new(crate::attestation::EvidenceSigner::from_env().unwrap()),
             http_client: reqwest::Client::new(),
             metrics: Arc::new(Metrics::new().unwrap()),
             provider: Provider::OpenAI,
@@ -2682,6 +2750,111 @@ mod tests {
         assert!(
             second.is_none(),
             "restoring an already-restored batch must return None"
+        );
+    }
+
+    // ── Retrieval plan regression ────────────────────────────────────────────
+
+    /// The two-stage retrieval query must be served by the HNSW index.  The
+    /// ANN stage's ORDER BY uses the bare `embedding <=> vec` operator with a
+    /// LIMIT precisely so pgvector can use `idx_memories_hnsw`; wrapping the
+    /// operator in decay/importance arithmetic silently falls back to a
+    /// sequential scan whose latency is linear in corpus size (observed at
+    /// 95 ms p50 for 10k memories vs ~3 ms index-served).  This test EXPLAINs
+    /// the exact SQL the hot path builds and fails if the plan ever loses the
+    /// index scan.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn retrieval_plan_uses_hnsw_index(pool: sqlx::PgPool) {
+        use sqlx::Row;
+
+        let state = build_state(pool, 0.0);
+        const AGENT: &str = "explain-agent";
+
+        sqlx::query("INSERT INTO agents (agent_id) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(AGENT)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // Seed 1,500 rows with per-row random embeddings in one statement
+        // (the LATERAL's `WHERE g > 0` forces per-row evaluation).
+        sqlx::query(
+            r#"INSERT INTO memories
+                 (agent_id, session_id, content, memory_type, confidence, embedding,
+                  tier, provenance, importance_score, importance_source, status, sensitivity)
+               SELECT $1, 'seed', 'memory ' || g, 'semantic', 1.0, v.vec,
+                      'L2', 'user_stated', 0.5, 'user_stated', 'active', 'unknown'
+               FROM generate_series(1, 1500) g
+               CROSS JOIN LATERAL (
+                   SELECT ('[' || string_agg(random()::text, ',') || ']')::vector AS vec
+                   FROM generate_series(1, 1536) WHERE g > 0
+               ) v"#,
+        )
+        .bind(AGENT)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE memories")
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        let query_vec = unit_vec(3);
+
+        // Behavioral check through the real entry point: results come back
+        // ordered with distances present.
+        let rows = search_memories_filtered(&state, AGENT, &query_vec, 5, 2.0, None, None)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 5, "expected 5 results from seeded corpus");
+
+        // Plan check on the exact SQL the hot path builds.  The property under
+        // test is that the ANN stage is *index-servable*: pgvector can only
+        // use the HNSW index when the ORDER BY is the bare `<=>` operator.
+        // On a small test corpus the cost model may still prefer a seq scan,
+        // so disable it for the EXPLAIN — a shape regression (e.g. wrapping
+        // the operator in arithmetic again) produces a seq scan even with
+        // seqscan disabled, which is exactly what the assertion catches.
+        let mut qb = build_search_query(
+            "EXPLAIN ",
+            Vector::from(query_vec),
+            AGENT,
+            5,
+            2.0,
+            100,
+            0.0,
+            0.0,
+            None,
+            None,
+            true,
+        );
+        let mut tx = state.db.begin().await.unwrap();
+        // Ban every non-index path for the ANN stage: if the query shape is
+        // index-servable the planner must now pick the HNSW scan (the outer
+        // re-rank Sort survives on disable-cost, which is fine); if the shape
+        // regresses, a scan+sort still appears and the assertions fail.
+        for knob in [
+            "SET LOCAL enable_seqscan = off",
+            "SET LOCAL enable_bitmapscan = off",
+            "SET LOCAL enable_sort = off",
+        ] {
+            sqlx::query(knob).execute(&mut *tx).await.unwrap();
+        }
+        let plan_rows = qb.build().fetch_all(&mut *tx).await.unwrap();
+        tx.rollback().await.unwrap();
+        let plan: String = plan_rows
+            .iter()
+            .map(|r| r.get::<String, _>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            plan.contains("Index Scan using idx_memories_hnsw"),
+            "retrieval plan no longer uses the HNSW index:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on memories"),
+            "retrieval plan regressed to a sequential scan:\n{plan}"
         );
     }
 }

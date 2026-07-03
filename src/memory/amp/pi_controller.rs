@@ -14,12 +14,22 @@ pub struct PIController {
 }
 
 impl PIController {
-    pub fn new(params: ControllerParams) -> Self {
+    /// Reconstruct a controller from persisted state (see
+    /// `amp_controller_state`), so integral action survives across
+    /// pressure-sweep cycles.  Inputs are clamped to the controller's own
+    /// invariant ranges (Proposition 7 of the white paper), so corrupted or
+    /// hand-edited rows cannot produce out-of-range behaviour.
+    pub fn with_state(params: ControllerParams, aggressiveness: f64, integral_error: f64) -> Self {
         Self {
             params,
-            aggressiveness: 0.0,
-            integral_error: 0.0,
+            aggressiveness: aggressiveness.clamp(0.0, 1.0),
+            integral_error: integral_error.clamp(-10.0, 10.0),
         }
+    }
+
+    /// Current state for persistence: (aggressiveness, integral_error).
+    pub fn state(&self) -> (f64, f64) {
+        (self.aggressiveness, self.integral_error)
     }
 
     /// Update the controller given the current vs target active count.

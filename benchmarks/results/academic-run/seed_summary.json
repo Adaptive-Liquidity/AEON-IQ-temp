@@ -1,0 +1,41 @@
+{
+  "agents": {
+    "bench-archival": {
+      "memory_count": 12
+    },
+    "bench-latency-empty": {
+      "memory_count": 0
+    },
+    "bench-latency-seeded": {
+      "memory_count": 100
+    },
+    "bench-recall": {
+      "memory_count": 7
+    },
+    "bench-retrieval-100": {
+      "memory_count": 100
+    },
+    "bench-retrieval-1000": {
+      "memory_count": 1000
+    },
+    "bench-retrieval-10000": {
+      "memory_count": 10000
+    }
+  },
+  "generated_at": "2026-07-03T05:50:38.574142Z",
+  "labels": {
+    "archival_goal": "f64077b9-3de3-4f40-97ca-0c4bfc96ff44",
+    "cost_policy": "d1dffc4f-636b-44f5-a718-c3c9b1d11445",
+    "database_choice": "9c4d8e1b-d74b-4540-bf29-980d308f1054",
+    "favorite_language": "50fbede0-94ea-474b-a245-8d4a9d8b436c",
+    "planning_cadence": "7352988a-6548-4648-82ea-e2ee75437221",
+    "security_requirement": "dcf524ae-0e98-4437-8853-d43686a6348d",
+    "ui_preference": "69be8cf1-3553-4955-bdd3-ef254d108284"
+  },
+  "seed_memory_counts": [
+    100,
+    1000,
+    10000
+  ],
+  "status": "ok"
+}

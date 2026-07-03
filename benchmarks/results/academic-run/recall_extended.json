@@ -1,0 +1,189 @@
+{
+  "by_cluster": {
+    "budget": {
+      "mrr_at_10": 0.9667,
+      "ndcg_at_10": 0.9667,
+      "precision_at_5": 0.1933,
+      "queries": 30,
+      "recall_at_1": 0.9667,
+      "recall_at_10": 0.9667,
+      "recall_at_3": 0.9667,
+      "recall_at_5": 0.9667
+    },
+    "compliance": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "database": {
+      "mrr_at_10": 0.9667,
+      "ndcg_at_10": 0.9754,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 0.9333,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "deployment": {
+      "mrr_at_10": 0.9667,
+      "ndcg_at_10": 0.9667,
+      "precision_at_5": 0.1933,
+      "queries": 30,
+      "recall_at_1": 0.9667,
+      "recall_at_10": 0.9667,
+      "recall_at_3": 0.9667,
+      "recall_at_5": 0.9667
+    },
+    "incident": {
+      "mrr_at_10": 0.9667,
+      "ndcg_at_10": 0.9667,
+      "precision_at_5": 0.1933,
+      "queries": 30,
+      "recall_at_1": 0.9667,
+      "recall_at_10": 0.9667,
+      "recall_at_3": 0.9667,
+      "recall_at_5": 0.9667
+    },
+    "model": {
+      "mrr_at_10": 0.8611,
+      "ndcg_at_10": 0.8972,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 0.7333,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "network": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "oncall": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "release": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "security": {
+      "mrr_at_10": 0.6667,
+      "ndcg_at_10": 0.6667,
+      "precision_at_5": 0.1333,
+      "queries": 30,
+      "recall_at_1": 0.6667,
+      "recall_at_10": 0.6667,
+      "recall_at_3": 0.6667,
+      "recall_at_5": 0.6667
+    },
+    "storage": {
+      "mrr_at_10": 0.95,
+      "ndcg_at_10": 0.9544,
+      "precision_at_5": 0.1933,
+      "queries": 30,
+      "recall_at_1": 0.9333,
+      "recall_at_10": 0.9667,
+      "recall_at_3": 0.9667,
+      "recall_at_5": 0.9667
+    },
+    "team": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 30,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    }
+  },
+  "by_query_type": {
+    "full_paraphrase": {
+      "mrr_at_10": 1.0,
+      "ndcg_at_10": 1.0,
+      "precision_at_5": 0.2,
+      "queries": 120,
+      "recall_at_1": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "keyword": {
+      "mrr_at_10": 0.9958,
+      "ndcg_at_10": 0.9969,
+      "precision_at_5": 0.2,
+      "queries": 120,
+      "recall_at_1": 0.9917,
+      "recall_at_10": 1.0,
+      "recall_at_3": 1.0,
+      "recall_at_5": 1.0
+    },
+    "partial_paraphrase": {
+      "mrr_at_10": 0.8403,
+      "ndcg_at_10": 0.8515,
+      "precision_at_5": 0.1767,
+      "queries": 120,
+      "recall_at_1": 0.8,
+      "recall_at_10": 0.8833,
+      "recall_at_3": 0.8833,
+      "recall_at_5": 0.8833
+    }
+  },
+  "corpus": {
+    "clusters": 12,
+    "distractors": 1000,
+    "queries": 360,
+    "rng_seed": 42,
+    "targets": 120
+  },
+  "dataset_version": "0.2.0",
+  "generated_at": "2026-07-03T06:02:28.984575Z",
+  "method": "120 target facts across 12 clusters seeded among 1000 lexically-confusable distractors (1120 memories, one agent). 3 query variants per fact (360 queries), search limit=10 threshold=0.95. Rank of the expected memory id yields recall@k, MRR@10, nDCG@10 (single relevant document per query). Hash embeddings: this exercises the retrieval pipeline deterministically, not semantic embedding quality.",
+  "search_latency": {
+    "error_count": 0,
+    "error_rate": 0.0,
+    "max_ms": 17.282,
+    "mean_ms": 8.885,
+    "min_ms": 6.989,
+    "p50_ms": 8.501,
+    "p90_ms": 10.773,
+    "p95_ms": 12.17,
+    "p99_ms": 13.334,
+    "request_count": 360
+  },
+  "status": "ok",
+  "summary": {
+    "mrr_at_10": 0.9454,
+    "ndcg_at_10": 0.9495,
+    "precision_at_5": 0.1922,
+    "queries": 360,
+    "recall_at_1": 0.9306,
+    "recall_at_10": 0.9611,
+    "recall_at_3": 0.9611,
+    "recall_at_5": 0.9611
+  }
+}

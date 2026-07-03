@@ -1,7 +1,12 @@
 use crate::memory::amp::config::AmpConfig;
 use crate::memory::rmk::config::RmkConfig;
-use crate::url_guard::validate_provider_url;
+use crate::url_guard::{validate_local_provider_url, validate_provider_url};
 use anyhow::{Context, Result};
+
+/// Default retrieval-distance threshold, shared by the static env config and
+/// the seeded RMK policy (`PolicyParams::default`) so an RMK-enabled agent's
+/// first policy does not silently change retrieval strictness.
+pub const DEFAULT_RETRIEVAL_THRESHOLD: f64 = 0.80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessRole {
@@ -75,7 +80,7 @@ pub struct Config {
     /// Cosine distance upper bound; memories with distance ≥ this are dropped.
     pub retrieval_threshold: f64,
     /// Decay rate per day applied to cosine distance during retrieval.
-    /// `adjusted_dist = cosine_dist * (1 + decay_rate * days_since_last_access)`
+    /// `adjusted_dist = cosine_dist * exp(decay_rate * days_since_last_access)`
     /// Set to 0.0 (default) to disable decay and use pure cosine similarity.
     pub memory_decay_rate: f64,
     /// Importance weight in retrieval formula. 0.0 = disabled (default).
@@ -83,6 +88,21 @@ pub struct Config {
     pub importance_boost_factor: f64,
     /// Per-retrieval boost added to importance_score (spacing-effect refresh). 0.0 = disabled.
     pub importance_refresh_boost: f32,
+    /// Number of ANN candidates fetched by the index-served first stage of
+    /// retrieval before the decay/importance re-rank is applied. Clamped to at
+    /// least the request's `limit` at query time.
+    pub ann_candidate_limit: i64,
+    /// Value applied as `SET LOCAL hnsw.ef_search` on each retrieval
+    /// transaction (pgvector's default of 40 is too low once tombstones
+    /// accumulate; see docs/HNSW_MAINTENANCE.md). Clamped to at least the
+    /// effective ANN candidate limit at query time.
+    pub hnsw_ef_search: u32,
+    /// Local embedding lane for `private`/`secret` memories: an
+    /// OpenAI-compatible embeddings endpoint on this host or private network.
+    /// Loopback/private targets are allowed for THIS variable only (scoped
+    /// validation); when unset, operations that would send private content to
+    /// the remote provider are refused instead.
+    pub local_embedding_base_url: Option<String>,
 
     // ── Management API security ───────────────────────────────────────────────
     /// When set, all /api/v1/* routes require this key via
@@ -213,13 +233,28 @@ impl Config {
             },
 
             retrieval_threshold: std::env::var("RETRIEVAL_THRESHOLD")
-                .unwrap_or_else(|_| "0.80".to_string())
+                .unwrap_or_else(|_| DEFAULT_RETRIEVAL_THRESHOLD.to_string())
                 .parse()
                 .context("RETRIEVAL_THRESHOLD must be a float")?,
             memory_decay_rate: std::env::var("MEMORY_DECAY_RATE")
                 .unwrap_or_else(|_| "0.0".to_string())
                 .parse()
                 .context("MEMORY_DECAY_RATE must be a float")?,
+            ann_candidate_limit: std::env::var("ANN_CANDIDATE_LIMIT")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .context("ANN_CANDIDATE_LIMIT must be an integer")?,
+            hnsw_ef_search: std::env::var("HNSW_EF_SEARCH")
+                .unwrap_or_else(|_| "100".to_string())
+                .parse()
+                .context("HNSW_EF_SEARCH must be an integer")?,
+            local_embedding_base_url: match std::env::var("LOCAL_EMBEDDING_BASE_URL") {
+                Ok(raw) if !raw.trim().is_empty() => Some(validate_local_provider_url(
+                    "LOCAL_EMBEDDING_BASE_URL",
+                    raw.trim(),
+                )?),
+                _ => None,
+            },
             importance_boost_factor: std::env::var("IMPORTANCE_BOOST_FACTOR")
                 .unwrap_or_else(|_| "0.0".to_string())
                 .parse()

@@ -1,5 +1,6 @@
 mod api;
 mod archival;
+mod attestation;
 mod auth;
 mod config;
 mod db;
@@ -14,6 +15,8 @@ mod providers;
 mod proxy;
 mod rate_limit;
 mod rmk_worker;
+#[cfg(test)]
+mod test_support;
 mod url_guard;
 
 use std::sync::Arc;
@@ -38,6 +41,7 @@ pub struct AppState {
     pub metrics: Arc<metrics::Metrics>,
     pub provider: providers::Provider,
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
+    pub evidence_signer: Arc<attestation::EvidenceSigner>,
 }
 
 #[tokio::main]
@@ -116,6 +120,16 @@ async fn main() -> anyhow::Result<()> {
         config.rate_limit_burst,
     ));
 
+    let evidence_signer = Arc::new(attestation::EvidenceSigner::from_env()?);
+    if evidence_signer.persistent {
+        tracing::info!(key_id = %evidence_signer.key_id(), "Evidence signing key loaded from env");
+    } else {
+        tracing::warn!(
+            key_id = %evidence_signer.key_id(),
+            "AEON_EVIDENCE_SIGNING_KEY not set — using an ephemeral evidence signing key (key_id changes on restart; Nexus verifiers must pin a persistent key in production)"
+        );
+    }
+
     let state = AppState {
         config: config.clone(),
         db,
@@ -123,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: Arc::new(m),
         provider,
         rate_limiter,
+        evidence_signer,
     };
 
     // ── Background jobs ───────────────────────────────────────────────────────
@@ -142,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         }
         if config.rmk_config.enabled {
             tokio::spawn(rmk_worker::run_policy_update_job(state.clone()));
+            tokio::spawn(rmk_worker::run_task_success_aggregation_job(state.clone()));
             tokio::spawn(rmk_worker::run_co_access_decay_job(state.clone()));
             tokio::spawn(rmk_worker::run_pressure_sweep_job(state.clone()));
         } else if config.amp_config.enabled {
@@ -218,6 +234,10 @@ async fn main() -> anyhow::Result<()> {
                 post(api::restore_archival_batch),
             )
             .route("/stats", get(api::get_stats))
+            .route(
+                "/evidence/verifying-key",
+                get(api::get_evidence_verifying_key),
+            )
             .route("/feedback", post(api::post_feedback))
             .layer(middleware::from_fn_with_state(
                 state.clone(),

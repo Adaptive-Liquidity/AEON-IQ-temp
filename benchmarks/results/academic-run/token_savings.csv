@@ -1,0 +1,4 @@
+scenario,baseline_tokens,aeon_iq_tokens,injected_memory_tokens,delta,percent_savings,aeon_uses_more_tokens
+profile_recall,73,46,10,27,36.99,False
+archival_question,61,47,14,14,22.95,False
+small_context_overhead,16,53,26,-37,-231.25,True

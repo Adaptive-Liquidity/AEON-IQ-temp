@@ -264,6 +264,62 @@ pub fn validate_provider_url(var_name: &str, raw: &str) -> anyhow::Result<String
     Ok(url.to_string())
 }
 
+/// Validation for the **local embedding lane** (`LOCAL_EMBEDDING_BASE_URL`).
+///
+/// Unlike `validate_provider_url`, this lane exists precisely so
+/// sensitivity-labeled content can be embedded by a model running on this
+/// host or private network — so `http`, loopback, and RFC-1918 private
+/// addresses are permitted *for this variable only*, without the global
+/// `AEON_ALLOW_INSECURE_PROVIDER_URLS` escape hatch (which would also loosen
+/// the upstream and extractor guards).  Link-local (169.254.0.0/16 — the
+/// cloud-metadata range), multicast, and unspecified addresses remain
+/// blocked unconditionally.
+pub fn validate_local_provider_url(var_name: &str, raw: &str) -> anyhow::Result<String> {
+    let url = Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("{var_name}: failed to parse URL {raw:?}: {e}"))?;
+
+    let scheme = url.scheme();
+    if !matches!(scheme, "http" | "https") {
+        bail!(
+            "{var_name}: URL {raw:?} uses unsupported scheme {scheme:?}.              Only http or https is allowed for the local embedding lane."
+        );
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{var_name}: URL {raw:?} has no host"))?;
+    let port = url.port().unwrap_or(match scheme {
+        "https" => 443,
+        _ => 80,
+    });
+    let socket_addr_str = format!("{host}:{port}");
+    let addrs: Vec<IpAddr> = socket_addr_str
+        .to_socket_addrs()
+        .map_err(|e| {
+            anyhow::anyhow!("{var_name}: could not resolve host {host:?} in URL {raw:?}: {e}")
+        })?
+        .map(|sa| sa.ip())
+        .collect();
+
+    if addrs.is_empty() {
+        bail!("{var_name}: host {host:?} in URL {raw:?} resolved to zero addresses");
+    }
+
+    for addr in &addrs {
+        // Loopback and private ranges are the expected targets of this lane.
+        if is_dev_allowed(addr) {
+            continue;
+        }
+        if let Some(reason) = blocked_reason(*addr) {
+            bail!(
+                "{var_name}: URL {raw:?} resolved to {addr} which is a {reason} —                  blocked even for the local lane (metadata/link-local/multicast                  addresses are never legitimate embedding targets)."
+            );
+        }
+    }
+
+    Ok(url.to_string())
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -368,6 +424,30 @@ mod tests {
     }
 
     // ── Rejection cases: blocked_reason unit tests ─────────────────────────
+
+    #[test]
+    fn local_lane_allows_loopback_http() {
+        assert!(
+            validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "http://127.0.0.1:11434")
+                .is_ok()
+        );
+        assert!(
+            validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "http://localhost:8081")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn local_lane_blocks_metadata_and_bad_schemes() {
+        assert!(
+            validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "http://169.254.169.254")
+                .is_err(),
+            "cloud metadata must stay blocked even on the local lane"
+        );
+        assert!(
+            validate_local_provider_url("LOCAL_EMBEDDING_BASE_URL", "ftp://127.0.0.1").is_err()
+        );
+    }
 
     #[test]
     fn blocked_reason_identifies_ipv4_link_local() {

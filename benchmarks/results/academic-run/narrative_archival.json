@@ -1,0 +1,42 @@
+{
+  "agent_id": "bench-archival",
+  "batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+  "checks": {
+    "batch_record_completed": true,
+    "has_l3_narrative_memory": true,
+    "narrative_count_is_one": true,
+    "narrative_has_version_entry": true,
+    "same_archival_batch_linkage": true,
+    "source_l2_memories_tombstoned": true,
+    "trigger_http_ok": true,
+    "trigger_not_skipped": true
+  },
+  "details": {
+    "batch": {
+      "l3_count": 4,
+      "source_count": 12,
+      "status": "completed"
+    },
+    "l2_source_count": 12,
+    "l3_memory_count": 4,
+    "narrative_memory": [
+      {
+        "archival_batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+        "archived_at": null,
+        "content": "Mira's Nimbus work repeatedly emphasized Rust service design, weekly planning, and auditable memory history. The archived material forms one cohesive benchmark storyline.",
+        "id": "9d23b6a3-2cbc-4d44-84dc-b6543e521429",
+        "memory_type": "narrative",
+        "tier": "L3"
+      }
+    ],
+    "narrative_version_count": 1,
+    "trigger_response": {
+      "batch_id": "7da5bb58-8a5c-4893-b6c9-6659ceba810f",
+      "l3_count": 3,
+      "narrative_count": 1,
+      "source_count": 12,
+      "status": "completed"
+    }
+  },
+  "status": "pass"
+}
