@@ -2,10 +2,10 @@
 
 > **Give any AI agent persistent memory with zero code changes.**
 
-[![CI](https://github.com/adaptive-liquidity/aeon-iq/actions/workflows/ci.yml/badge.svg)](https://github.com/adaptive-liquidity/aeon-iq/actions/workflows/ci.yml)
-[![Benchmark Proof](https://github.com/Adaptive-Liquidity/AEON-IQ/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/Adaptive-Liquidity/AEON-IQ/actions/workflows/benchmarks.yml)
+[![CI](https://github.com/adaptiveliquidity/AEON-IQ/actions/workflows/ci.yml/badge.svg)](https://github.com/adaptiveliquidity/AEON-IQ/actions/workflows/ci.yml)
+[![Benchmark Proof](https://github.com/adaptiveliquidity/AEON-IQ/actions/workflows/benchmarks.yml/badge.svg)](https://github.com/adaptiveliquidity/AEON-IQ/actions/workflows/benchmarks.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fadaptive--liquidity%2Faeon--iq-blue)](https://ghcr.io/adaptive-liquidity/aeon-iq)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fadaptiveliquidity%2Faeon--iq-blue)](https://github.com/adaptiveliquidity/AEON-IQ/pkgs/container/aeon-iq)
 
 MemoryOS Kernel is a **transparent OpenAI-compatible proxy** that sits between your agent and any LLM. It automatically retrieves relevant past facts on every request and extracts new facts from every response — all in the background, with no changes to your existing code.
 
@@ -27,8 +27,8 @@ Your App  ──→  POST /v1/chat/completions  ──→  MemoryOS Kernel  ─�
 ## 30-second quickstart
 
 ```bash
-git clone https://github.com/adaptive-liquidity/aeon-iq
-cd aeon-iq
+git clone https://github.com/adaptiveliquidity/AEON-IQ.git
+cd AEON-IQ
 cp .env.example .env          # add your OPENAI_API_KEY
 docker compose up --build     # ~60 s first build, instant after
 ```

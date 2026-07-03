@@ -32,8 +32,8 @@ add one header.
 ## Step 1 — Clone & configure
 
 ```bash
-git clone https://github.com/adaptive-liquidity/aeon-iq
-cd aeon-iq
+git clone https://github.com/adaptiveliquidity/AEON-IQ.git
+cd AEON-IQ
 cp .env.example .env
 # Edit .env and set OPENAI_API_KEY=sk-...
 ```
