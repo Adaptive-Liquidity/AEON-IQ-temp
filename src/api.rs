@@ -1707,6 +1707,62 @@ pub async fn list_retrievals(
     })))
 }
 
+// ── Memory lifecycle timeline ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct LifecycleQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub struct LifecycleEventDto {
+    pub event_type: String,
+    pub memory_id: Option<String>,
+    pub timestamp: String,
+    pub detail: serde_json::Value,
+}
+
+/// GET /api/v1/agents/:id/lifecycle
+///
+/// Unified, chronological memory-lifecycle event feed for an agent: creation,
+/// modification, status change, narrative generation, archival consolidation /
+/// restoration, and retrieval — assembled from `memory_versions`,
+/// `archival_batches`, and `memory_retrieval_logs`. Newest-first, paginated.
+pub async fn agent_lifecycle(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    Query(q): Query<LifecycleQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let offset = q.offset.unwrap_or(0).max(0);
+
+    let events = store::fetch_lifecycle_events(&state, &agent_id, limit, offset)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total = store::count_lifecycle_events(&state, &agent_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let dtos: Vec<LifecycleEventDto> = events
+        .into_iter()
+        .map(|e| LifecycleEventDto {
+            event_type: e.event_type,
+            memory_id: e.memory_id.map(|id| id.to_string()),
+            timestamp: e.timestamp.to_rfc3339(),
+            detail: e.detail,
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "agent_id": agent_id,
+        "events": dtos,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
 // ── Memory versions ───────────────────────────────────────────────────────────
 
 #[derive(Serialize)]

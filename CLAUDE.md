@@ -218,6 +218,7 @@ AppState {
 | GET | `/api/v1/stats` | Agent + memory counts |
 | POST | `/api/v1/feedback` | Record retrieval-quality feedback; updates `utility_ema` |
 | GET | `/api/v1/agents/:id/retrievals` | Paginated retrieval log (session_id filter available) |
+| GET | `/api/v1/agents/:id/lifecycle` | Unified chronological memory-lifecycle event feed (created/modified/status_changed/narrative_generated/consolidation/batch_restored/retrieval), paginated; UNION over `memory_versions` + `archival_batches` + `memory_retrieval_logs` |
 | GET | `/api/v1/memories/:id/versions` | Full version history for a memory |
 | PATCH | `/api/v1/memories/:id/status` | Set status (active\|candidate\|quarantined\|suppressed); creates version snapshot |
 | PATCH | `/api/v1/memories/:id/sensitivity` | Set sensitivity (unknown\|normal\|private\|sensitive\|secret) |
