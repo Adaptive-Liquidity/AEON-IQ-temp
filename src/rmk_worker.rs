@@ -96,8 +96,7 @@ async fn update_policy_for_agent(
                 if let Some((prev_mean, prev_n)) =
                     store::get_mean_reward_for_policy(&state.db, prev_id).await?
                 {
-                    if prev_n >= MIN_EPISODES_PER_POLICY
-                        && !decide_accept(current_mean, prev_mean)
+                    if prev_n >= MIN_EPISODES_PER_POLICY && !decide_accept(current_mean, prev_mean)
                     {
                         store::mark_policy_rejected(&state.db, current_id).await?;
                         info!(
@@ -397,34 +396,48 @@ mod tests {
         const AGENT: &str = "rmk-hillclimb-agent";
 
         // Policy A (good), then policy B (newer, worse).
-        let mut params_a = PolicyParams::default();
-        params_a.kp = 0.33; // distinctive marker for identity checks
-        let id_a = store::insert_policy(&state.db, AGENT, &params_a).await.unwrap();
+        let params_a = PolicyParams {
+            kp: 0.33, // distinctive marker for identity checks
+            ..Default::default()
+        };
+        let id_a = store::insert_policy(&state.db, AGENT, &params_a)
+            .await
+            .unwrap();
         insert_episodes_for_policy(&state, AGENT, id_a, &[2.0; 6]).await;
 
-        let mut params_b = PolicyParams::default();
-        params_b.kp = 0.77;
-        let id_b = store::insert_policy(&state.db, AGENT, &params_b).await.unwrap();
+        let params_b = PolicyParams {
+            kp: 0.77,
+            ..Default::default()
+        };
+        let id_b = store::insert_policy(&state.db, AGENT, &params_b)
+            .await
+            .unwrap();
         insert_episodes_for_policy(&state, AGENT, id_b, &[1.0; 6]).await;
 
         // Sanity: B currently serves.
-        let (serving, _) = store::get_latest_policy(&state.db, AGENT).await.unwrap().unwrap();
+        let (serving, _) = store::get_latest_policy(&state.db, AGENT)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(serving, id_b);
 
         // One worker cycle with ε = 0 (deterministic re-roll).
-        update_policy_for_agent(&state, AGENT, 1, 0.0).await.unwrap();
+        update_policy_for_agent(&state, AGENT, 1, 0.0)
+            .await
+            .unwrap();
 
         // B is rejected; the new serving policy carries A's parameters.
-        let status_b: String =
-            sqlx::query_scalar("SELECT status FROM rmk_policies WHERE id = $1")
-                .bind(id_b)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
+        let status_b: String = sqlx::query_scalar("SELECT status FROM rmk_policies WHERE id = $1")
+            .bind(id_b)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
         assert_eq!(status_b, "rejected", "regressing policy must be rejected");
 
-        let (new_id, new_params) =
-            store::get_latest_policy(&state.db, AGENT).await.unwrap().unwrap();
+        let (new_id, new_params) = store::get_latest_policy(&state.db, AGENT)
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(new_id, id_b, "rejected policy must not serve");
         assert_eq!(
             new_params.kp, params_a.kp,
@@ -439,29 +452,43 @@ mod tests {
         let state = test_state(pool);
         const AGENT: &str = "rmk-improve-agent";
 
-        let mut params_a = PolicyParams::default();
-        params_a.kp = 0.33;
-        let id_a = store::insert_policy(&state.db, AGENT, &params_a).await.unwrap();
+        let params_a = PolicyParams {
+            kp: 0.33,
+            ..Default::default()
+        };
+        let id_a = store::insert_policy(&state.db, AGENT, &params_a)
+            .await
+            .unwrap();
         insert_episodes_for_policy(&state, AGENT, id_a, &[1.0; 6]).await;
 
-        let mut params_b = PolicyParams::default();
-        params_b.kp = 0.77;
-        let id_b = store::insert_policy(&state.db, AGENT, &params_b).await.unwrap();
+        let params_b = PolicyParams {
+            kp: 0.77,
+            ..Default::default()
+        };
+        let id_b = store::insert_policy(&state.db, AGENT, &params_b)
+            .await
+            .unwrap();
         insert_episodes_for_policy(&state, AGENT, id_b, &[2.0; 6]).await;
 
-        update_policy_for_agent(&state, AGENT, 1, 0.0).await.unwrap();
+        update_policy_for_agent(&state, AGENT, 1, 0.0)
+            .await
+            .unwrap();
 
-        let status_b: String =
-            sqlx::query_scalar("SELECT status FROM rmk_policies WHERE id = $1")
-                .bind(id_b)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
+        let status_b: String = sqlx::query_scalar("SELECT status FROM rmk_policies WHERE id = $1")
+            .bind(id_b)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
         assert_eq!(status_b, "accepted");
 
-        let (_, new_params) =
-            store::get_latest_policy(&state.db, AGENT).await.unwrap().unwrap();
-        assert_eq!(new_params.kp, params_b.kp, "candidate explores from the survivor");
+        let (_, new_params) = store::get_latest_policy(&state.db, AGENT)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_params.kp, params_b.kp,
+            "candidate explores from the survivor"
+        );
     }
 
     /// Feedback aggregation backfills task_success (and recomputes reward)
@@ -517,7 +544,10 @@ mod tests {
         }
 
         let updated = aggregate_task_success(&state).await.unwrap();
-        assert_eq!(updated, 1, "exactly the episode with injected memories updates");
+        assert_eq!(
+            updated, 1,
+            "exactly the episode with injected memories updates"
+        );
 
         use sqlx::Row;
         let rows = sqlx::query(
@@ -533,10 +563,16 @@ mod tests {
         let fed: &sqlx::postgres::PgRow = &rows[0]; // s1
         assert_eq!(fed.get::<String, _>("task_success_source"), "feedback");
         let ts: f64 = fed.get("task_success");
-        assert!((ts - 0.25).abs() < 1e-9, "task_success = avg feedback, got {ts}");
+        assert!(
+            (ts - 0.25).abs() < 1e-9,
+            "task_success = avg feedback, got {ts}"
+        );
         // reward recomputed with default weights: 1.0*0.25 + 0.5*0.4 + 1.0*0.2 - 0.1*0.0
         let reward: f64 = fed.get("reward");
-        assert!((reward - 0.65).abs() < 1e-9, "reward recomputed, got {reward}");
+        assert!(
+            (reward - 0.65).abs() < 1e-9,
+            "reward recomputed, got {reward}"
+        );
 
         let unfed: &sqlx::postgres::PgRow = &rows[1]; // s2
         assert_eq!(unfed.get::<String, _>("task_success_source"), "assumed");
