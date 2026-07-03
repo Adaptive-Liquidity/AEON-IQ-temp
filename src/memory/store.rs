@@ -838,6 +838,124 @@ pub async fn retrieval_activity_between(
     Ok((total_row.0, unique_row.0))
 }
 
+// ── Memory lifecycle timeline ─────────────────────────────────────────────────
+
+/// One event in an agent's memory lifecycle feed.  `memory_id` is `None` for
+/// agent-level events (archival batches, retrievals) that are not tied to a
+/// single memory.  `detail` carries event-type-specific fields as JSON.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LifecycleEvent {
+    pub event_type: String,
+    pub memory_id: Option<Uuid>,
+    pub timestamp: DateTime<Utc>,
+    pub detail: serde_json::Value,
+}
+
+/// Assemble a chronological memory-lifecycle event feed for one agent by
+/// UNION-ing the tables that already record lifecycle transitions:
+/// `memory_versions` (creation, modification, status change, and — when the
+/// versioned row is a narrative — narrative generation), `archival_batches`
+/// (consolidation, and restoration when `status = 'restored'`), and
+/// `memory_retrieval_logs` (retrievals).  No new table is required — every
+/// event type is already persisted.  Ordered newest-first, paginated.
+pub async fn fetch_lifecycle_events(
+    state: &AppState,
+    agent_id: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LifecycleEvent>> {
+    let rows: Vec<(String, Option<Uuid>, DateTime<Utc>, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT event_type, memory_id, ts, detail FROM (
+            SELECT
+                CASE
+                    WHEN change_type = 'initial' AND memory_type = 'narrative'
+                        THEN 'narrative_generated'
+                    WHEN change_type = 'initial'      THEN 'created'
+                    WHEN change_type = 'patch'        THEN 'modified'
+                    WHEN change_type = 'status_change' THEN 'status_changed'
+                    ELSE change_type
+                END AS event_type,
+                memory_id,
+                created_at AS ts,
+                jsonb_build_object(
+                    'version_number', version_number,
+                    'memory_type', memory_type,
+                    'status', status,
+                    'change_type', change_type
+                ) AS detail
+            FROM memory_versions
+            WHERE agent_id = $1
+
+            UNION ALL
+
+            SELECT
+                CASE WHEN status = 'restored' THEN 'batch_restored' ELSE 'consolidation' END
+                    AS event_type,
+                NULL::uuid AS memory_id,
+                created_at AS ts,
+                jsonb_build_object(
+                    'batch_id', id,
+                    'source_count', source_count,
+                    'l3_count', l3_count,
+                    'status', status
+                ) AS detail
+            FROM archival_batches
+            WHERE agent_id = $1
+
+            UNION ALL
+
+            SELECT
+                'retrieval' AS event_type,
+                NULL::uuid AS memory_id,
+                created_at AS ts,
+                jsonb_build_object(
+                    'query_hash', query_hash,
+                    'injected_count', COALESCE(array_length(injected_memory_ids, 1), 0)
+                ) AS detail
+            FROM memory_retrieval_logs
+            WHERE agent_id = $1
+        ) events
+        ORDER BY ts DESC
+        LIMIT $2 OFFSET $3
+        "#,
+    )
+    .bind(agent_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(event_type, memory_id, timestamp, detail)| LifecycleEvent {
+                event_type,
+                memory_id,
+                timestamp,
+                detail,
+            },
+        )
+        .collect())
+}
+
+/// Total lifecycle-event count for an agent (for pagination).
+pub async fn count_lifecycle_events(state: &AppState, agent_id: &str) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT (
+            (SELECT COUNT(*) FROM memory_versions        WHERE agent_id = $1)
+          + (SELECT COUNT(*) FROM archival_batches       WHERE agent_id = $1)
+          + (SELECT COUNT(*) FROM memory_retrieval_logs  WHERE agent_id = $1)
+        )::bigint
+        "#,
+    )
+    .bind(agent_id)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(row.0)
+}
+
 // ── Cognitive Hypervisor timeline ────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -2856,5 +2974,102 @@ mod tests {
             !plan.contains("Seq Scan on memories"),
             "retrieval plan regressed to a sequential scan:\n{plan}"
         );
+    }
+
+    /// #11: the lifecycle feed unions every lifecycle source (memory_versions,
+    /// archival_batches, memory_retrieval_logs) into one chronological,
+    /// paginated stream with the expected event types.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn lifecycle_feed_unions_all_event_sources(pool: sqlx::PgPool) {
+        let state = build_state(pool, 0.0);
+        const AGENT: &str = "lifecycle-agent";
+
+        sqlx::query("INSERT INTO agents (agent_id) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(AGENT)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // A normal memory → a version-1 'created' event.
+        store_memory_with_tier(
+            &state,
+            AGENT,
+            None,
+            "a fact",
+            "semantic",
+            0.6,
+            unit_vec(1),
+            None,
+            "L2",
+            "user_stated",
+            0.5,
+            "extractor",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A narrative L3 row → a 'narrative_generated' event.
+        store_memory_with_tier(
+            &state,
+            AGENT,
+            None,
+            "a narrative",
+            "narrative",
+            0.7,
+            unit_vec(2),
+            None,
+            "L3",
+            "inferred",
+            0.5,
+            "extractor",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An archival batch → a 'consolidation' event.
+        create_archival_batch(&state, AGENT, 3, 2).await.unwrap();
+
+        // A retrieval log → a 'retrieval' event.
+        sqlx::query(
+            "INSERT INTO memory_retrieval_logs (agent_id, query_hash, injected_memory_ids)
+             VALUES ($1, $2, '{}')",
+        )
+        .bind(AGENT)
+        .bind("deadbeef")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+        let events = fetch_lifecycle_events(&state, AGENT, 50, 0).await.unwrap();
+        let types: std::collections::HashSet<&str> =
+            events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(types.contains("created"), "missing created: {types:?}");
+        assert!(
+            types.contains("narrative_generated"),
+            "missing narrative_generated: {types:?}"
+        );
+        assert!(
+            types.contains("consolidation"),
+            "missing consolidation: {types:?}"
+        );
+        assert!(types.contains("retrieval"), "missing retrieval: {types:?}");
+
+        // Newest-first ordering.
+        for pair in events.windows(2) {
+            assert!(
+                pair[0].timestamp >= pair[1].timestamp,
+                "events must be ordered newest-first"
+            );
+        }
+
+        // 2 versions + 1 batch + 1 retrieval = 4 events total.
+        let total = count_lifecycle_events(&state, AGENT).await.unwrap();
+        assert_eq!(total, 4, "expected 4 lifecycle events, got {total}");
+
+        // Pagination: limit=1 returns exactly one event.
+        let first_page = fetch_lifecycle_events(&state, AGENT, 1, 0).await.unwrap();
+        assert_eq!(first_page.len(), 1);
     }
 }

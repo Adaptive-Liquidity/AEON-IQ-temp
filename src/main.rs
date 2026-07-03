@@ -214,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
                 delete(api::delete_session),
             )
             .route("/agents/:agent_id/retrievals", get(api::list_retrievals))
+            .route("/agents/:agent_id/lifecycle", get(api::agent_lifecycle))
             .route("/agents/:agent_id/conflicts", get(api::list_conflicts))
             .route(
                 "/conflicts/:conflict_id/resolve",
