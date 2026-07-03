@@ -57,7 +57,7 @@ run_logged docker_compose_ps docker compose -f docker-compose.test.yml ps
 
 run_logged cargo_fmt cargo fmt --check
 run_logged cargo_clippy cargo clippy -- -D warnings
-run_logged cargo_unit_skip_store cargo test -- --skip memory::store::tests --skip rmk_worker::tests
+run_logged cargo_unit_skip_store cargo test -- --skip memory::store::tests --skip rmk_worker::tests --skip archival::tests::persist_archival
 run_logged cargo_full_db env DATABASE_URL="$DATABASE_URL" cargo test
 run_logged python_compileall python3 -m compileall -q benchmarks mock_openai_server.py run_tests.py test_memory.py
 run_logged test_memory python3 test_memory.py

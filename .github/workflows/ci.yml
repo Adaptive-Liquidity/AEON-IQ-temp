@@ -42,7 +42,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Unit tests (skip DB integration)
-        run: cargo test -- --skip memory::store::tests --skip rmk_worker::tests
+        run: cargo test -- --skip memory::store::tests --skip rmk_worker::tests --skip archival::tests::persist_archival
 
   # ── Full integration tests (pgvector Postgres required) ─────────────────────
   integration:
