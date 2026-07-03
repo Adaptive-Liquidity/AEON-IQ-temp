@@ -127,7 +127,7 @@ The extraction prompt (`EXTRACTION_SYSTEM_PROMPT` in `src/memory/extraction.rs`)
 
 ### Database
 
-Migrations run automatically at startup via `sqlx::migrate!("./migrations")`. The kernel uses `sqlx::query` (non-macro form) throughout to avoid compile-time DB dependency — never use `sqlx::query!` macros.  Current migration range: 0001–0026.
+Migrations run automatically at startup via `sqlx::migrate!("./migrations")`. The kernel uses `sqlx::query` (non-macro form) throughout to avoid compile-time DB dependency — never use `sqlx::query!` macros.  Current migration range: 0001–0027.
 
 `QueryBuilder` is used for dynamic filter composition (filters on `memory_type`, `session_id`, etc.). The vector embedding is always bound exactly once inside a CTE to avoid double-binding.
 
@@ -153,6 +153,7 @@ Migrations run automatically at startup via `sqlx::migrate!("./migrations")`. Th
 | `IMPORTANCE_REFRESH_BOOST` | `0.05` | Per-retrieval importance bump; 0 = disabled |
 | `ANN_CANDIDATE_LIMIT` | `100` | Stage-1 ANN candidate count before decay/importance re-rank |
 | `HNSW_EF_SEARCH` | `100` | `SET LOCAL hnsw.ef_search` per retrieval transaction (clamped ≥ candidate limit) |
+| `LOCAL_EMBEDDING_BASE_URL` | unset | Local lane (loopback/private allowed, scoped validation) for embedding `private`/`secret` content; when unset such operations are refused |
 | `RATE_LIMIT_RPM` | `0` | Per-agent request cap; 0 = disabled |
 | `MANAGEMENT_API_KEY` | unset | Required unless `ALLOW_UNAUTH_MANAGEMENT=true`; protects `/api/v1/*` |
 | `ALLOW_UNAUTH_MANAGEMENT` | `false` | Must be `true` when no management key is set (dev only; logs warning) |
@@ -195,7 +196,10 @@ AppState {
 | GET | `/api/v1/agents/:id/memories/at` | Time-travel snapshot at `timestamp` using latest version per memory at or before that time |
 | GET | `/api/v1/agents/:id/memories/diff` | Temporal diff in `[from,to]`: added, modified, archived, status_changed, retrieval_activity |
 | POST | `/api/v1/agents/:id/memories` | Create memory manually |
-| PATCH | `/api/v1/memories/:id` | Update memory content (re-embeds) |
+| PATCH | `/api/v1/memories/:id` | Update memory content (re-embeds; `private`/`secret` rows use the local embedding lane or are refused with 409) |
+| POST | `/api/v1/agents/:id/timeline` | Append hash-chained cognitive-hypervisor timeline event (server computes `prev_event_digest`) |
+| GET | `/api/v1/agents/:id/timeline/at` | Resolve latest snapshot at a timestamp (branch-aware via `branch_id`) |
+| GET | `/api/v1/evidence/verifying-key` | Ed25519 evidence-signature verifying key (key_id + persistence) |
 | GET | `/api/v1/agents/:id/memories/archived` | Tombstoned memories |
 | GET | `/api/v1/agents/:id/archival/batches` | Archival batch history |
 | POST | `/api/v1/agents/:id/archival/trigger` | Manually trigger L2→L3 compaction |
@@ -297,11 +301,25 @@ Prometheus metrics at `GET /metrics` (text format 0.0.4). Key counters/histogram
 - `run_policy_update_job` — sleeps for `update_cooldown_secs` (default 3600 s); for each agent with ≥ `min_episodes_before_update` (default 20) episodes: compares the serving policy's mean episode reward (per `rmk_episodes.policy_id`) against its predecessor's — a regression (both with ≥ 5 episodes) is marked rejected and the next candidate re-rolls from the last known-good policy; then applies `MetaLearner::suggest_explore()` and persists the candidate
 - `run_task_success_aggregation_job` — every 120 s, backfills `task_success` (and recomputes reward) on recent episodes from `retrieval_feedback` rows matching the episode's `injected_memory_ids` (24 h attribution window; episodes without feedback keep the assumed 1.0)
 - `run_co_access_decay_job` — runs once per day; calls `CoAccessGraph::decay_all()` to apply weight decay and prune stale edges
-- `run_pressure_sweep_job` — runs every 5 minutes; for each agent: counts active memories, drives a fresh `PIController`, computes pressure for each memory via `PressureManager::compute_pressure()`, batch-updates the `pressure` column, soft-evicts memories above `threshold_high`, and restores those below `threshold_low`
+- `run_pressure_sweep_job` — runs every 5 minutes; for each agent: counts active memories, drives a `PIController` restored from persisted per-agent state (`amp_controller_state`, migration 0027, so integral action accumulates across sweeps), computes pressure for each memory via `PressureManager::compute_pressure()`, batch-updates the `pressure` column in one UNNEST statement, soft-evicts memories above `threshold_high`, and restores those below `threshold_low`
 
 `run_policy_update_job` and `run_pressure_sweep_job` start when `RMK_ENABLED=true`; `run_co_access_decay_job` and `run_pressure_sweep_job` also start when `AMP_ENABLED=true` without RMK.
 
 **Episode metrics** (proxy.rs): `token_savings` is computed from `injected_chars / (prompt_chars + injected_chars)`; `eviction_cost` queries the real fraction of soft-evicted memories for the agent.  `task_success` starts at 1.0 ("assumed"); the aggregation worker backfills a feedback-derived value for episodes whose injected memories later receive `/api/v1/feedback` (source-tagged via `task_success_source`).
+
+### Sensitivity enforcement ("private never leaves the box")
+
+Sensitivity is assigned post-hoc via `PATCH /api/v1/memories/:id/sensitivity`
+(inserts default `'unknown'`; the extractor never assigns it), so enforcement
+targets already-labeled rows re-touching the provider:
+- Retrieval injection excludes `private`/`secret` (`filter_sensitive` path).
+- Archival candidates exclude `private`/`secret` (they never auto-compact).
+- Conflict-detection candidates exclude `private`/`secret`; the new-content
+  prompt is safe by timing (content is `'unknown'` at insert-time detection).
+- PATCH re-embed routes `private`/`secret` content through
+  `LOCAL_EMBEDDING_BASE_URL` (scoped validation permits loopback/private for
+  this variable only) or refuses with 409 when no local lane is configured
+  (`embeddings::embed_text_for_sensitivity`).
 
 ### Memory status, sensitivity, and validity (migration 0019)
 

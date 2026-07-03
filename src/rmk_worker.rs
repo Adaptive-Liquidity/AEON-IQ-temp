@@ -234,10 +234,32 @@ async fn run_pressure_sweep_for_agent(state: &AppState, agent_id: &str) -> anyho
     .fetch_one(&state.db)
     .await?;
 
-    // Fresh PI controller per sweep — acceptable for Phase 1; integral_error
-    // will re-converge within a few cycles.
-    let mut pi = PIController::new(controller_params);
+    // Restore persisted controller state so integral action accumulates
+    // across sweeps (fresh construction discarded it every 5 minutes).
+    let prior: Option<(f64, f64)> = sqlx::query_as(
+        "SELECT aggressiveness, integral_error FROM amp_controller_state WHERE agent_id = $1",
+    )
+    .bind(agent_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let (agg0, int0) = prior.unwrap_or((0.0, 0.0));
+    let mut pi = PIController::with_state(controller_params, agg0, int0);
     let (threshold_high, threshold_low) = pi.update(current_count as u64, target, 1.0);
+    let (agg1, int1) = pi.state();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO amp_controller_state (agent_id, aggressiveness, integral_error, updated_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (agent_id) DO UPDATE
+             SET aggressiveness = $2, integral_error = $3, updated_at = NOW()",
+    )
+    .bind(agent_id)
+    .bind(agg1)
+    .bind(int1)
+    .execute(&state.db)
+    .await
+    {
+        warn!(agent_id = %agent_id, "Pressure sweep: controller-state persist failed: {}", e);
+    }
 
     // Fetch all non-archived memories (including currently soft-evicted ones so we
     // can restore them) with the pressure-relevant columns.
@@ -489,6 +511,59 @@ mod tests {
             new_params.kp, params_b.kp,
             "candidate explores from the survivor"
         );
+    }
+
+    /// Controller state persists across pressure sweeps: with the active
+    /// count held above target, integral error accumulates from one sweep to
+    /// the next instead of resetting (the pre-fix behaviour).
+    #[sqlx::test(migrations = "./migrations")]
+    async fn controller_state_persists_across_sweeps(pool: sqlx::PgPool) {
+        let mut state = test_state(pool);
+        let mut cfg = (*state.config).clone();
+        cfg.amp_config.target_active_count = 1;
+        state.config = std::sync::Arc::new(cfg);
+        const AGENT: &str = "amp-state-agent";
+
+        let zero_vec = format!("[{}]", vec!["0"; 1536].join(","));
+        for i in 0..3 {
+            sqlx::query(
+                "INSERT INTO memories (agent_id, content, memory_type, confidence, embedding)
+                 VALUES ($1, $2, 'semantic', 1.0, $3::vector)",
+            )
+            .bind(AGENT)
+            .bind(format!("m{i}"))
+            .bind(&zero_vec)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+
+        run_pressure_sweep_for_agent(&state, AGENT).await.unwrap();
+        let (agg1, int1): (f64, f64) = sqlx::query_as(
+            "SELECT aggressiveness, integral_error FROM amp_controller_state WHERE agent_id = $1",
+        )
+        .bind(AGENT)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(
+            int1 > 0.0,
+            "positive error must accumulate integral, got {int1}"
+        );
+
+        run_pressure_sweep_for_agent(&state, AGENT).await.unwrap();
+        let (agg2, int2): (f64, f64) = sqlx::query_as(
+            "SELECT aggressiveness, integral_error FROM amp_controller_state WHERE agent_id = $1",
+        )
+        .bind(AGENT)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert!(
+            int2 > int1,
+            "integral must keep accumulating across sweeps ({int1} -> {int2})"
+        );
+        assert!((0.0..=1.0).contains(&agg1) && (0.0..=1.0).contains(&agg2));
     }
 
     /// Feedback aggregation backfills task_success (and recomputes reward)

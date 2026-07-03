@@ -778,12 +778,35 @@ pub async fn patch_memory(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let uuid = Uuid::parse_str(&id).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let embedding = embed_text(&state, &body.content).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Embedding: {}", e),
-        )
-    })?;
+    // A PATCH re-embeds content for a row that may already carry a
+    // sensitivity label — the one path where labeled content could reach the
+    // remote provider.  Route private/secret through the local lane (or
+    // refuse with 409 when none is configured).
+    let sensitivity: Option<String> =
+        sqlx::query_scalar("SELECT sensitivity FROM memories WHERE id = $1")
+            .bind(uuid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(sensitivity) = sensitivity else {
+        return Err((StatusCode::NOT_FOUND, format!("memory {} not found", id)));
+    };
+
+    let embedding =
+        crate::embeddings::embed_text_for_sensitivity(&state, &body.content, &sensitivity)
+            .await
+            .map_err(|e| {
+                if crate::embeddings::is_private_sensitivity(&sensitivity)
+                    && state.config.local_embedding_base_url.is_none()
+                {
+                    (StatusCode::CONFLICT, format!("{}", e))
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Embedding: {}", e),
+                    )
+                }
+            })?;
 
     let updated = store::update_memory_content(&state, uuid, &body.content, embedding)
         .await

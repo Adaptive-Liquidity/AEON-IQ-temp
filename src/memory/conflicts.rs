@@ -59,6 +59,14 @@ async fn run_detection(
         return Ok(());
     }
 
+    // Privacy note: `new_content` is sent to the extractor provider.  This is
+    // safe because sensitivity is assigned post-hoc only (PATCH
+    // /memories/:id/sensitivity) — a memory is always 'unknown' at insert
+    // time, when conflict detection runs, so labeled private/secret content
+    // can never reach this prompt.  The candidate SELECT above additionally
+    // excludes private/secret rows from the comparison set.  If sensitivity
+    // ever becomes assignable at insert time, this path must gain the same
+    // guard as PATCH re-embed (see embeddings::embed_text_for_sensitivity).
     let numbered: String = candidates
         .iter()
         .enumerate()

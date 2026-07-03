@@ -105,6 +105,63 @@ PowerShell:
 | Production-scale retrieval latency at 10,000+ memories | 10,000-memory seed is optional and not required by current CI proof | Curated 10,000+ memory results |
 | Live-provider archival quality | Default suite uses mock extraction and compaction | Optional env-gated live provider run |
 | k6 as production load proof | k6 checks are proof smoke tests, not a production load model | Curated production-like load report |
+| Semantic recall quality on LongMemEval/LoCoMo | Semantic benchmark is optional and env-gated (`AEON_SEMANTIC_BENCHMARK=true`), cost-gated (real embedding provider), runs fixed sampled subsets rather than full datasets, and has no mem0 comparison yet (deferred) | Curated env-gated runs on published subsets, plus a mem0 side-by-side |
+
+## Semantic Recall Benchmark (Optional, Env-Gated)
+
+`benchmarks/scripts/run_semantic_quality.py` measures SEMANTIC recall quality on
+public long-memory datasets (LongMemEval, LoCoMo), complementing the mechanical
+recall proof (`run_recall_quality.py`, deterministic hash embeddings). It is
+API-first: memories are seeded via `POST /api/v1/agents/:id/memories` so the
+kernel embeds them server-side with whatever real embedding model it is
+configured with, and queries go through `POST /api/v1/memories/search`. The
+client never computes embeddings and never touches the database.
+
+It is intentionally NOT part of the required CI proof: unless
+`AEON_SEMANTIC_BENCHMARK=true` it writes a `not_run` artifact
+(`semantic_quality.json`) and exits 0. It must never become a required CI gate
+— runs cost real embedding-API money and depend on external datasets.
+
+How to run:
+
+1. Point the kernel at a real provider — a plain env-var change per CLAUDE.md
+   (`UPSTREAM_PROVIDER`, `UPSTREAM_BASE_URL`, `EMBEDDING_BASE_URL`,
+   `EMBEDDING_MODEL`, `EMBEDDING_DIMENSION`, provider API key) — and restart it.
+2. Supply a dataset file: download LongMemEval
+   (`longmemeval_s.json`/`longmemeval_oracle.json`) or LoCoMo (`locomo10.json`)
+   and pass `--dataset-file`. If omitted, the script best-effort downloads
+   (Hugging Face for LongMemEval, GitHub raw for LoCoMo) and emits `not_run`
+   with a clear reason if the network is restricted.
+3. Run, once per condition:
+
+```bash
+AEON_SEMANTIC_BENCHMARK=true MANAGEMENT_API_KEY=... \
+python3 benchmarks/scripts/run_semantic_quality.py \
+  --dataset longmemeval --dataset-file /path/to/longmemeval_oracle.json \
+  --sample-size 100 --condition aeon-full \
+  --results-dir benchmarks/results/manual
+```
+
+Two conditions are compared by reconfiguring the KERNEL, not the script — the
+`--condition` flag is only a label recorded in the results:
+
+- `aeon-full`: kernel with the ranking features under test enabled (e.g.
+  `MEMORY_DECAY_RATE`, `IMPORTANCE_BOOST_FACTOR`, `AMP_ENABLED=true`, etc.).
+- `cosine-baseline`: kernel started with `MEMORY_DECAY_RATE=0`
+  `IMPORTANCE_BOOST_FACTOR=0` `AMP_ENABLED=false` `RMK_ENABLED=false`
+  `GRAPH_RETRIEVAL_ENABLED=false`, which per the retrieval docs collapses the
+  adjusted-distance formula to pure cosine similarity.
+
+Sampling is seeded (`--seed`, default 42) and stratified by question
+type/category when the dataset provides one. Each question (LongMemEval) or
+conversation (LoCoMo) gets its own isolated `sem-*` agent, deleted after
+evaluation unless `--keep-agents` is passed. `AEON_SEMANTIC_THRESHOLD`
+(default 0.95) sets the search cosine-distance threshold.
+
+Metrics per query: first-gold rank, recall@{1,3,5,10}, MRR@10, nDCG@10
+(binary relevance), precision@5; aggregated overall and per category, plus
+search-latency percentiles. Artifacts:
+`semantic_quality_{dataset}.json` and `semantic_quality_{dataset}.csv`.
 
 ## Known Limitations
 

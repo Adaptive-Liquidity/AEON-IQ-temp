@@ -1845,6 +1845,7 @@ mod tests {
                 importance_refresh_boost: 0.05,
                 ann_candidate_limit: 100,
                 hnsw_ef_search: 100,
+                local_embedding_base_url: None,
                 management_api_key: None,
                 allow_unauth_management: true,
                 max_body_bytes: 10 * 1024 * 1024,

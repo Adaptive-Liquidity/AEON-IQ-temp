@@ -1,6 +1,6 @@
 use crate::memory::amp::config::AmpConfig;
 use crate::memory::rmk::config::RmkConfig;
-use crate::url_guard::validate_provider_url;
+use crate::url_guard::{validate_local_provider_url, validate_provider_url};
 use anyhow::{Context, Result};
 
 /// Default retrieval-distance threshold, shared by the static env config and
@@ -97,6 +97,12 @@ pub struct Config {
     /// accumulate; see docs/HNSW_MAINTENANCE.md). Clamped to at least the
     /// effective ANN candidate limit at query time.
     pub hnsw_ef_search: u32,
+    /// Local embedding lane for `private`/`secret` memories: an
+    /// OpenAI-compatible embeddings endpoint on this host or private network.
+    /// Loopback/private targets are allowed for THIS variable only (scoped
+    /// validation); when unset, operations that would send private content to
+    /// the remote provider are refused instead.
+    pub local_embedding_base_url: Option<String>,
 
     // ── Management API security ───────────────────────────────────────────────
     /// When set, all /api/v1/* routes require this key via
@@ -242,6 +248,13 @@ impl Config {
                 .unwrap_or_else(|_| "100".to_string())
                 .parse()
                 .context("HNSW_EF_SEARCH must be an integer")?,
+            local_embedding_base_url: match std::env::var("LOCAL_EMBEDDING_BASE_URL") {
+                Ok(raw) if !raw.trim().is_empty() => Some(validate_local_provider_url(
+                    "LOCAL_EMBEDDING_BASE_URL",
+                    raw.trim(),
+                )?),
+                _ => None,
+            },
             importance_boost_factor: std::env::var("IMPORTANCE_BOOST_FACTOR")
                 .unwrap_or_else(|_| "0.0".to_string())
                 .parse()
