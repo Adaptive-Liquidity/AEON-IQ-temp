@@ -11,7 +11,7 @@ cargo build                        # debug build
 cargo build --release              # production build
 
 # Unit tests only (no database required)
-cargo test -- --skip memory::store::tests --skip rmk_worker::tests
+cargo test -- --skip memory::store::tests --skip rmk_worker::tests --skip archival::tests::persist_archival
 
 # All tests including DB integration tests (requires DATABASE_URL → pgvector Postgres)
 # Run `docker compose up postgres` first, then:

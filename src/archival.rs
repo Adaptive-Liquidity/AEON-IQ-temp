@@ -132,14 +132,9 @@ pub async fn archive_agent(
     }
 
     // ── Create versioned batch record before mutating any rows ───────────────
-    let fact_count = compaction.facts.len();
-    let narrative_text = compaction
-        .narrative
-        .as_ref()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let narrative_text = narrative_text(&compaction);
     let narrative_count = if narrative_text.is_some() { 1 } else { 0 };
-    let stored_l3_count = fact_count + narrative_count;
+    let stored_l3_count = compaction.facts.len() + narrative_count;
 
     let batch_id =
         store::create_archival_batch(state, agent_id, count as i32, stored_l3_count as i32).await?;
@@ -159,6 +154,43 @@ pub async fn archive_agent(
             return Ok(None);
         }
     };
+
+    persist_archival(
+        state,
+        agent_id,
+        &candidates,
+        &compaction,
+        batch_id,
+        embeddings,
+    )
+    .await
+}
+
+/// Trim-and-filter the narrative to a non-empty string (or `None`).
+fn narrative_text(compaction: &CompactionOutput) -> Option<String> {
+    compaction
+        .narrative
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persist a compaction result: store the compressed L3 facts and (when present)
+/// the narrative L3 row — all tagged with `batch_id` — then tombstone the L2
+/// sources.  Split out of `archive_agent` so it can be exercised deterministically
+/// with a canned `CompactionOutput` + pre-computed embeddings, without the LLM or
+/// the embedding HTTP call.  `embeddings` must be ordered facts-first, narrative
+/// last (matching `archive_agent`'s `texts_to_embed`).
+async fn persist_archival(
+    state: &AppState,
+    agent_id: &str,
+    candidates: &[(Uuid, String)],
+    compaction: &CompactionOutput,
+    batch_id: Uuid,
+    embeddings: Vec<Vec<f32>>,
+) -> Result<Option<ArchivalResult>> {
+    let count = candidates.len();
+    let narrative_text = narrative_text(compaction);
 
     let mut emb_iter = embeddings.into_iter();
     let mut facts_stored = 0usize;
@@ -403,6 +435,157 @@ mod tests {
         let out = parse_compaction_output(raw);
         assert_eq!(out.facts, vec!["Only facts here"]);
         assert!(out.narrative.is_none(), "missing narrative must be None");
+    }
+
+    /// A 1536-dim embedding vector with a single distinguishing component, so
+    /// each stored row gets a distinct (but deterministic) vector.
+    #[cfg(test)]
+    fn seed_vec(seed: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 1536];
+        v[0] = seed;
+        v
+    }
+
+    /// #13: deterministic end-to-end archival persistence — seeds L2 sources,
+    /// persists a canned compaction (facts + narrative) with pre-computed
+    /// embeddings (no LLM, no embedding HTTP), and asserts the full contract:
+    /// L3 facts stored, a narrative L3 row created, facts + narrative sharing
+    /// one archival_batch_id, initial memory_versions snapshots present, and the
+    /// L2 sources tombstoned and tagged with the batch.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn persist_archival_stores_facts_narrative_versions_and_tombstones(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool);
+        const AGENT: &str = "archival-smoke-agent";
+
+        // archival_batches has a FK to agents — register the agent first.
+        sqlx::query("INSERT INTO agents (agent_id) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(AGENT)
+            .execute(&state.db)
+            .await
+            .unwrap();
+
+        // Seed two stale L2 sources to compact.
+        let src_a = store::store_memory_with_tier(
+            &state,
+            AGENT,
+            None,
+            "L2 source A",
+            "semantic",
+            0.6,
+            seed_vec(0.1),
+            None,
+            "L2",
+            "user_stated",
+            0.5,
+            "extractor",
+            None,
+        )
+        .await
+        .unwrap();
+        let src_b = store::store_memory_with_tier(
+            &state,
+            AGENT,
+            None,
+            "L2 source B",
+            "semantic",
+            0.6,
+            seed_vec(0.2),
+            None,
+            "L2",
+            "user_stated",
+            0.5,
+            "extractor",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let candidates = vec![
+            (src_a, "L2 source A".to_string()),
+            (src_b, "L2 source B".to_string()),
+        ];
+
+        // Canned compaction with a non-empty narrative + facts-first embeddings.
+        let compaction = CompactionOutput {
+            facts: vec![
+                "Compressed fact one".to_string(),
+                "Compressed fact two".to_string(),
+            ],
+            narrative: Some("A cohesive narrative summary of the archived material.".to_string()),
+        };
+        let embeddings = vec![seed_vec(0.3), seed_vec(0.4), seed_vec(0.5)];
+
+        let batch_id = store::create_archival_batch(&state, AGENT, candidates.len() as i32, 3)
+            .await
+            .unwrap();
+
+        let result = persist_archival(
+            &state,
+            AGENT,
+            &candidates,
+            &compaction,
+            batch_id,
+            embeddings,
+        )
+        .await
+        .unwrap()
+        .expect("archival must succeed with facts present");
+        assert_eq!(result.batch_id, batch_id);
+        assert_eq!(result.l3_count, 2, "two compressed facts stored");
+        assert_eq!(result.narrative_count, 1, "one narrative stored");
+
+        // L3 compressed facts under the batch.
+        let fact_ids: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM memories
+             WHERE agent_id = $1 AND tier = 'L3' AND memory_type = 'semantic'
+               AND archival_batch_id = $2",
+        )
+        .bind(AGENT)
+        .bind(batch_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(fact_ids.len(), 2, "two L3 semantic facts under the batch");
+
+        // A narrative L3 row under the SAME batch (proves shared archival_batch_id).
+        let narrative_ids: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT id FROM memories
+             WHERE agent_id = $1 AND tier = 'L3' AND memory_type = 'narrative'
+               AND archival_batch_id = $2",
+        )
+        .bind(AGENT)
+        .bind(batch_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(narrative_ids.len(), 1, "exactly one narrative L3 row");
+
+        // Every L3 row has an initial memory_versions snapshot.
+        let l3_ids = fact_ids.iter().chain(narrative_ids.iter()).map(|(id,)| *id);
+        for id in l3_ids {
+            let (versions,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM memory_versions WHERE memory_id = $1")
+                    .bind(id)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert!(
+                versions >= 1,
+                "L3 row {id} must have an initial memory_versions snapshot"
+            );
+        }
+
+        // L2 sources tombstoned and tagged with the batch.
+        for src in [src_a, src_b] {
+            let (archived_at, batch): (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) =
+                sqlx::query_as("SELECT archived_at, archival_batch_id FROM memories WHERE id = $1")
+                    .bind(src)
+                    .fetch_one(&state.db)
+                    .await
+                    .unwrap();
+            assert!(archived_at.is_some(), "L2 source {src} must be tombstoned");
+            assert_eq!(batch, Some(batch_id), "tombstoned L2 tagged with the batch");
+        }
     }
 
     #[test]
