@@ -1,7 +1,6 @@
 use rand::Rng;
 
 use super::policy::PolicyParams;
-use super::reward::EpisodeMetrics;
 
 /// Hard parameter bounds (min, max) for each θ dimension.
 /// Values outside these ranges are physically meaningless.
@@ -17,26 +16,23 @@ const BOUNDS: [(f64, f64); 6] = [
 /// Perturbation magnitude as a fraction of each parameter's full range.
 const PERTURBATION_SCALE: f64 = 0.10;
 
-/// Contextual-bandit meta-learner.
+/// ε-greedy policy explorer.
 ///
-/// Phase 1: ε-greedy exploration over a perturbation neighbourhood with
-/// hill-climbing acceptance (keep the new policy only if reward improved).
-/// Phase 2 will replace this with PPO once sufficient episodes accumulate.
+/// The learner itself is stateless across worker cycles: it proposes a
+/// (possibly perturbed) candidate from a base policy, and the hill-climbing
+/// accept/reject decision is made in `rmk_worker` from *persisted* per-policy
+/// mean rewards (`rmk_episodes.policy_id` grouping).  An earlier design kept
+/// `previous`/`last_reward` state on this struct for in-memory hill-climbing,
+/// but the worker constructs a fresh learner every cycle, so that state could
+/// never survive; it has been removed in favour of the DB-backed loop.
 ///
-/// Safety invariants:
-/// - Parameters are always clamped to `BOUNDS` after perturbation.
-/// - The previous policy is retained for rollback if reward degrades.
-/// - Update acceptance is conservative: ties go to the new policy.
+/// Safety invariant: parameters are always clamped to `BOUNDS` after
+/// perturbation, so every policy the learner can ever emit lies in the
+/// compact box ∏[loᵢ, hiᵢ].
 pub struct MetaLearner {
     /// Exploration rate: probability of returning a perturbed policy.
     pub epsilon: f64,
     pub current: PolicyParams,
-    /// Snapshot before the last update (enables rollback).
-    #[allow(dead_code)]
-    previous: Option<PolicyParams>,
-    /// Reward observed during the episode that produced `current`.
-    #[allow(dead_code)]
-    last_reward: Option<f64>,
 }
 
 impl MetaLearner {
@@ -44,15 +40,7 @@ impl MetaLearner {
         Self {
             epsilon,
             current: initial,
-            previous: None,
-            last_reward: None,
         }
-    }
-
-    /// Return the current best-known policy (pure exploitation).
-    #[allow(dead_code)]
-    pub fn suggest(&self) -> PolicyParams {
-        self.current.clone()
     }
 
     /// ε-greedy: with probability `epsilon` return a uniformly-perturbed
@@ -93,26 +81,62 @@ impl MetaLearner {
             retrieval_threshold: perturbed[5],
         }
     }
+}
 
-    /// Accept an observed reward and conditionally adopt `new_policy`.
-    ///
-    /// Hill-climbing rule: replace `current` with `new_policy` only when
-    /// `reward >= last_reward` (non-degrading).  This prevents a bad
-    /// perturbation from being locked in even after a negative signal.
-    #[allow(dead_code)]
-    pub fn update(&mut self, _metrics: &EpisodeMetrics, reward: f64, new_policy: PolicyParams) {
-        self.previous = Some(self.current.clone());
-        if self.last_reward.is_none_or(|prev| reward >= prev) {
-            self.current = new_policy;
-        }
-        self.last_reward = Some(reward);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn in_bounds(p: &PolicyParams) -> bool {
+        let vals = [
+            p.pressure_a,
+            p.pressure_b,
+            p.kp,
+            p.ki,
+            p.graph_bonus_weight,
+            p.retrieval_threshold,
+        ];
+        vals.iter()
+            .zip(BOUNDS.iter())
+            .all(|(&v, &(lo, hi))| v >= lo && v <= hi)
     }
 
-    /// Revert to the policy that was active before the last `update` call.
-    #[allow(dead_code)]
-    pub fn rollback(&mut self) {
-        if let Some(prev) = self.previous.take() {
-            self.current = prev;
+    /// Every policy the learner emits stays within BOUNDS, even when
+    /// exploring from a base policy sitting on a bound (Proposition 10 of the
+    /// white paper: containment of policy exploration).
+    #[test]
+    fn suggest_explore_respects_bounds() {
+        // ε = 1.0 forces a perturbation every call.
+        let corner = PolicyParams {
+            pressure_a: 0.5,
+            pressure_b: 0.05,
+            kp: 1.0,
+            ki: 0.001,
+            graph_bonus_weight: 0.0,
+            retrieval_threshold: 0.99,
+        };
+        let learner = MetaLearner::new(1.0, corner);
+        for _ in 0..1000 {
+            let candidate = learner.suggest_explore();
+            assert!(in_bounds(&candidate), "candidate escaped BOUNDS");
+        }
+
+        let default_learner = MetaLearner::new(1.0, PolicyParams::default());
+        for _ in 0..1000 {
+            assert!(in_bounds(&default_learner.suggest_explore()));
+        }
+    }
+
+    /// With ε = 0 the learner is pure exploitation: the base policy is
+    /// returned unchanged.
+    #[test]
+    fn zero_epsilon_never_perturbs() {
+        let base = PolicyParams::default();
+        let learner = MetaLearner::new(0.0, base.clone());
+        for _ in 0..100 {
+            let candidate = learner.suggest_explore();
+            assert_eq!(candidate.pressure_a, base.pressure_a);
+            assert_eq!(candidate.retrieval_threshold, base.retrieval_threshold);
         }
     }
 }

@@ -119,10 +119,13 @@ The **LTM archival job** automatically compacts stale L2 facts into concise L3 s
 
 ```
 adjusted_dist = cosine_dist
-    × (1 + MEMORY_DECAY_RATE × days_stale)
+    × exp(MEMORY_DECAY_RATE × days_stale)
     × (1 + IMPORTANCE_BOOST_FACTOR × (1 − importance_score))
-    − graph_bonus_weight × co_access_neighbour_weight   (when AMP/RMK enabled)
 ```
+
+When AMP/RMK is enabled, a post-query re-rank additionally subtracts a capped
+co-access bonus: `adjusted_dist − min(graph_bonus_weight × co_access_neighbour_weight, max_bonus)`,
+floored at 0.
 
 When all factors are 0 or disabled (defaults), this collapses to pure cosine similarity. The **co-access bonus** promotes memories that frequently appear alongside other retrieved memories, building a pheromone-style graph of related facts over time.
 

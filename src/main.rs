@@ -14,6 +14,8 @@ mod providers;
 mod proxy;
 mod rate_limit;
 mod rmk_worker;
+#[cfg(test)]
+mod test_support;
 mod url_guard;
 
 use std::sync::Arc;
@@ -142,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         }
         if config.rmk_config.enabled {
             tokio::spawn(rmk_worker::run_policy_update_job(state.clone()));
+            tokio::spawn(rmk_worker::run_task_success_aggregation_job(state.clone()));
             tokio::spawn(rmk_worker::run_co_access_decay_job(state.clone()));
             tokio::spawn(rmk_worker::run_pressure_sweep_job(state.clone()));
         } else if config.amp_config.enabled {
