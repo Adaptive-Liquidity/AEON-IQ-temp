@@ -1,6 +1,8 @@
 # Longitudinal Memory Benchmark — Design & Pre-Registration
 
-**Status:** design for review — no harness built or run yet.
+**Status:** pre-registration — EXECUTED at smoke scale (2026-07-04). What actually
+happened (results, amendments to this frozen protocol, and the bugs/artifacts found)
+lives in **[LONGITUDINAL_RESULTS.md](LONGITUDINAL_RESULTS.md)** (PR #42). See §12.
 **Purpose:** measure whether AEON-IQ's ranking/memory mechanisms (time-decay, importance,
 AMP co-access, AMP eviction, RMK feedback learning) produce a *measurable, mechanism-attributable*
 improvement over a pure-cosine baseline **when memories have history** — age, access patterns,
@@ -155,3 +157,26 @@ Verified in `run_longitudinal.py::run_pressure_phase`: pressure distractors are 
 2. **Smoke pass:** aeon-full vs cosine-baseline, rounds-only (`--skip-pressure`), 3–4 conv subset, 4–6 rounds. **If they don't diverge at all, STOP and report** — no-divergence is itself a finding.
 3. If they diverge: full 4-way ablation + importance variant + pressure phase, at the approved bounds (3–4 conv, 4–6 rounds, pressure corpus ≈2.5×1000). $ cost is trivial (embeddings ≈ pennies); wall-clock ~30–45 min run condition-by-condition to respect the 10-min command limit.
 4. Fold **differentiated** results into the white paper as a PR — honest caveats (configured decay; shipped-default AMP; simulated time; sampled subset), surfacing any weakness or no-lift finding rather than filtering it.
+
+## 12. What actually happened → LONGITUDINAL_RESULTS.md (PR #42)
+
+This pre-registration was executed at smoke scale on 2026-07-04. The full record —
+run, every amendment to the frozen protocol (recorded before the numbers), and the
+honest findings — is in **[LONGITUDINAL_RESULTS.md](LONGITUDINAL_RESULTS.md)** on the
+harness branch (PR #42). Quick trail so this doc is complete from either side:
+
+- **Amendments** (see RESULTS §2): dataset `oracle` → `longmemeval_s` (oracle was
+  ~all-gold, no headroom); smoke haystack truncated; `SIM_EPOCH` anchored to run-time
+  now; `gold_retention` made `soft_evicted`-aware; kernel run `MEMORYOS_ROLE=proxy`.
+- **Bugs/artifacts found in our own harness+kernel** (RESULTS §4): fixed-past epoch
+  (collapsed recall to 0.0), the AMP `gold_retention` artifact (had pinned AMP at a
+  false **1.000**), a feedback `TypeError`, a psycopg multi-statement failure, the
+  distractor-isolation fix (§10d, done), and a **latent** kernel bug — decay filters
+  below the retrieval threshold instead of only re-ranking (owner: don't fix now).
+- **Findings** (RESULTS §3/§5): the one robust result is **AMP under pressure**
+  (gold retention 0.81–0.95 vs LRU 0.38–0.50 / random 0.39–0.47, every agent — still
+  smoke-scale). Ranking-layer lift is **provisional/none at n = 3** (noisy, not a
+  conclusion). **RMK was NOT tested** (proxy role disabled its learning loop) — an
+  open question, not a negative finding.
+- **Next:** publication-scale run (≥30–50 conv, untruncated `_s`, RMK enabled with
+  sweep serialization) in a fresh session.
