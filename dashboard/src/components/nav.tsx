@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Brain, LayoutDashboard, Search, LogOut, ShieldCheck, Sparkles } from "lucide-react";
+import { Brain, LayoutDashboard, Search, LogOut, ShieldCheck, Sparkles, Waypoints } from "lucide-react";
 import { useSession, signOut } from "next-auth/react";
 
 const links = [
   { href: "/",                label: "Overview",        icon: LayoutDashboard },
   { href: "/memory-explorer", label: "Memory Explorer", icon: Search },
   { href: "/cognition",       label: "Cognition",       icon: Sparkles },
+  { href: "/lifecycle",       label: "Lifecycle",       icon: Waypoints },
 ];
 
 export default function Nav() {
