@@ -124,4 +124,34 @@ AMP co-access: co-retrieval rate of high-edge pairs vs random; post-eviction rec
 ## 9. Requires your approval
 
 - The **full run** (burns OpenAI credits) — scope/subset-size to be approved before spending.
-- The **kernel force-sweep endpoint** (small, gated) — needed for the eviction comparison.
+- The **kernel force-sweep endpoint** (small, gated) — needed for the eviction comparison. **DONE** (PR #42): `POST /api/v1/agents/:id/amp/sweep`, empirically verified (1500-memory aged corpus → 517 soft-evicted, converged to target in 23 sweeps).
+
+## 10. Verification findings (2026-07-03) — read before running
+
+### 10a. Go/no-go: eviction is forceable — CONFIRMED
+The only pre-existing sweep trigger is a hardcoded 5-min loop; the force-sweep endpoint (PR #42) exposes the existing `run_pressure_sweep_for_agent` and was proven to drive eviction to convergence deterministically.
+
+### 10b. Q1 — all four conditions are cleanly producible (verified in `src/config.rs`)
+Every toggle is env-wired: `MEMORY_DECAY_RATE` (L239), `IMPORTANCE_BOOST_FACTOR` (L258), `GRAPH_RETRIEVAL_ENABLED` (L305), `AMP_ENABLED` (L323), `RMK_ENABLED` (L330). baseline / decay-only / amp-only / aeon-full each map to a clean env recipe. The only hardcoded knobs are AMP *internals* (`target_active_count`=1000, pressure/controller coefficients) — but AMP on/off is clean, so the ablation still separates mechanisms.
+
+### 10c. Locked (pre-registered) config — decay/importance
+`MEMORY_DECAY_RATE` and `IMPORTANCE_BOOST_FACTOR` **ship as 0.0 (off)**. So decay/importance are NOT shipped defaults; the positive values below are a **pre-registered choice**, frozen here like the timeline, and must be described in the white paper as **"configured decay,"** not a shipped default:
+
+| Param | Locked value | Used in | Rationale |
+|---|---|---|---|
+| `MEMORY_DECAY_RATE` | **0.03** | decay-only, aeon-full, aeon-full-importance | `exp(0.03·days)` → ~1.35× penalty at 10d, ~2.5× at 30d (window edge); distance "doubles" at ~23 days. Meaningful but not crushing. |
+| `IMPORTANCE_BOOST_FACTOR` | **0.5** | decay-only, aeon-full(+importance) | inert under uniform importance at seed; becomes active via `IMPORTANCE_REFRESH_BOOST` as accessed memories accrue importance (spacing effect) |
+| `IMPORTANCE_REFRESH_BOOST` | **0.05** (shipped default) | same | per-retrieval importance bump |
+| gold importance (variant only) | **0.95** | aeon-full-importance | reported as its own line, never folded into the primary uniform claim |
+AMP runs at **shipped defaults** (target=1000, etc.) in amp-only/aeon-full — the more defensible "works out of the box" claim.
+
+### 10d. Q2 — distractor isolation is NOT yet clean → FIX IS STEP 1 OF THE RUN
+Verified in `run_longitudinal.py::run_pressure_phase`: pressure distractors are currently seeded via the real API (`seed_memory`, real embeddings) **into the same agent** that post-eviction recall re-queries. Consequences: (1) post-eviction recall can be distorted by distractors as retrieval candidates; (2) ~2500 real embeddings/pressure-condition (needless cost/time). The rounds recall/MRR/nDCG are **already clean** (computed before the pressure phase); `gold_retention` is **already clean** (set-membership).
+
+**Required fix, before the smoke pass:** SQL-seed pressure distractors with a **fixed far/dummy embedding** (guaranteed to rank last → they create pressure without being retrieval candidates), and make **`gold_retention` the primary pressure metric** with post-eviction recall **secondary/caveated**. Contained change to `run_pressure_phase`.
+
+## 11. Fresh-session run order
+1. **Distractor-isolation fix** (§10d) — before anything spends credits.
+2. **Smoke pass:** aeon-full vs cosine-baseline, rounds-only (`--skip-pressure`), 3–4 conv subset, 4–6 rounds. **If they don't diverge at all, STOP and report** — no-divergence is itself a finding.
+3. If they diverge: full 4-way ablation + importance variant + pressure phase, at the approved bounds (3–4 conv, 4–6 rounds, pressure corpus ≈2.5×1000). $ cost is trivial (embeddings ≈ pennies); wall-clock ~30–45 min run condition-by-condition to respect the 10-min command limit.
+4. Fold **differentiated** results into the white paper as a PR — honest caveats (configured decay; shipped-default AMP; simulated time; sampled subset), surfacing any weakness or no-lift finding rather than filtering it.
