@@ -56,6 +56,7 @@ tuned to win," **these parameters are frozen here before running and the exact S
 | `last_accessed_at` | = `created_at` at seed (no pre-warmed access history) | no head start |
 | Feedback values | fixed: `1.0` on the memory the query's gold evidence points to, `0.0` on retrieved distractors; applied every round by the same rule | no per-run tuning |
 | Round count / clock step | fixed R rounds, fixed Δ simulated-days per round | frozen |
+| **Eviction sweep count** (pressure phase) | **fixed deterministic rule, committed before running: drive forced sweeps until `active_count` is within `AMP_DEADBAND` of `AMP_TARGET_ACTIVE_COUNT` for 2 consecutive sweeps, OR 20 sweeps — whichever comes first.** No hand-picking. | the PI controller ramps aggressiveness gradually (≤ +0.1/cycle), so sweep count directly changes how much is evicted. The rule is the controller's *own* convergence criterion (not a number chosen to flatter the result) with a hard cap, and it is identical across AMP / LRU / random (LRU & random evict the *same count* AMP settled on) |
 
 All timeline/eviction SQL lives in `benchmarks/sql/longitudinal_*.sql` (committed), invoked verbatim
 by the harness. A reviewer can replay the exact protocol. **The RNG that assigns ages is seeded and
