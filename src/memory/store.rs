@@ -2624,14 +2624,32 @@ mod tests {
 
         let state = build_state(pool.clone(), 0.0);
         store_memory(
-            &state, AGENT, None, "fresh fact", "episodic", 0.9, fresh_emb, None,
-            "user_stated", 0.5_f32, "extractor",
+            &state,
+            AGENT,
+            None,
+            "fresh fact",
+            "episodic",
+            0.9,
+            fresh_emb,
+            None,
+            "user_stated",
+            0.5_f32,
+            "extractor",
         )
         .await
         .unwrap();
         let stale_id = store_memory(
-            &state, AGENT, None, "stale relevant fact", "episodic", 0.9, stale_emb, None,
-            "user_stated", 0.5_f32, "extractor",
+            &state,
+            AGENT,
+            None,
+            "stale relevant fact",
+            "episodic",
+            0.9,
+            stale_emb,
+            None,
+            "user_stated",
+            0.5_f32,
+            "extractor",
         )
         .await
         .unwrap();
@@ -2660,7 +2678,11 @@ mod tests {
             "stale-but-relevant memory must survive the threshold (decay reorders, \
              never removes); pre-fix its decayed distance ≈ 2.01 > 0.80 dropped it"
         );
-        assert_eq!(results.len(), 2, "both in-ceiling memories should be retrievable");
+        assert_eq!(
+            results.len(),
+            2,
+            "both in-ceiling memories should be retrievable"
+        );
         // Decay still REORDERS: fresh (distance 0.20) ranks ahead of the aged
         // memory (distance ≈ 2.01), despite stale having the lower raw cosine.
         assert_eq!(
