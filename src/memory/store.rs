@@ -464,7 +464,10 @@ async fn search_memories_impl(
 ///            can serve it from the HNSW index (wrapping the operator in
 ///            the decay arithmetic forces a sequential scan — the ranking
 ///            formula must therefore only ever touch the ann CTE's output)
-///   ranked — decay + importance re-rank over the ≤ ann_limit candidates
+///   ranked — decay + importance re-rank over the ≤ ann_limit candidates.
+///            The final threshold gates RAW cosine relevance (`cosine_dist`),
+///            so decay/importance only REORDER, never remove, an in-ceiling
+///            candidate — a relevant-but-stale memory is never dropped (§4.5).
 /// With decay_rate = importance_boost = 0 (defaults) the re-rank is the
 /// identity and the result equals pure cosine ranking, so the two-stage
 /// split is exact; with non-zero factors it is exact whenever the true
@@ -526,9 +529,13 @@ ann AS (
            AS distance
     FROM ann
 )
+-- §4.5 fix: gate on RAW cosine relevance, not the decayed `distance`.  Decay /
+-- importance still ORDER BY `distance` (they reorder), but the threshold only
+-- decides relevance, so a highly-relevant but stale memory is never removed —
+-- pre-fix, exp(rate·days_stale) pushed aged gold past the ceiling and dropped it.
 SELECT id, agent_id, session_id, content, memory_type, confidence, provenance,
        created_at, source_turn, importance_score, importance_source, distance
-FROM ranked WHERE distance < "#,
+FROM ranked WHERE cosine_dist < "#,
     );
     qb.push_bind(threshold);
     qb.push(" ORDER BY distance LIMIT ");
@@ -2596,6 +2603,91 @@ mod tests {
         assert_eq!(
             results[0].content, "fresh fact",
             "with decay: fresh should rank first despite higher base cosine distance"
+        );
+    }
+
+    // ── §4.5 regression: decay must REORDER, never REMOVE ──────────────────────
+    //
+    // A highly-relevant but very stale memory must survive the retrieval
+    // threshold.  Pre-fix, the threshold gated the DECAYED distance, so
+    // exp(rate·days_stale) pushed aged gold past the ceiling and it vanished
+    // from results (the §8.2 recall collapse).  Post-fix, the threshold gates
+    // RAW cosine relevance, so it stays retrievable — just ranked lower.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn stale_relevant_memory_survives_decay_filter(pool: sqlx::PgPool) {
+        const AGENT: &str = "decay-survival-agent";
+        // fresh: cosine dist ≈ 0.20 (less relevant, age 0)
+        // stale: cosine dist ≈ 0.10 (MORE relevant, aged 60 days)
+        let fresh_emb = two_hot(0, 0.8, 1, 0.6);
+        let stale_emb = two_hot(0, 0.9, 2, 0.4359);
+        let query = unit_vec(0);
+
+        let state = build_state(pool.clone(), 0.0);
+        store_memory(
+            &state,
+            AGENT,
+            None,
+            "fresh fact",
+            "episodic",
+            0.9,
+            fresh_emb,
+            None,
+            "user_stated",
+            0.5_f32,
+            "extractor",
+        )
+        .await
+        .unwrap();
+        let stale_id = store_memory(
+            &state,
+            AGENT,
+            None,
+            "stale relevant fact",
+            "episodic",
+            0.9,
+            stale_emb,
+            None,
+            "user_stated",
+            0.5_f32,
+            "extractor",
+        )
+        .await
+        .unwrap();
+
+        // Age the stale memory 60 days → decayed distance = 0.10 · exp(0.05·60)
+        //   = 0.10 · exp(3.0) ≈ 2.01, far above the 0.80 threshold used below.
+        // Pre-fix (`WHERE distance < 0.80`) this row was FILTERED OUT.
+        sqlx::query(
+            "UPDATE memories SET last_accessed_at = NOW() - INTERVAL '60 days' WHERE id = $1",
+        )
+        .bind(stale_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Decay ON (0.05); realistic cosine-distance ceiling 0.80.
+        let with_decay = build_state(pool, 0.05);
+        let results = search_memories_filtered(&with_decay, AGENT, &query, 10, 0.80, None, None)
+            .await
+            .unwrap();
+
+        // SURVIVAL: the stale-but-relevant memory is still retrievable (raw
+        // cosine 0.10 < 0.80).  Pre-fix it would be absent (decayed 2.01 > 0.80).
+        assert!(
+            results.iter().any(|r| r.content == "stale relevant fact"),
+            "stale-but-relevant memory must survive the threshold (decay reorders, \
+             never removes); pre-fix its decayed distance ≈ 2.01 > 0.80 dropped it"
+        );
+        assert_eq!(
+            results.len(),
+            2,
+            "both in-ceiling memories should be retrievable"
+        );
+        // Decay still REORDERS: fresh (distance 0.20) ranks ahead of the aged
+        // memory (distance ≈ 2.01), despite stale having the lower raw cosine.
+        assert_eq!(
+            results[0].content, "fresh fact",
+            "decay must still reorder: fresh ranks ahead of the aged memory"
         );
     }
 
