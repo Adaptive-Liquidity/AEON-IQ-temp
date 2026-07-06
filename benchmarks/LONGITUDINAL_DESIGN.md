@@ -252,7 +252,9 @@ re-run. §8.2 keeps the pre-fix (before) and corrected (after) curves side by si
   number can drift between the two docs). The §4.5
   fix targets the retrieval threshold, which the pressure metric does not depend on — so
   the headline is **not contaminated** by the fix. **Precision caveats (RESULTS §8.1):**
-  single seed (42) ⇒ no confidence intervals, the ratio is a one-run point estimate;
+  the headline is now 5-seed CI-backed (A12: the across-seed 95% CI of AMP−max(LRU,random)
+  excludes 0 on all 4 pressure arms → seed-robust; the ratio range itself lives only in the
+  canonical RESULTS §8.1, per this doc's no-drift rule);
   AMP did **not** converge (`converged:false`, settled K ≈ 2× target — same-K comparison
   still valid, but convergence must not be implied); the ratio depends on the
   `pressure_multiplier=2.5` setpoint. Comparator drop smoke→scale is mechanistic:
