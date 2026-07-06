@@ -1081,6 +1081,33 @@ pub async fn trigger_archival(
     }
 }
 
+// ── AMP pressure-sweep trigger ───────────────────────────────────────────────
+
+/// POST /api/v1/agents/:id/amp/sweep
+///
+/// Runs one AMP pressure-sweep cycle for this agent synchronously and returns
+/// the resulting controller/eviction state. This is the same routine the
+/// background sweep worker runs on its 5-minute cadence; exposing it lets
+/// operators and the longitudinal benchmark drive eviction to convergence
+/// deterministically instead of waiting on the timer.
+pub async fn trigger_amp_sweep(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let report = crate::rmk_worker::run_pressure_sweep_for_agent(&state, &agent_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "swept":              true,
+        "active_count":       report.active_count,
+        "target":             report.target,
+        "aggressiveness":     report.aggressiveness,
+        "soft_evicted_total": report.soft_evicted_total,
+        "newly_evicted":      report.newly_evicted,
+        "newly_restored":     report.newly_restored,
+    })))
+}
+
 // ── Session (working memory) handlers ────────────────────────────────────────
 
 /// GET /api/v1/agents/:id/sessions

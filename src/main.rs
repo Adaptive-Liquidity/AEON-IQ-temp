@@ -202,6 +202,7 @@ async fn main() -> anyhow::Result<()> {
                 "/agents/:agent_id/archival/trigger",
                 post(api::trigger_archival),
             )
+            .route("/agents/:agent_id/amp/sweep", post(api::trigger_amp_sweep))
             .route("/agents/:agent_id/export", get(api::export_memories))
             .route("/agents/:agent_id/import", post(api::import_memories))
             .route("/agents/:agent_id/sessions", get(api::list_sessions))

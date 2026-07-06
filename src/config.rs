@@ -330,6 +330,17 @@ impl Config {
                 enabled: std::env::var("RMK_ENABLED")
                     .unwrap_or_else(|_| "false".to_string())
                     .eq_ignore_ascii_case("true"),
+                // Rate-limiting knobs for the meta-learning loop.  Previously only
+                // `enabled` was env-wired; these fell back to hardcoded defaults
+                // (3600 s / 20), making a "compressed cadence" impossible to set.
+                update_cooldown_secs: std::env::var("RMK_UPDATE_COOLDOWN_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| RmkConfig::default().update_cooldown_secs),
+                min_episodes_before_update: std::env::var("RMK_MIN_EPISODES_BEFORE_UPDATE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| RmkConfig::default().min_episodes_before_update),
                 ..Default::default()
             },
 
