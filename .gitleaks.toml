@@ -1,0 +1,39 @@
+# Gitleaks configuration for AEON-IQ.
+#
+# The repository had no secret scanning at all before this file existed. The
+# policy is the stock gitleaks ruleset plus the smallest set of exceptions that
+# makes it pass, and every exception here is keyed to an exact literal value --
+# never to a path.
+#
+# Do NOT add a `paths` entry to an allowlist in this file. It was tried and
+# rejected: gitleaks 8.30.1 silently accepts `condition = "AND"` alongside
+# `paths` + `regexes` (no error, no warning) but does not apply it, so the
+# `paths` entry alone exempts the whole file. A planted credential in an
+# allowlisted path went completely undetected. Keying on the literal keeps the
+# blast radius to that one string: any other secret, in any file, still fails.
+#
+# Adding an entry here is a security decision. It needs the same review as a
+# code change, and it must be justified by the value being provably not a
+# secret -- never merely to turn a red scan green.
+
+[extend]
+useDefault = true
+
+# `.github/workflows/ci.yml` builds the legacy `dashboard/` Next.js app, and
+# next-auth refuses to build without an AUTH_SECRET of at least 32 characters.
+# The workflow supplies the literal "ci-placeholder-secret-32-chars-min", which
+# is padding chosen to satisfy that length check. It grants no access to
+# anything: it is public in the workflow file, is used only by the CI build
+# step, and no deployed environment accepts it.
+#
+# `regexTarget = "secret"` matches the detected secret value rather than the
+# surrounding line, and the pattern is anchored at both ends. Verified by
+# differential scan (stock ruleset vs this file) over planted payloads: a hex
+# blob and a private key in ci.yml, a hex blob in README.md, and the literal
+# with an added prefix/suffix. Every payload except the exact literal produced
+# an identical result with and without this config, so the only detection this
+# file suppresses is that one string.
+[[allowlists]]
+description = "next-auth length-check padding in the dashboard CI build step"
+regexTarget = "secret"
+regexes = ['''^ci-placeholder-secret-32-chars-min$''']

@@ -1,0 +1,8 @@
+# Shell scripts that CI executes must keep LF line endings. A script committed
+# with CRLF fails on Linux with "bad interpreter: /bin/bash^M", and the failure
+# looks like a broken scanner rather than a line-ending problem.
+#
+# Scoped to the CI scripts directory on purpose: a repository-wide `*.sh` rule
+# would renormalise the existing benchmark scripts and show them as modified in
+# working copies that currently have CRLF checked out.
+/.github/scripts/*.sh text eol=lf

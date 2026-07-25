@@ -1,0 +1,141 @@
+name: Secret Scan
+
+# Two deliberately different questions:
+#
+#   tracked-tree  "does the code we are about to merge contain a secret?"
+#                 Runs on every PR and every push to main. Fast, and the only
+#                 mode that can block a merge.
+#
+#   full-history  "has a secret EVER been committed to this repository?"
+#                 Runs weekly and on demand. A secret deleted in a later commit
+#                 is still published in the objects, so the tracked-tree scan
+#                 alone would report clean on a repository that has leaked.
+#                 Needs fetch-depth: 0 -- the default shallow checkout would
+#                 silently reduce this to a one-commit scan.
+#
+# Gitleaks is installed from a pinned release and verified against a SHA-256
+# recorded in this file, not one downloaded next to the artefact. The upstream
+# gitleaks-action is deliberately not used: it requires a paid licence key for
+# organisation-owned repositories, and this repository is expected to move back
+# under an organisation, at which point the scan would start failing for
+# licensing reasons rather than security ones.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Mondays 05:17 UTC. Off the hour: scheduled runs cluster on round times
+    # and get delayed by queueing.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+
+jobs:
+  tracked-tree:
+    name: Secret scan (tracked tree)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gitleaks (pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # `git archive` rather than scanning the workspace directly: it yields
+      # exactly the tracked files at HEAD, with no .git directory and no build
+      # output. Scanning the workspace would let a generated file produce a
+      # finding that does not exist in the repository.
+      - name: Export tracked tree
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/tree"
+          git archive --format=tar HEAD | tar -x -C "${RUNNER_TEMP}/tree"
+          count=$(find "${RUNNER_TEMP}/tree" -type f | wc -l)
+          echo "exported ${count} tracked files"
+          # A scan of an empty tree passes trivially. Refuse to report success
+          # on a tree that cannot plausibly be this repository.
+          if [ "${count}" -lt 50 ]; then
+            echo "::error::Only ${count} files exported; refusing to treat this as a scan."
+            exit 1
+          fi
+
+      - name: Scan tracked tree
+        working-directory: ${{ runner.temp }}/tree
+        run: |
+          set -uo pipefail
+          set +e
+          gitleaks dir . \
+            --config "${GITHUB_WORKSPACE}/.gitleaks.toml" \
+            --redact \
+            --no-banner \
+            --exit-code 1 \
+            --report-format json \
+            --report-path "${RUNNER_TEMP}/gitleaks-tracked.json"
+          rc=$?
+          set -e
+          "${GITHUB_WORKSPACE}/.github/scripts/gitleaks-verdict.sh" \
+            "${rc}" "${RUNNER_TEMP}/gitleaks-tracked.json" "tracked tree at HEAD"
+
+  full-history:
+    name: Secret scan (full history)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Without this the checkout is shallow and the history scan below
+          # degrades to a single commit while still reporting success.
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Confirm history is complete
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error::Repository is shallow; a history scan here would be meaningless."
+            exit 1
+          fi
+          echo "commits reachable: $(git rev-list --count --all)"
+
+      # --log-opts=--all walks every ref, not just the checked-out branch, so a
+      # secret committed on a side branch that was never merged is still found.
+      - name: Scan full history
+        run: |
+          set -uo pipefail
+          set +e
+          gitleaks git . \
+            --config "${GITHUB_WORKSPACE}/.gitleaks.toml" \
+            --log-opts=--all \
+            --redact \
+            --no-banner \
+            --exit-code 1 \
+            --report-format json \
+            --report-path "${RUNNER_TEMP}/gitleaks-history.json"
+          rc=$?
+          set -e
+          "${GITHUB_WORKSPACE}/.github/scripts/gitleaks-verdict.sh" \
+            "${rc}" "${RUNNER_TEMP}/gitleaks-history.json" "full history (all refs)"

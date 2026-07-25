@@ -140,3 +140,43 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ── Dependency policy: advisories, licences, bans, sources ──────────────────
+  deny-check:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: 0.19.9
+      CARGO_DENY_SHA256: f1f8eedc2a3ac297c540873f93785d4104b102c0079506b2a6b3221b7ec956af
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-deny shells out to `cargo metadata`, so pin the toolchain rather
+      # than relying on whatever the runner image happens to ship.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # cargo-deny is installed from a pinned release whose SHA-256 is recorded
+      # here rather than fetched alongside the artefact. A re-published tag or a
+      # tampered download therefore fails closed instead of being trusted on
+      # sight. Bumping the version means bumping the digest in the same commit.
+      - name: Install cargo-deny (pinned)
+        run: |
+          set -euo pipefail
+          archive="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL --retry 3 -o cargo-deny.tar.gz \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${archive}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  cargo-deny.tar.gz" | sha256sum --check --strict
+          tar -xzf cargo-deny.tar.gz "${archive}/cargo-deny"
+          sudo install -m 0755 "${archive}/cargo-deny" /usr/local/bin/cargo-deny
+          cargo-deny --version
+
+      # `check all` runs advisories, bans, licenses and sources. deny.toml
+      # carries no advisory ignores: a new RUSTSEC advisory is expected to fail
+      # this job and be fixed, not waived.
+      #
+      # Verified locally against this exact cargo-deny version that the gate
+      # fails closed -- an advisory violation exits 1 and a licence violation
+      # exits 4, so a policy breach cannot pass as a green job.
+      - name: cargo deny check all
+        run: cargo-deny check all
