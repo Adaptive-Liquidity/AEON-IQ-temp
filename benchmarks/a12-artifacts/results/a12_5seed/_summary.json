@@ -1,0 +1,194 @@
+[
+  {
+    "seed": "42",
+    "condition": "cosine-baseline",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/cosine-baseline/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "cosine-baseline",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/cosine-baseline/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "cosine-baseline",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/cosine-baseline/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "cosine-baseline",
+    "status": "ok",
+    "minutes": 17.7,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/cosine-baseline/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "cosine-baseline",
+    "status": "ok",
+    "minutes": 18.6,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/cosine-baseline/longitudinal_quality.json"
+  },
+  {
+    "seed": "42",
+    "condition": "decay-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/decay-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "decay-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/decay-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "decay-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/decay-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "decay-only",
+    "status": "ok",
+    "minutes": 17.7,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/decay-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "decay-only",
+    "status": "ok",
+    "minutes": 18.3,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/decay-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "42",
+    "condition": "amp-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/amp-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "amp-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/amp-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "amp-only",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/amp-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "amp-only",
+    "status": "ok",
+    "minutes": 47.7,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/amp-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "amp-only",
+    "status": "ok",
+    "minutes": 48.7,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/amp-only/longitudinal_quality.json"
+  },
+  {
+    "seed": "42",
+    "condition": "aeon-full",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/aeon-full/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "aeon-full",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/aeon-full/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "aeon-full",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/aeon-full/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "aeon-full",
+    "status": "ok",
+    "minutes": 53.6,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/aeon-full/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "aeon-full",
+    "status": "ok",
+    "minutes": 49.6,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/aeon-full/longitudinal_quality.json"
+  },
+  {
+    "seed": "42",
+    "condition": "aeon-full-importance",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/aeon-full-importance/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "aeon-full-importance",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/aeon-full-importance/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "aeon-full-importance",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/aeon-full-importance/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "aeon-full-importance",
+    "status": "ok",
+    "minutes": 51.2,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/aeon-full-importance/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "aeon-full-importance",
+    "status": "ok",
+    "minutes": 53.7,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/aeon-full-importance/longitudinal_quality.json"
+  },
+  {
+    "seed": "42",
+    "condition": "amp-rmk",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/42/amp-rmk/longitudinal_quality.json"
+  },
+  {
+    "seed": "7",
+    "condition": "amp-rmk",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/7/amp-rmk/longitudinal_quality.json"
+  },
+  {
+    "seed": "123",
+    "condition": "amp-rmk",
+    "status": "ok (resumed)",
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/123/amp-rmk/longitudinal_quality.json"
+  },
+  {
+    "seed": "2024",
+    "condition": "amp-rmk",
+    "status": "ok",
+    "minutes": 54.2,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/2024/amp-rmk/longitudinal_quality.json"
+  },
+  {
+    "seed": "99",
+    "condition": "amp-rmk",
+    "status": "ok",
+    "minutes": 63.1,
+    "results_json": "C:/Users/Benna/AppData/Local/Temp/claude/C--Users-Benna-Documents-nexus2-Nexus-main--claude-worktrees-hungry-noyce-a51d27/26896b37-6307-41d1-8d32-46519222e924/scratchpad/AEON-IQ/benchmarks/results/a12_5seed/99/amp-rmk/longitudinal_quality.json"
+  }
+]

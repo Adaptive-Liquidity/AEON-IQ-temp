@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 460" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="720" height="460" fill="#ffffff"/>
+  <text x="60" y="46" font-size="22" font-weight="700" fill="#0f172a">Gold retained under memory pressure</text>
+  <text x="60" y="72" font-size="14" fill="#475569">Fraction of critical ("gold") memories still retrievable after forced eviction · N=40 · 5 seeds</text>
+
+  <g stroke="#e2e8f0" stroke-width="1">
+    <line x1="120" y1="380" x2="660" y2="380"/>
+    <line x1="120" y1="312.5" x2="660" y2="312.5"/>
+    <line x1="120" y1="245" x2="660" y2="245"/>
+    <line x1="120" y1="177.5" x2="660" y2="177.5"/>
+    <line x1="120" y1="110" x2="660" y2="110"/>
+  </g>
+  <g font-size="12" fill="#64748b" text-anchor="end">
+    <text x="108" y="384">0.0</text>
+    <text x="108" y="316.5">0.25</text>
+    <text x="108" y="249">0.50</text>
+    <text x="108" y="181.5">0.75</text>
+    <text x="108" y="114">1.0</text>
+  </g>
+  <line x1="120" y1="110" x2="120" y2="380" stroke="#94a3b8" stroke-width="1.5"/>
+
+  <rect x="210" y="137" width="130" height="243" rx="4" fill="#0d9488"/>
+  <text x="275" y="128" font-size="16" font-weight="700" fill="#0f172a" text-anchor="middle">~0.90</text>
+  <text x="275" y="404" font-size="14" font-weight="600" fill="#0f172a" text-anchor="middle">AMP</text>
+  <text x="275" y="422" font-size="11.5" fill="#475569" text-anchor="middle">adaptive (value-aware)</text>
+
+  <rect x="440" y="291" width="130" height="89" rx="4" fill="#94a3b8"/>
+  <text x="505" y="282" font-size="16" font-weight="700" fill="#0f172a" text-anchor="middle">~0.33</text>
+  <text x="505" y="404" font-size="14" font-weight="600" fill="#0f172a" text-anchor="middle">LRU / random</text>
+  <text x="505" y="422" font-size="11.5" fill="#475569" text-anchor="middle">gold-blind (best of two)</text>
+
+  <g stroke="#0d9488" stroke-width="1.5" fill="none">
+    <path d="M348 150 H392 V291 H432"/>
+  </g>
+  <rect x="360" y="196" width="72" height="30" rx="15" fill="#0d9488"/>
+  <text x="396" y="216" font-size="15" font-weight="700" fill="#ffffff" text-anchor="middle">2.5–2.9×</text>
+
+  <text x="60" y="450" font-size="11" fill="#94a3b8">Seed-robust: across-seed 95% CI of AMP − max(LRU,random) excludes 0 on all 4 pressure arms. Source: RESULTS §8.1.</text>
+</svg>
