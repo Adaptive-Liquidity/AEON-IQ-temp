@@ -1,0 +1,67 @@
+# cargo-deny policy for AEON-IQ (memoryos-kernel).
+#
+# AEON-IQ is the memory plane for Nexus and is where the proof-layer work lands
+# next, so its dependency graph needs the same supply-chain checking Nexus-temp
+# already has. Before this file existed the repository had no advisory, license,
+# ban or source checking of any kind.
+#
+# Deliberately contains NO advisory waivers. If a future advisory needs an
+# exception it must be added here with its RUSTSEC id, the reason, an owner and
+# a review/expiry condition — never solely to turn CI green.
+
+[advisories]
+version = 2
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A yanked crate is a supply-chain signal in its own right; treat it as failing
+# rather than a warning.
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+# Do not fail merely because an allowed license is unused by the current graph.
+unused-allowed-license = "allow"
+# Permissive licences only. Copyleft (GPL/AGPL/LGPL) and source-available
+# licences are intentionally absent: adding one is a licensing decision that
+# should be made explicitly, not absorbed silently via a transitive dependency.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+
+# webpki-roots ships Mozilla's CA root store, which Mozilla distributes under
+# CDLA-Permissive-2.0. The licence is permissive and imposes no obligation on
+# this crate, but it applies to exactly one dependency and should not be added
+# to the `allow` list above -- doing so would silently accept any future crate
+# arriving under the same licence. Scoping it to the crate keeps the exception
+# auditable: everything else still has to be on the allow list.
+#
+# `crate` (not `name`) is the field cargo-deny 0.19.x expects here; verified
+# against cargo-deny 0.19.9, the version the deny-check CI job pins.
+[[licenses.exceptions]]
+crate = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[bans]
+# Duplicate versions are common and usually benign in a large transitive graph,
+# so surface them without failing the build.
+multiple-versions = "warn"
+# Wildcard version requirements are a genuine supply-chain risk: they admit any
+# future release, including a compromised one, with no review. Fail on them.
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Only crates.io. An unknown registry or a git dependency bypasses the advisory
+# database entirely, so both fail rather than warn.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
