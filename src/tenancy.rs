@@ -759,6 +759,26 @@ mod db_tests {
 
     const MIGRATION_SQL: &str = include_str!("../migrations/0028_agent_tenancy_identity.sql");
     const ROLLBACK_SQL: &str = include_str!("../rollback/0028_agent_tenancy_identity_down.sql");
+    const GRANTS_ROLLBACK_SQL: &str =
+        include_str!("../rollback/0030_credential_agent_grants_down.sql");
+
+    /// Unwind to the 0027 baseline, in order.
+    ///
+    /// Migration 0030's agent-side foreign key depends on
+    /// `agents_tenant_id_id_key`, which the 0028 rollback drops, so 0028's
+    /// script refuses until 0030 has been unwound. Every test that rolls step 1
+    /// back goes through here rather than reaching for `ROLLBACK_SQL` directly,
+    /// so a future migration adding another dependency has one place to update.
+    async fn rollback_to_0027(pool: &PgPool) {
+        sqlx::raw_sql(GRANTS_ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0030 rollback");
+        sqlx::raw_sql(ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0028 rollback");
+    }
 
     fn tenant_a() -> Uuid {
         Uuid::parse_str("aaaaaaaa-0000-4000-8000-000000000001").unwrap()
@@ -1359,7 +1379,7 @@ mod db_tests {
     /// create agents exactly as a pre-0028 release did, then apply 0028.
     #[sqlx::test(migrations = "./migrations")]
     async fn upgrading_a_populated_deployment_preserves_identifiers(pool: PgPool) {
-        sqlx::raw_sql(ROLLBACK_SQL).execute(&pool).await.unwrap();
+        rollback_to_0027(&pool).await;
         assert!(!column_exists(&pool, "agents", "external_agent_id").await);
 
         for agent in ["alpha", "beta"] {
@@ -1425,7 +1445,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(ROLLBACK_SQL).execute(&pool).await.unwrap();
+        rollback_to_0027(&pool).await;
 
         // Everything 0028 added is gone.
         assert!(!column_exists(&pool, "agents", "tenant_id").await);
@@ -1524,7 +1544,7 @@ mod db_tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(ROLLBACK_SQL).execute(&pool).await.unwrap();
+        rollback_to_0027(&pool).await;
 
         // Parent and both children now agree on the caller-facing identifier.
         assert_eq!(
@@ -1581,6 +1601,13 @@ mod db_tests {
         // (right for `psql -f`, where autocommit would otherwise leave a failed
         // rollback half-applied), so the RAISE leaves this connection in an
         // aborted transaction that must be cleared before it is reused.
+        // 0030 first, or the migration-order guard fires and this test would
+        // pass for the wrong reason.
+        sqlx::raw_sql(GRANTS_ROLLBACK_SQL)
+            .execute(&pool)
+            .await
+            .expect("0030 rollback");
+
         let mut conn = pool.acquire().await.unwrap();
         let error = sqlx::raw_sql(ROLLBACK_SQL)
             .execute(&mut *conn)

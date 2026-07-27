@@ -434,7 +434,7 @@ async fn a_cached_credential_is_served_without_the_database(pool: PgPool) {
         .expect("issuance");
     assert!(auth.authenticate(issued.presented()).await.result.is_ok());
 
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -466,7 +466,7 @@ async fn a_database_error_fails_closed(pool: PgPool) {
 
     // A fresh authenticator has an empty cache, so this reaches the database.
     let cold = authenticator(&pool, &clock);
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -977,7 +977,7 @@ async fn an_unexpected_column_default_is_rejected(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn a_missing_composite_uniqueness_is_rejected(pool: PgPool) {
-    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_id_tenant_id_key")
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_id_tenant_id_key CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -1040,7 +1040,7 @@ async fn a_missing_column_or_index_is_rejected(pool: PgPool) {
 async fn an_absent_table_is_rejected_rather_than_assumed(pool: PgPool) {
     // Also covers "validation could not be performed": an unverifiable schema
     // is treated exactly like a wrong one.
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -1086,7 +1086,7 @@ async fn a_weakened_pre_existing_table_survives_the_migration_and_is_caught_here
     // migration is a no-op — `IF NOT EXISTS` sees a table named `credentials`
     // and skips the entire definition — so `0029` reports success against a
     // table with no primary key and no constraints at all.
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -1243,7 +1243,7 @@ async fn a_wrong_secret_never_populates_the_cache(pool: PgPool) {
 
     // If any probe had cached the record, the *correct* secret would now be
     // servable with no database at all. Take the table away and find out.
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -1372,7 +1372,7 @@ async fn a_wrong_secret_for_a_warmed_id_still_reaches_the_database(pool: PgPool)
         "warm the cache"
     );
 
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
@@ -1442,7 +1442,7 @@ async fn a_failed_cache_probe_does_not_disturb_the_entry(pool: PgPool) {
     }
 
     // Still cached: the correct secret is served without the database.
-    sqlx::query("DROP TABLE credentials")
+    sqlx::query("DROP TABLE credentials CASCADE")
         .execute(&pool)
         .await
         .unwrap();
