@@ -1,0 +1,510 @@
+# Instincts generated from https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+# Generated: 2026-07-27T11:58:45.420Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: AEON-IQ-temp-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, docs, fix
+
+## Evidence
+
+- 4 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(db): add tenant-scoped agent identity columns and constraints (step 1), docs(tenancy): agent identity migration runbook, env vars and CI skip list
+
+---
+id: AEON-IQ-temp-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Length
+
+## Action
+
+Write moderate-length commit messages (~72 characters)
+
+## Evidence
+
+- Average commit message length: 72 chars
+- Based on 4 commits
+
+---
+id: AEON-IQ-temp-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: AEON-IQ-temp-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: AEON-IQ-temp-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: AEON-IQ-temp-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: AEON-IQ-temp-workflow-database-migration-workflow
+trigger: "when doing database migration workflow"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Database Migration Workflow
+
+## Action
+
+Follow the database-migration-workflow workflow:
+1. Create or update forward migration SQL file in migrations/
+2. Create or update rollback migration SQL file in rollback/
+3. Update application logic to use new schema (e.g., src/tenancy.rs, src/main.rs)
+4. Document migration steps and environment variables in docs/ and .env.example
+5. Update CI workflow to accommodate schema changes if necessary
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: migrations/*.sql, rollback/*.sql, src/*.rs
+
+---
+id: AEON-IQ-temp-workflow-feature-implementation-and-documentation-workflow
+trigger: "when doing feature implementation and documentation workflow"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Feature Implementation And Documentation Workflow
+
+## Action
+
+Follow the feature-implementation-and-documentation-workflow workflow:
+1. Implement feature logic in src/ (e.g., src/tenancy.rs, src/main.rs)
+2. Document feature and configuration in docs/ and .env.example
+3. Update CI workflow if new tests or environment variables are required
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: src/*.rs, docs/*.md, .env.example
+
+---
+id: aeon-iq-temp-instinct-naming-files
+trigger: "When creating or renaming a source file"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Naming Files
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files
+- Observed in src/tenancy.rs, src/main.rs
+
+---
+id: aeon-iq-temp-instinct-naming-functions
+trigger: "When defining a function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Naming Functions
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: aeon-iq-temp-instinct-naming-classes
+trigger: "When defining a class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Naming Classes
+
+## Action
+
+Use PascalCase for class/struct names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: aeon-iq-temp-instinct-naming-constants
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Naming Constants
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: aeon-iq-temp-instinct-import-style
+trigger: "When importing modules in Rust code"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: aeon-iq-temp-instinct-export-style
+trigger: "When exporting modules or items"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: aeon-iq-temp-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Test Location
+
+## Action
+
+Place test files in a separate directory from src (not inline with source files)
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation
+
+---
+id: aeon-iq-temp-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Git Commit Format
+
+## Action
+
+Use conventional commit format: <type>(<scope>): <description>
+
+## Evidence
+
+- Pattern in commits.type and commits.prefixes
+- Seen in commit: feat(db): add tenant-scoped agent identity columns and constraints (step 1)
+
+---
+id: aeon-iq-temp-instinct-git-commit-length
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Git Commit Length
+
+## Action
+
+Keep commit message length around 72 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: aeon-iq-temp-instinct-database-migration-step1
+trigger: "When introducing a new database feature or constraint"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Database Migration Step1
+
+## Action
+
+Create or update a forward migration SQL file in migrations/
+
+## Evidence
+
+- database-migration-workflow.steps[0]
+- Seen in commit sequence for migration
+
+---
+id: aeon-iq-temp-instinct-database-migration-step2
+trigger: "After creating a forward migration SQL file"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Database Migration Step2
+
+## Action
+
+Create or update a rollback migration SQL file in rollback/
+
+## Evidence
+
+- database-migration-workflow.steps[1]
+- Seen in commit sequence for migration
+
+---
+id: aeon-iq-temp-instinct-database-migration-step3
+trigger: "After updating migration SQL files"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Database Migration Step3
+
+## Action
+
+Update application logic in src/ to use the new schema
+
+## Evidence
+
+- database-migration-workflow.steps[2]
+- Seen in commit sequence for migration
+
+---
+id: aeon-iq-temp-instinct-database-migration-step4
+trigger: "After updating application logic for a migration"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Database Migration Step4
+
+## Action
+
+Document migration steps and environment variables in docs/ and .env.example
+
+## Evidence
+
+- database-migration-workflow.steps[3]
+- Seen in commit sequence for migration
+
+---
+id: aeon-iq-temp-instinct-database-migration-step5
+trigger: "After documenting migration steps"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Database Migration Step5
+
+## Action
+
+Update CI workflow in .github/workflows/ci.yml to accommodate schema changes if necessary
+
+## Evidence
+
+- database-migration-workflow.steps[4]
+- Seen in commit sequence for migration
+
+---
+id: aeon-iq-temp-instinct-feature-implementation-step1
+trigger: "When adding a new application-level feature or configuration"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Feature Implementation Step1
+
+## Action
+
+Implement feature logic in src/ (e.g., src/tenancy.rs, src/main.rs)
+
+## Evidence
+
+- feature-implementation-and-documentation-workflow.steps[0]
+- Seen in commit sequence for feature implementation
+
+---
+id: aeon-iq-temp-instinct-feature-implementation-step2
+trigger: "After implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Feature Implementation Step2
+
+## Action
+
+Document feature and configuration in docs/ and .env.example
+
+## Evidence
+
+- feature-implementation-and-documentation-workflow.steps[1]
+- Seen in commit sequence for feature implementation
+
+---
+id: aeon-iq-temp-instinct-feature-implementation-step3
+trigger: "After documenting a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Feature Implementation Step3
+
+## Action
+
+Update CI workflow in .github/workflows/ci.yml if new tests or environment variables are required
+
+## Evidence
+
+- feature-implementation-and-documentation-workflow.steps[2]
+- Seen in commit sequence for feature implementation
+
