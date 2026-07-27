@@ -37,6 +37,27 @@
 
 BEGIN;
 
+-- ── Migration order ──────────────────────────────────────────────────────────
+-- Migration 0030 (agent grants) hangs a composite foreign key off
+-- `agents_tenant_id_id_key`, which this script drops.  Unwinding out of order
+-- fails on a dependency error partway through — after the identifier restore
+-- block below has already run.  Refusing up front, with the remedy named, is
+-- the difference between "run this first" and "work out what state your
+-- database is in now".
+--
+-- Deliberately NOT resolved with `DROP ... CASCADE`: cascading would silently
+-- delete every agent grant, which is authorization data, as a side effect of a
+-- rollback the operator asked for on a different migration.
+DO $$
+BEGIN
+    IF to_regclass('public.credential_agent_grants') IS NOT NULL THEN
+        RAISE EXCEPTION
+            'migration 0030 (agent grants) is still applied and depends on constraints this '
+            'rollback removes. Run rollback/0030_credential_agent_grants_down.sql first.'
+            USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+END $$;
+
 -- ── Restore caller-facing identifiers ────────────────────────────────────────
 -- Runs before anything is dropped.  Skipped entirely when 0028 was never
 -- applied; plpgsql plans the statements lazily, so the guard is enough to keep

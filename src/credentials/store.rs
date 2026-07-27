@@ -415,8 +415,12 @@ pub enum SchemaError {
     /// unverifiable schema is treated exactly like a wrong one.
     #[error("the credential schema could not be inspected")]
     Backend(#[from] sqlx::Error),
+    // Names the schema rather than one table: since step 3 this also reports
+    // `credential_agent_grants` problems, and an error that says "the
+    // credentials table" while listing grant-table defects sends the reader to
+    // the wrong place.
     #[error(
-        "the `credentials` table does not match the contract this build requires:\n{}",
+        "the credential schema does not match the contract this build requires:\n{}",
         .0.iter().map(|p| format!("  • {p}")).collect::<Vec<_>>().join("\n")
     )]
     Contract(Vec<String>),
@@ -581,11 +585,254 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
         }
     }
 
+    // ── Agent grants (migration 0030) ────────────────────────────────────────
+    // Checked here rather than in a separate pass so a drifted schema produces
+    // one list. Same reasoning as above: the composite foreign keys and the
+    // mutual-exclusion triggers are what make cross-tenant and contradictory
+    // grants unrepresentable, so their presence is proved rather than assumed.
+    verify_grants_schema(pool, &mut problems).await?;
+
     if problems.is_empty() {
         Ok(())
     } else {
         Err(SchemaError::Contract(problems))
     }
+}
+
+/// `(column, data_type, nullable, expected default)` for `credential_agent_grants`.
+const REQUIRED_GRANT_COLUMNS: &[(&str, &str, bool, Option<&str>)] = &[
+    ("credential_id", "uuid", false, None),
+    ("tenant_id", "uuid", false, None),
+    ("agent_id", "uuid", false, None),
+    (
+        "created_at",
+        "timestamp with time zone",
+        false,
+        Some("now()"),
+    ),
+];
+
+/// Both foreign keys must be **composite**. A single-column reference would
+/// leave `tenant_id` free to name any tenant at all, which is precisely the
+/// earlier §2.2 draft the plan rejects — so the definitions are compared, not
+/// merely counted.
+const REQUIRED_GRANT_FOREIGN_KEYS: &[(&str, &str)] = &[
+    (
+        "credential_agent_grants_credential_fkey",
+        "FOREIGN KEY (credential_id, tenant_id) REFERENCES credentials(id, tenant_id) \
+         ON DELETE CASCADE",
+    ),
+    (
+        "credential_agent_grants_agent_fkey",
+        "FOREIGN KEY (tenant_id, agent_id) REFERENCES agents(tenant_id, id) ON DELETE CASCADE",
+    ),
+];
+
+/// `(table, trigger, expected pg_get_triggerdef)` — the pair enforcing
+/// tenant-wide/grants mutual exclusion.
+///
+/// Three things are checked, and each covers a different way this can rot:
+///
+/// * **Presence** — the obvious one.
+/// * **`tgenabled`** — a disabled trigger is listed by `pg_trigger` exactly like
+///   an enabled one, and `ALTER TABLE … DISABLE TRIGGER` is a routine thing to
+///   do for a bulk load and an easy thing to forget to undo.
+/// * **The definition** — same reasoning as the CHECK expressions above. A
+///   trigger with the right name, enabled, but firing on the wrong event or
+///   calling a no-op function passes the first two checks while enforcing
+///   nothing. `authorize_agent` would still deny the contradictory state it
+///   allows, but startup would have declared the schema sound.
+const REQUIRED_TRIGGERS: &[(&str, &str, &str)] = &[
+    (
+        "credential_agent_grants",
+        "credential_agent_grants_not_tenant_wide",
+        "CREATE TRIGGER credential_agent_grants_not_tenant_wide BEFORE INSERT OR UPDATE \
+         ON public.credential_agent_grants FOR EACH ROW \
+         EXECUTE FUNCTION credential_agent_grants_reject_tenant_wide()",
+    ),
+    (
+        "credentials",
+        "credentials_not_tenant_wide_with_grants",
+        "CREATE TRIGGER credentials_not_tenant_wide_with_grants BEFORE INSERT OR UPDATE \
+         ON public.credentials FOR EACH ROW \
+         EXECUTE FUNCTION credentials_reject_tenant_wide_with_grants()",
+    ),
+];
+
+/// Append any `credential_agent_grants` contract violations to `problems`.
+async fn verify_grants_schema(
+    pool: &PgPool,
+    problems: &mut Vec<String>,
+) -> Result<(), sqlx::Error> {
+    let (present,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('public.credential_agent_grants') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    if !present {
+        problems.push(
+            "table `credential_agent_grants` does not exist; migration 0030 has not been \
+             applied, so no credential could be restricted to an agent set"
+                .into(),
+        );
+        // Everything below would pile on the same root cause.
+        return Ok(());
+    }
+
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable, column_default \
+           FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'credential_agent_grants'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (name, want_type, want_nullable, want_default) in REQUIRED_GRANT_COLUMNS {
+        match columns.iter().find(|(column, _, _, _)| column == name) {
+            None => problems.push(format!(
+                "column `credential_agent_grants.{name}` is missing"
+            )),
+            Some((_, got_type, got_nullable, got_default)) => {
+                if got_type != want_type {
+                    problems.push(format!(
+                        "column `credential_agent_grants.{name}` has type `{got_type}`, \
+                         expected `{want_type}`"
+                    ));
+                }
+                if (got_nullable == "YES") != *want_nullable {
+                    problems.push(format!(
+                        "column `credential_agent_grants.{name}` is {}, expected {}",
+                        if got_nullable == "YES" {
+                            "nullable"
+                        } else {
+                            "NOT NULL"
+                        },
+                        if *want_nullable {
+                            "nullable"
+                        } else {
+                            "NOT NULL"
+                        },
+                    ));
+                }
+                let got_default = got_default.as_deref().map(normalise_sql);
+                let want_default = want_default.map(normalise_sql);
+                if got_default != want_default {
+                    problems.push(format!(
+                        "column `credential_agent_grants.{name}` has default {}, expected {}",
+                        got_default.as_deref().unwrap_or("(none)"),
+                        want_default.as_deref().unwrap_or("(none)"),
+                    ));
+                }
+            }
+        }
+    }
+
+    let constraints: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT c.conname, c.contype::text, \
+                COALESCE((SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
+                            FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                            JOIN pg_attribute a \
+                              ON a.attrelid = c.conrelid AND a.attnum = k.attnum), ''), \
+                pg_get_constraintdef(c.oid) \
+           FROM pg_constraint c \
+          WHERE c.conrelid = 'public.credential_agent_grants'::regclass",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    match constraints.iter().find(|(_, kind, _, _)| kind == "p") {
+        None => problems.push(
+            "`credential_agent_grants` has no PRIMARY KEY, so the same agent could be \
+             granted to the same credential more than once"
+                .into(),
+        ),
+        Some((name, _, cols, _)) if cols != "credential_id,agent_id" => problems.push(format!(
+            "primary key `{name}` covers ({cols}), expected (credential_id, agent_id)"
+        )),
+        Some(_) => {}
+    }
+
+    for (name, want_def) in REQUIRED_GRANT_FOREIGN_KEYS {
+        match constraints
+            .iter()
+            .find(|(got, kind, _, _)| got == name && kind == "f")
+        {
+            None => problems.push(format!("foreign key `{name}` is missing")),
+            Some((_, _, _, got_def)) if normalise_sql(got_def) != normalise_sql(want_def) => {
+                problems.push(format!(
+                    "foreign key `{name}` is `{}`, expected `{}` — a non-composite \
+                     reference would leave tenant_id free to name any tenant",
+                    normalise_sql(got_def),
+                    normalise_sql(want_def),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    let (index_present,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+          WHERE schemaname = 'public' AND tablename = 'credential_agent_grants' \
+            AND indexname = 'idx_credential_agent_grants_agent')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !index_present {
+        problems.push("index `idx_credential_agent_grants_agent` is missing".into());
+    }
+
+    for (table, trigger, want_def) in REQUIRED_TRIGGERS {
+        let found: Option<(String, String)> = sqlx::query_as(
+            "SELECT t.tgenabled::text, pg_get_triggerdef(t.oid) FROM pg_trigger t \
+              WHERE t.tgrelid = ($1 || '')::regclass AND t.tgname = $2 AND NOT t.tgisinternal",
+        )
+        .bind(format!("public.{table}"))
+        .bind(trigger)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some((state, got_def)) = found else {
+            problems.push(format!(
+                "trigger `{trigger}` on `{table}` is missing; tenant-wide and per-agent \
+                 grants would no longer be mutually exclusive"
+            ));
+            continue;
+        };
+
+        // 'O' origin, 'A' always. 'D' is disabled; 'R' fires only on replica.
+        if state != "O" && state != "A" {
+            problems.push(format!(
+                "trigger `{trigger}` on `{table}` exists but is not enabled (tgenabled = \
+                 '{state}'), so a credential could hold tenant_wide and grants at once"
+            ));
+        }
+
+        if normalise_sql(&got_def) != normalise_sql(want_def) {
+            problems.push(format!(
+                "trigger `{trigger}` on `{table}` has the expected name but a different \
+                 definition: found `{}`, expected `{}` — a trigger firing on the wrong \
+                 event, or calling a different function, enforces nothing",
+                normalise_sql(&got_def),
+                normalise_sql(want_def),
+            ));
+        }
+    }
+
+    let (select, insert, delete): (bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('public.credential_agent_grants', 'SELECT'), \
+                has_table_privilege('public.credential_agent_grants', 'INSERT'), \
+                has_table_privilege('public.credential_agent_grants', 'DELETE')",
+    )
+    .fetch_one(pool)
+    .await?;
+    for (granted, privilege) in [(select, "SELECT"), (insert, "INSERT"), (delete, "DELETE")] {
+        if !granted {
+            problems.push(format!(
+                "the connected role lacks {privilege} on `credential_agent_grants`"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

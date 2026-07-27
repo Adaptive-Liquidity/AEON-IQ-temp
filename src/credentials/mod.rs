@@ -37,6 +37,7 @@
 
 mod cache;
 mod context;
+mod grants;
 mod scope;
 mod secret;
 mod store;
@@ -63,6 +64,13 @@ pub use context::{AeonAuthContext, CredentialMode};
 pub use scope::{Scope, ScopeSet};
 pub use secret::{IssuedCredential, Pepper};
 pub use store::{CredentialRecord, CredentialStatus};
+// Step 3. Nothing in the binary consults these yet — route enforcement is step
+// 5 — so the module-scope `dead_code` allowance above covers them.
+#[allow(unused_imports)]
+pub use grants::{
+    authorize_agent, grant, list_grants, revoke_grant, AgentDecision, AgentGrant, DenialReason,
+    GrantBasis,
+};
 
 /// The single message any rejected caller sees.
 ///
