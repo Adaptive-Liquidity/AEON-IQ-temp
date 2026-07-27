@@ -920,21 +920,37 @@ async fn verify_trigger_functions(
                    FROM pg_proc p \
                    JOIN pg_namespace n ON n.oid = p.pronamespace \
                    JOIN pg_language l ON l.oid = p.prolang \
-                  WHERE p.proname = $1",
+                  WHERE p.proname = $1 AND p.pronargs = 0",
         )
         .bind(name)
         .fetch_all(pool)
         .await?;
 
+        // `pg_proc` permits overloads, so the query above is narrowed to the
+        // zero-argument one — the only signature a trigger can execute. Without
+        // that, an unrelated same-named overload could be picked out of an
+        // unordered result set and validated in place of the real function.
+        let public_candidates: Vec<&FunctionFacts> = candidates
+            .iter()
+            .filter(|(schema, ..)| schema == "public")
+            .collect();
+
+        if public_candidates.len() > 1 {
+            problems.push(format!(
+                "`public` holds {} zero-argument functions named `{name}`; the schema is                  ambiguous about which one the trigger executes",
+                public_candidates.len()
+            ));
+        }
+
         let Some((_, nargs, result, language, security_definer, config, body)) =
-            candidates.iter().find(|(schema, ..)| schema == "public")
+            public_candidates.first().copied()
         else {
             let elsewhere: Vec<&str> = candidates
                 .iter()
                 .map(|(schema, ..)| schema.as_str())
                 .collect();
             problems.push(if elsewhere.is_empty() {
-                format!("trigger function `public.{name}` is missing")
+                format!("trigger function `public.{name}` is missing, or takes arguments")
             } else {
                 format!(
                     "trigger function `{name}` does not exist in `public`; it was found in \

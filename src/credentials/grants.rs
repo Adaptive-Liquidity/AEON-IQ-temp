@@ -410,27 +410,63 @@ mod db_tests {
         let target = agent(&pool, tenant, "ext-a").await;
         grant(&pool, cred, tenant, target).await.unwrap();
 
-        // A *second* credential id reusing the same grants is not possible (the
-        // grant's FK ties it to one credential), so the INSERT arm is exercised
-        // by re-inserting this credential's id after removing the row itself
-        // while leaving the grant — which cascade makes impossible — so instead
-        // the arm is exercised directly against the trigger's own predicate.
+        // The arm has to be reached with a credential id that is *free*, or the
+        // primary key rejects the INSERT first and the test passes even with the
+        // arm deleted. Grants normally cannot precede their credential — the
+        // composite foreign key sees to that — so the key is dropped for the
+        // duration to stage a grant against an id that does not exist yet.
+        //
+        // This is a contrived state on purpose: it is the only way to put the
+        // trigger's INSERT branch under test, and it is exactly the state a
+        // restore-with-constraints-disabled can produce.
+        sqlx::query("ALTER TABLE credential_agent_grants DROP CONSTRAINT credential_agent_grants_credential_fkey")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let unborn = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO credential_agent_grants (credential_id, tenant_id, agent_uuid) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(unborn)
+        .bind(tenant)
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("with the foreign key gone, a grant can precede its credential");
+
         let error = sqlx::query(
             "INSERT INTO credentials (id, tenant_id, principal_id, secret_mac, mode, tenant_wide) \
-             SELECT $1, $2, 'p', $3, 'v2_required', TRUE",
+             VALUES ($1, $2, 'p', $3, 'v2_required', TRUE)",
         )
-        .bind(cred)
+        .bind(unborn)
         .bind(tenant)
         .bind(vec![0u8; 32])
         .execute(&pool)
         .await
-        .expect_err("inserting a tenant_wide credential whose id already holds grants");
-        // Either the trigger or the primary key stops it; both are refusals,
-        // and the trigger is what stops the case where the id is free.
+        .expect_err("a credential arriving tenant_wide onto existing grants must be refused");
+
+        // Specifically the trigger, not the primary key: `unborn` is a fresh id.
         assert!(
-            format!("{error:?}").contains("duplicate key")
-                || format!("{error:?}").contains("tenant_wide cannot be set")
+            format!("{error:?}").contains("tenant_wide cannot be set"),
+            "the INSERT arm must be what refuses it, got: {error:?}"
         );
+
+        // …and the same INSERT without tenant_wide is fine, so the refusal is
+        // about the contradiction rather than about the row.
+        sqlx::query(
+            "INSERT INTO credentials (id, tenant_id, principal_id, secret_mac, mode, tenant_wide) \
+             VALUES ($1, $2, 'p', $3, 'v2_required', FALSE)",
+        )
+        .bind(unborn)
+        .bind(tenant)
+        .bind(vec![0u8; 32])
+        .execute(&pool)
+        .await
+        .expect("an agent-restricted credential over the same grants is fine");
+
+        assert_ne!(cred, unborn);
     }
 
     #[sqlx::test(migrations = "./migrations")]
