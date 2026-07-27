@@ -123,6 +123,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- `CREATE OR REPLACE TRIGGER` needs PostgreSQL 14+, and is used so re-running
+-- this file is a no-op rather than a duplicate-object error.  Every place this
+-- repository declares a Postgres pins the same image — `pgvector/pgvector:pg16`
+-- in docker-compose.yml, docker-compose.test.yml, .github/workflows/ci.yml and
+-- AEON-IQ_BUILD_BLUEPRINT.md — so 14+ is satisfied with two majors to spare.
+-- If a deployment ever needs Postgres 13, this becomes DROP + CREATE.
 CREATE OR REPLACE TRIGGER credential_agent_grants_not_tenant_wide
     BEFORE INSERT OR UPDATE ON credential_agent_grants
     FOR EACH ROW EXECUTE FUNCTION credential_agent_grants_reject_tenant_wide();

@@ -803,6 +803,120 @@ mod db_tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn the_rollback_is_safe_to_re_run_and_to_run_when_never_applied(pool: PgPool) {
+        // Three reviewers independently predicted this would fail, on the theory
+        // that `DROP TRIGGER IF EXISTS … ON credential_agent_grants` errors once
+        // the table is gone, aborting the transaction and stranding the trigger
+        // on `credentials`. On PostgreSQL 16 it does not: the missing relation
+        // is skipped with a notice. Pinned here so the question is settled by
+        // the database rather than re-argued, and so a change to either the
+        // script or the server version is caught.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, cred, tenant, target).await.unwrap();
+
+        for attempt in 1..=3 {
+            sqlx::raw_sql(MIGRATION_0030_DOWN)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("rollback attempt {attempt} failed: {e}"));
+        }
+
+        // Every object is gone after the first pass and stays gone — in
+        // particular the trigger on `credentials`, which is the one an aborted
+        // transaction would have stranded.
+        let (triggers,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_trigger \
+              WHERE NOT tgisinternal \
+                AND tgname IN ('credentials_not_tenant_wide_with_grants', \
+                               'credential_agent_grants_not_tenant_wide')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            triggers, 0,
+            "both triggers removed, and re-runs kept them so"
+        );
+
+        let (migration_row,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 30")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(migration_row, 0, "the migration record is cleared");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_trigger_with_the_right_name_but_a_different_definition_is_rejected(pool: PgPool) {
+        // The trigger equivalent of the weakened-CHECK drift: right name,
+        // enabled, and enforcing nothing. Presence and `tgenabled` both pass.
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION inert_noop() RETURNS TRIGGER AS $$ \
+             BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE OR REPLACE TRIGGER credential_agent_grants_not_tenant_wide \
+             BEFORE INSERT ON credential_agent_grants \
+             FOR EACH ROW EXECUTE FUNCTION inert_noop()",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Proof it enforces nothing: a tenant-wide credential can now be
+        // granted, which is the state §2.2 forbids.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, true).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, cred, tenant, target)
+            .await
+            .expect("the inert trigger permits the contradictory state");
+
+        let error = crate::credentials::assert_schema_contract(&pool)
+            .await
+            .expect_err("an inert trigger must fail the contract");
+        let rendered = error
+            .chain()
+            .map(|cause| cause.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            rendered.contains("has the expected name but a different definition"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("inert_noop"), "{rendered}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_disabled_trigger_is_rejected(pool: PgPool) {
+        sqlx::query(
+            "ALTER TABLE credentials DISABLE TRIGGER credentials_not_tenant_wide_with_grants",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = crate::credentials::assert_schema_contract(&pool)
+            .await
+            .expect_err("a disabled trigger must fail the contract");
+        let rendered = error
+            .chain()
+            .map(|cause| cause.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(rendered.contains("is not enabled"), "{rendered}");
+        assert!(
+            rendered.contains("tenant_wide and grants at once"),
+            "{rendered}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn the_grants_table_carries_every_frozen_constraint(pool: PgPool) {
         for name in [
             "credential_agent_grants_pkey",

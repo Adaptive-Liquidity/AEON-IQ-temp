@@ -415,8 +415,12 @@ pub enum SchemaError {
     /// unverifiable schema is treated exactly like a wrong one.
     #[error("the credential schema could not be inspected")]
     Backend(#[from] sqlx::Error),
+    // Names the schema rather than one table: since step 3 this also reports
+    // `credential_agent_grants` problems, and an error that says "the
+    // credentials table" while listing grant-table defects sends the reader to
+    // the wrong place.
     #[error(
-        "the `credentials` table does not match the contract this build requires:\n{}",
+        "the credential schema does not match the contract this build requires:\n{}",
         .0.iter().map(|p| format!("  • {p}")).collect::<Vec<_>>().join("\n")
     )]
     Contract(Vec<String>),
@@ -624,18 +628,35 @@ const REQUIRED_GRANT_FOREIGN_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `(table, trigger)` — the pair enforcing tenant-wide/grants mutual exclusion.
+/// `(table, trigger, expected pg_get_triggerdef)` — the pair enforcing
+/// tenant-wide/grants mutual exclusion.
 ///
-/// Presence is not enough: a disabled trigger is listed by `pg_trigger` exactly
-/// like an enabled one, and `ALTER TABLE … DISABLE TRIGGER` is a routine thing
-/// to do for a bulk load and an easy thing to forget to undo. `tgenabled` is
-/// checked too.
-const REQUIRED_TRIGGERS: &[(&str, &str)] = &[
+/// Three things are checked, and each covers a different way this can rot:
+///
+/// * **Presence** — the obvious one.
+/// * **`tgenabled`** — a disabled trigger is listed by `pg_trigger` exactly like
+///   an enabled one, and `ALTER TABLE … DISABLE TRIGGER` is a routine thing to
+///   do for a bulk load and an easy thing to forget to undo.
+/// * **The definition** — same reasoning as the CHECK expressions above. A
+///   trigger with the right name, enabled, but firing on the wrong event or
+///   calling a no-op function passes the first two checks while enforcing
+///   nothing. `authorize_agent` would still deny the contradictory state it
+///   allows, but startup would have declared the schema sound.
+const REQUIRED_TRIGGERS: &[(&str, &str, &str)] = &[
     (
         "credential_agent_grants",
         "credential_agent_grants_not_tenant_wide",
+        "CREATE TRIGGER credential_agent_grants_not_tenant_wide BEFORE INSERT OR UPDATE \
+         ON public.credential_agent_grants FOR EACH ROW \
+         EXECUTE FUNCTION credential_agent_grants_reject_tenant_wide()",
     ),
-    ("credentials", "credentials_not_tenant_wide_with_grants"),
+    (
+        "credentials",
+        "credentials_not_tenant_wide_with_grants",
+        "CREATE TRIGGER credentials_not_tenant_wide_with_grants BEFORE INSERT OR UPDATE \
+         ON public.credentials FOR EACH ROW \
+         EXECUTE FUNCTION credentials_reject_tenant_wide_with_grants()",
+    ),
 ];
 
 /// Append any `credential_agent_grants` contract violations to `problems`.
@@ -759,9 +780,9 @@ async fn verify_grants_schema(
         problems.push("index `idx_credential_agent_grants_agent` is missing".into());
     }
 
-    for (table, trigger) in REQUIRED_TRIGGERS {
-        let enabled: Option<(String,)> = sqlx::query_as(
-            "SELECT t.tgenabled::text FROM pg_trigger t \
+    for (table, trigger, want_def) in REQUIRED_TRIGGERS {
+        let found: Option<(String, String)> = sqlx::query_as(
+            "SELECT t.tgenabled::text, pg_get_triggerdef(t.oid) FROM pg_trigger t \
               WHERE t.tgrelid = ($1 || '')::regclass AND t.tgname = $2 AND NOT t.tgisinternal",
         )
         .bind(format!("public.{table}"))
@@ -769,17 +790,30 @@ async fn verify_grants_schema(
         .fetch_optional(pool)
         .await?;
 
-        match enabled.as_ref().map(|(state,)| state.as_str()) {
-            None => problems.push(format!(
+        let Some((state, got_def)) = found else {
+            problems.push(format!(
                 "trigger `{trigger}` on `{table}` is missing; tenant-wide and per-agent \
                  grants would no longer be mutually exclusive"
-            )),
-            // 'O' origin, 'A' always. 'D' is disabled; 'R' fires only on replica.
-            Some("O") | Some("A") => {}
-            Some(state) => problems.push(format!(
+            ));
+            continue;
+        };
+
+        // 'O' origin, 'A' always. 'D' is disabled; 'R' fires only on replica.
+        if state != "O" && state != "A" {
+            problems.push(format!(
                 "trigger `{trigger}` on `{table}` exists but is not enabled (tgenabled = \
                  '{state}'), so a credential could hold tenant_wide and grants at once"
-            )),
+            ));
+        }
+
+        if normalise_sql(&got_def) != normalise_sql(want_def) {
+            problems.push(format!(
+                "trigger `{trigger}` on `{table}` has the expected name but a different \
+                 definition: found `{}`, expected `{}` — a trigger firing on the wrong \
+                 event, or calling a different function, enforces nothing",
+                normalise_sql(&got_def),
+                normalise_sql(want_def),
+            ));
         }
     }
 
