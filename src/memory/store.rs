@@ -2000,8 +2000,6 @@ mod tests {
             metrics: Arc::new(Metrics::new().unwrap()),
             provider: Provider::OpenAI,
             rate_limiter: Arc::new(RateLimiter::new(0, 0)),
-            // The V1 default: credential authentication inactive.
-            credential_auth: None,
         }
     }
 

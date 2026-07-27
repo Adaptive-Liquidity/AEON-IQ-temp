@@ -3,7 +3,6 @@ mod archival;
 mod attestation;
 mod auth;
 mod config;
-mod credentials;
 mod db;
 mod embeddings;
 mod extraction_worker;
@@ -44,14 +43,6 @@ pub struct AppState {
     pub provider: providers::Provider,
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     pub evidence_signer: Arc<attestation::EvidenceSigner>,
-    /// `None` unless `AEON_CREDENTIAL_AUTH_ENABLED=true`, which is the V1
-    /// default and the state every existing deployment starts in.
-    ///
-    /// Nothing reads this yet: per-route enforcement is plan step 5. It is
-    /// carried on the state so the subsystem is constructed and its startup
-    /// preconditions are exercised, rather than sitting unreachable until the
-    /// step that needs it.
-    pub credential_auth: Option<Arc<credentials::Authenticator>>,
 }
 
 #[tokio::main]
@@ -71,12 +62,6 @@ async fn main() -> anyhow::Result<()> {
     // Parsed before anything touches the database so a half-specified migration
     // mode fails immediately rather than after partial work.
     let tenancy_settings = tenancy::TenancySettings::from_env()?;
-    // Parsed here for the same reason: a malformed pepper, or credential
-    // authentication enabled with no pepper at all, must fail before any work
-    // is done rather than at the first request. With none of the
-    // AEON_CREDENTIAL_* variables set this yields the inactive V1 default and
-    // requires no pepper.
-    let credential_auth_settings = credentials::CredentialAuthSettings::from_env()?;
     tracing::info!(
         "MemoryOS Kernel starting on port {} with role {:?}",
         config.port,
@@ -162,28 +147,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Also inert unless MULTI_TENANT_ENABLED=true.  Separate from the gate
-    // above because it asks a different question: that one asks whether the
-    // legacy path has been retired, this one asks whether anything exists to
-    // replace it.  Enabling multi-tenancy with an empty registry would leave a
-    // deployment nothing could authenticate against (plan §2 "Startup").
-    credentials::assert_registry_ready_for_multi_tenant(&db, tenancy_settings.multi_tenant_enabled)
-        .await?;
-
-    let credential_auth = credential_auth_settings.build(db.clone())?.map(Arc::new);
-    match credential_auth.as_ref() {
-        Some(_) => tracing::info!(
-            cache_ttl_secs = credentials::MAX_TTL.as_secs(),
-            cache_capacity = credential_auth_settings.cache_capacity,
-            "Credential authentication subsystem loaded (registry available; \
-             per-route enforcement is not yet active)"
-        ),
-        None => tracing::debug!(
-            "Credential authentication is inactive (AEON_CREDENTIAL_AUTH_ENABLED is not true); \
-             MANAGEMENT_API_KEY remains the only authentication in effect"
-        ),
-    }
-
     // Redirects are disabled: provider API calls (LLM, embeddings, extraction)
     // should never be redirected cross-host.  Following redirects by default
     // would allow a validated public URL to 302 to an internal address
@@ -217,7 +180,6 @@ async fn main() -> anyhow::Result<()> {
         provider,
         rate_limiter,
         evidence_signer,
-        credential_auth,
     };
 
     // ── Background jobs ───────────────────────────────────────────────────────
