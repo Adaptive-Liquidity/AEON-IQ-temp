@@ -70,6 +70,11 @@ subtle = "2"
 
 # SHA-256 for query hashing in retrieval logs
 sha2 = "0.10"
+# HMAC-SHA-256 for credential verification.  A keyed MAC, not a password hash:
+# credential secrets are 32 bytes of CSPRNG output, so a slow KDF would buy no
+# resistance and would hand unauthenticated callers a per-request amplifier.
+# See src/credentials/secret.rs.
+hmac = "0.12"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex  = "0.4"
 
