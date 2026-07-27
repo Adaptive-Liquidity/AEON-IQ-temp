@@ -1,0 +1,454 @@
+# Instincts generated from https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+# Generated: 2026-07-27T15:09:00.020Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: AEON-IQ-temp-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, ci, fix
+
+## Evidence
+
+- 4 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(credentials): add the credential registry migration (plan step 2), ci: skip credentials::db_tests in the no-database job
+
+---
+id: AEON-IQ-temp-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Length
+
+## Action
+
+Write moderate-length commit messages (~62 characters)
+
+## Evidence
+
+- Average commit message length: 62 chars
+- Based on 4 commits
+
+---
+id: AEON-IQ-temp-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: AEON-IQ-temp-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: AEON-IQ-temp-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: AEON-IQ-temp-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: AEON-IQ-temp-workflow-feature-development-with-db-migration
+trigger: "when doing feature development with db migration"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Feature Development With Db Migration
+
+## Action
+
+Follow the feature-development-with-db-migration workflow:
+1. Create or modify a SQL migration file in migrations/ to update the database schema.
+2. Add or update Rust module files under src/ (e.g., src/credentials/...) to implement the feature logic.
+3. Update Cargo.toml and Cargo.lock if new dependencies are needed.
+4. Write or update tests in src/credentials/db_tests.rs or similar test files.
+5. Integrate feature into main application logic (e.g., src/main.rs).
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: migrations/*.sql, src/credentials/*.rs, src/main.rs
+
+---
+id: AEON-IQ-temp-workflow-post-merge-review-fix
+trigger: "when doing post merge review fix"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Post Merge Review Fix
+
+## Action
+
+Follow the post-merge-review-fix workflow:
+1. Identify and describe each issue in the commit message.
+2. Update relevant Rust source files to address the findings.
+3. Add or update regression/unit tests to verify the fixes.
+4. Commit with detailed notes about each fix.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: src/credentials/*.rs
+
+---
+id: AEON-IQ-temp-workflow-ci-test-exclusion-update
+trigger: "when doing ci test exclusion update"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Ci Test Exclusion Update
+
+## Action
+
+Follow the ci-test-exclusion-update workflow:
+1. Edit .github/workflows/ci.yml to add or modify test exclusion rules.
+2. Document the rationale in the commit message.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: .github/workflows/ci.yml
+
+---
+id: aeon-iq-temp-instinct-file-naming
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct File Naming
+
+## Action
+
+Use camelCase for file names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files
+
+---
+id: aeon-iq-temp-instinct-function-naming
+trigger: "When defining a function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+
+---
+id: aeon-iq-temp-instinct-class-naming
+trigger: "When defining a class or struct"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Class Naming
+
+## Action
+
+Use PascalCase for class or struct names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: aeon-iq-temp-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: aeon-iq-temp-instinct-import-style
+trigger: "When importing modules in Rust code"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+
+---
+id: aeon-iq-temp-instinct-export-style
+trigger: "When exporting modules or functions"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: aeon-iq-temp-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Test Location
+
+## Action
+
+Place tests in separate files, typically in src/credentials/db_tests.rs or similar
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation
+- Workflow: feature-development-with-db-migration
+
+---
+id: aeon-iq-temp-instinct-test-update-after-fix
+trigger: "When fixing a bug or review finding"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Test Update After Fix
+
+## Action
+
+Add or update regression/unit tests to verify the fix
+
+## Evidence
+
+- Workflow: post-merge-review-fix
+- Seen in commit: fix(credentials): address four review findings from Cursor and Codex
+
+---
+id: aeon-iq-temp-instinct-commit-format
+trigger: "When making a commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Commit Format
+
+## Action
+
+Use conventional commit format with prefixes like feat, fix, or ci
+
+## Evidence
+
+- Pattern in commits.prefixes
+- Examples: feat(credentials): add the credential registry migration (plan step 2)
+
+---
+id: aeon-iq-temp-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.8
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Commit Length
+
+## Action
+
+Aim for descriptive commit messages averaging around 62 characters
+
+## Evidence
+
+- Pattern in commits.averageLength
+
+---
+id: aeon-iq-temp-instinct-feature-db-migration
+trigger: "When adding a new backend feature that requires both schema and code changes"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Feature Db Migration
+
+## Action
+
+Follow the workflow: create/modify SQL migration, update Rust modules, update dependencies, write/update tests, integrate into main logic
+
+## Evidence
+
+- Workflow: feature-development-with-db-migration
+- Example commit sequence in workflow
+
+---
+id: aeon-iq-temp-instinct-post-merge-fix
+trigger: "When addressing issues found in code review or post-merge audits"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Post Merge Fix
+
+## Action
+
+Identify issues in the commit message, update relevant Rust files, update/add tests, and commit with detailed notes
+
+## Evidence
+
+- Workflow: post-merge-review-fix
+- Example commit: fix(credentials): address four review findings from Cursor and Codex
+
+---
+id: aeon-iq-temp-instinct-ci-test-exclusion
+trigger: "When adjusting which tests run in different CI environments"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Ci Test Exclusion
+
+## Action
+
+Edit .github/workflows/ci.yml to add or modify test exclusion rules and document the rationale in the commit message
+
+## Evidence
+
+- Workflow: ci-test-exclusion-update
+- Example commit: ci: skip credentials::db_tests in the no-database job
+
