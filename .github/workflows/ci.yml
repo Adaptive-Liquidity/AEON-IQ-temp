@@ -143,8 +143,12 @@ jobs:
       # Revisit when eslint-config-next moves its plugins to minimatch >=9, at
       # which point this step should become blocking again and replace the one
       # above.
+      # `continue-on-error` rather than `|| true`: the step is allowed to fail
+      # without failing the job, but it still renders as failed, so the
+      # findings stay visible in the run summary instead of behind a green tick.
       - name: Audit full dependency tree (informational)
-        run: npm audit --audit-level=high || true
+        continue-on-error: true
+        run: npm audit --audit-level=high
 
   # ── Docker image builds (verify Dockerfiles compile) ───────────────────────
   docker:
