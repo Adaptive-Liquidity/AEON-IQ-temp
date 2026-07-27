@@ -185,18 +185,41 @@ async fn an_unknown_credential_fails_and_runs_the_decoy_mac(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_real_credential_does_not_run_the_decoy(pool: PgPool) {
-    // The counter would be useless as evidence if it incremented on every call.
+async fn the_decoy_is_charged_to_every_database_visit_and_only_those(pool: PgPool) {
+    // The decoy now equalises *database visits*, not just misses. Charging it
+    // only to a miss would leave a one-HMAC asymmetry in the other direction,
+    // since the real MAC is computed before the lookup either way.
+    //
+    // That also makes the counter a direct probe for "did this request reach
+    // PostgreSQL?", which is what the oracle tests below measure with.
     let clock = Arc::new(TestClock::new(start()));
     let auth = authenticator(&pool, &clock);
-
     let issued = auth
         .issue(spec(Uuid::new_v4(), &["memory:read"]))
         .await
         .expect("issuance");
-    let _ = auth.authenticate(issued.presented()).await;
+    assert_eq!(auth.dummy_mac_count(), 0, "issuance is not a lookup");
 
-    assert_eq!(auth.dummy_mac_count(), 0);
+    // Cold hit: reaches the database.
+    assert!(auth.authenticate(issued.presented()).await.result.is_ok());
+    assert_eq!(auth.dummy_mac_count(), 1);
+
+    // Warm hit with the correct secret: served from cache, no visit.
+    assert!(auth.authenticate(issued.presented()).await.result.is_ok());
+    assert_eq!(
+        auth.dummy_mac_count(),
+        1,
+        "a cache hit must not touch the database"
+    );
+
+    // Miss: reaches the database.
+    let unknown = format!("{}.{}", Uuid::new_v4(), "cd".repeat(32));
+    assert!(auth.authenticate(&unknown).await.result.is_err());
+    assert_eq!(auth.dummy_mac_count(), 2);
+
+    // Malformed: rejected before any lookup, so no visit and no decoy.
+    assert!(auth.authenticate("not-a-credential").await.result.is_err());
+    assert_eq!(auth.dummy_mac_count(), 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -773,6 +796,239 @@ async fn the_agent_identity_migration_remains_valid(pool: PgPool) {
     }
 }
 
+// ── Schema contract ──────────────────────────────────────────────────────────
+
+/// Run the contract check and return the rendered failure, or `None` if it
+/// passed. The whole error chain is flattened because `assert_schema_contract`
+/// wraps the detail in context.
+async fn schema_failure(pool: &PgPool) -> Option<String> {
+    match assert_schema_contract(pool).await {
+        Ok(()) => None,
+        Err(error) => Some(
+            error
+                .chain()
+                .map(|cause| cause.to_string())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ),
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_migrated_schema_satisfies_the_contract(pool: PgPool) {
+    // The control case. Without it, every rejection test below could be passing
+    // because the checker rejects everything.
+    assert_eq!(
+        schema_failure(&pool).await,
+        None,
+        "the schema migration 0029 produces must satisfy its own contract"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_primary_key_is_rejected(pool: PgPool) {
+    // The drift that `CREATE TABLE IF NOT EXISTS` would wave through. Without a
+    // primary key, `id` need not identify one row.
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_pkey CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("PRIMARY KEY"), "{failure}");
+    assert!(
+        failure.contains("duplicate credential id"),
+        "the error should say why it matters: {failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_mac_length_constraint_is_rejected(pool: PgPool) {
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_secret_mac_len_ck")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains("credentials_secret_mac_len_ck` is missing"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unvalidated_constraint_is_rejected(pool: PgPool) {
+    // NOT VALID is the subtle one: the constraint exists and `pg_constraint`
+    // lists it, but it was never checked against existing rows — so a
+    // 16-byte MAC written before it was added is still sitting there.
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_secret_mac_len_ck")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE credentials ADD CONSTRAINT credentials_secret_mac_len_ck \
+         CHECK (octet_length(secret_mac) = 32) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("NOT VALID"), "{failure}");
+    assert!(failure.contains("never verified"), "{failure}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_composite_uniqueness_is_rejected(pool: PgPool) {
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_id_tenant_id_key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("UNIQUE (id, tenant_id)"), "{failure}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_wrong_column_type_or_nullability_is_rejected(pool: PgPool) {
+    sqlx::query("ALTER TABLE credentials ALTER COLUMN principal_id TYPE VARCHAR(64)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool)
+        .await
+        .expect("type drift must be rejected");
+    assert!(
+        failure.contains("`principal_id` has type `character varying`"),
+        "{failure}"
+    );
+
+    sqlx::query("ALTER TABLE credentials ALTER COLUMN tenant_id DROP NOT NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool)
+        .await
+        .expect("nullability drift must be rejected");
+    assert!(
+        failure.contains("`tenant_id` is nullable, expected NOT NULL"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_column_or_index_is_rejected(pool: PgPool) {
+    sqlx::query("DROP INDEX idx_credentials_active")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains("index `idx_credentials_active` is missing"),
+        "{failure}"
+    );
+
+    sqlx::query("ALTER TABLE credentials DROP COLUMN tenant_wide")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains("column `tenant_wide` is missing"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_absent_table_is_rejected_rather_than_assumed(pool: PgPool) {
+    // Also covers "validation could not be performed": an unverifiable schema
+    // is treated exactly like a wrong one.
+    sqlx::query("DROP TABLE credentials")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("does not exist"), "{failure}");
+    assert!(
+        failure.contains("silently accepts a pre-existing table"),
+        "the context should explain why this check exists: {failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn every_reported_problem_is_listed_at_once(pool: PgPool) {
+    // An operator repairing a drifted schema should see the whole list in one
+    // startup attempt, not discover it one restart at a time.
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_mode_ck")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_status_ck")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP INDEX idx_credentials_tenant_principal")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("credentials_mode_ck"), "{failure}");
+    assert!(failure.contains("credentials_status_ck"), "{failure}");
+    assert!(
+        failure.contains("idx_credentials_tenant_principal"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_weakened_pre_existing_table_survives_the_migration_and_is_caught_here(pool: PgPool) {
+    // The end-to-end drift scenario, not a synthetic one: drop the migrated
+    // table, put a plausible weakened one in its place, and re-apply 0029. The
+    // migration is a no-op — `IF NOT EXISTS` sees a table named `credentials`
+    // and skips the entire definition — so `0029` reports success against a
+    // table with no primary key and no constraints at all.
+    sqlx::query("DROP TABLE credentials")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE credentials ( \
+             id UUID, tenant_id UUID, principal_id TEXT, secret_mac BYTEA, \
+             mode TEXT, scopes TEXT[], tenant_wide BOOLEAN, status TEXT, \
+             created_at TIMESTAMPTZ, last_used_at TIMESTAMPTZ, \
+             revoked_at TIMESTAMPTZ, expires_at TIMESTAMPTZ)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(MIGRATION_0029)
+        .execute(&pool)
+        .await
+        .expect("re-applying 0029 over an existing table is a silent no-op");
+
+    // Proof that the migration alone would have accepted this.
+    let (present,): (bool,) = sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+          WHERE conrelid = 'credentials'::regclass AND contype = 'p')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !present,
+        "the weakened table still has no primary key after 0029 re-ran"
+    );
+
+    // The contract check is what catches it.
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("PRIMARY KEY"), "{failure}");
+    assert!(failure.contains("credentials_mode_ck"), "{failure}");
+    assert!(failure.contains("NOT NULL"), "{failure}");
+}
+
 // ── Startup gate ─────────────────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "./migrations")]
@@ -951,6 +1207,163 @@ async fn only_a_fully_successful_authentication_advances_last_used(pool: PgPool)
     let fresh = authenticator(&pool, &clock);
     assert!(fresh.authenticate(issued.presented()).await.result.is_ok());
     assert!(last_used(issued.credential_id).await.is_some());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_warmed_cache_entry_does_not_serve_a_wrong_secret(pool: PgPool) {
+    // The second half of the timing oracle, and the one that survived the first
+    // fix. Caching only after a successful authentication stops an *attacker*
+    // from warming the entry — but a legitimate request warms it just the same,
+    // and after that any wrong-secret probe for the same id was answered from
+    // memory while an unknown id still paid an indexed query.
+    //
+    // Measured through the decoy counter, which increments exactly once per
+    // database visit: the two probes must cost the same number of visits.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    let issued = auth
+        .issue(spec(Uuid::new_v4(), &["memory:read"]))
+        .await
+        .expect("issuance");
+
+    // A legitimate use warms the cache.
+    assert!(auth.authenticate(issued.presented()).await.result.is_ok());
+    let after_warm = auth.dummy_mac_count();
+    assert!(
+        auth.authenticate(issued.presented()).await.result.is_ok(),
+        "the correct secret may still be served from the warm entry"
+    );
+    assert_eq!(
+        auth.dummy_mac_count(),
+        after_warm,
+        "the holder of the correct secret is served from cache"
+    );
+
+    // Now probe the *same* id with a wrong secret, and an unknown id.
+    let wrong = format!("{}.{}", issued.credential_id, "ff".repeat(32));
+    let unknown = format!("{}.{}", Uuid::new_v4(), "ff".repeat(32));
+
+    let before = auth.dummy_mac_count();
+    assert!(auth.authenticate(&wrong).await.result.is_err());
+    let warmed_id_visits = auth.dummy_mac_count() - before;
+
+    let before = auth.dummy_mac_count();
+    assert!(auth.authenticate(&unknown).await.result.is_err());
+    let unknown_id_visits = auth.dummy_mac_count() - before;
+
+    assert_eq!(
+        warmed_id_visits, unknown_id_visits,
+        "a warmed credential id must cost the same number of database visits as \
+         an invented one, or the cache reintroduces the existence oracle"
+    );
+    assert_eq!(warmed_id_visits, 1, "both must actually reach the database");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_wrong_secret_for_a_warmed_id_still_reaches_the_database(pool: PgPool) {
+    // The same property proven structurally rather than by counter: with the
+    // table gone, only something served from cache can succeed.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    let issued = auth
+        .issue(spec(Uuid::new_v4(), &["memory:read"]))
+        .await
+        .expect("issuance");
+
+    assert!(
+        auth.authenticate(issued.presented()).await.result.is_ok(),
+        "warm the cache"
+    );
+
+    sqlx::query("DROP TABLE credentials")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The correct secret still rides the live entry — the cache is doing its job.
+    assert!(
+        auth.authenticate(issued.presented()).await.result.is_ok(),
+        "the correct secret may use the warm entry"
+    );
+
+    // The wrong secret must not. It has to consult PostgreSQL, which is gone.
+    let wrong = format!("{}.{}", issued.credential_id, "ff".repeat(32));
+    let error = auth
+        .authenticate(&wrong)
+        .await
+        .result
+        .expect_err("a wrong secret must not be answered from a warmed entry");
+    assert_eq!(
+        error.reason(),
+        FailureReason::Backend,
+        "reaching the database is the proof; a BadSecret here would mean the \
+         cache answered and the oracle is still open"
+    );
+
+    // An unknown id behaves identically.
+    let unknown = format!("{}.{}", Uuid::new_v4(), "ff".repeat(32));
+    assert_eq!(
+        auth.authenticate(&unknown)
+            .await
+            .result
+            .expect_err("unknown")
+            .reason(),
+        FailureReason::Backend
+    );
+
+    // And the TTL is still absolute: the warm entry dies on schedule.
+    clock.advance(std::time::Duration::from_secs(31));
+    assert_eq!(
+        auth.authenticate(issued.presented())
+            .await
+            .result
+            .expect_err("the entry expired")
+            .reason(),
+        FailureReason::Backend
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failed_cache_probe_does_not_disturb_the_entry(pool: PgPool) {
+    // A wrong-secret probe must not refresh the entry (which would slide the
+    // TTL) nor evict it (which would let an attacker force database load, or
+    // deny the legitimate holder their cache).
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    let issued = auth
+        .issue(spec(Uuid::new_v4(), &["memory:read"]))
+        .await
+        .expect("issuance");
+    assert!(auth.authenticate(issued.presented()).await.result.is_ok());
+
+    let wrong = format!("{}.{}", issued.credential_id, "ff".repeat(32));
+
+    // Hammer the id with wrong secrets across almost the whole TTL window.
+    for _ in 0..29 {
+        clock.advance(std::time::Duration::from_secs(1));
+        assert!(auth.authenticate(&wrong).await.result.is_err());
+    }
+
+    // Still cached: the correct secret is served without the database.
+    sqlx::query("DROP TABLE credentials")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        auth.authenticate(issued.presented()).await.result.is_ok(),
+        "29 failed probes must not have evicted the entry"
+    );
+
+    // …and did not extend it either.
+    clock.advance(std::time::Duration::from_secs(1));
+    assert_eq!(
+        auth.authenticate(issued.presented())
+            .await
+            .result
+            .expect_err("the absolute TTL still expires on schedule")
+            .reason(),
+        FailureReason::Backend
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

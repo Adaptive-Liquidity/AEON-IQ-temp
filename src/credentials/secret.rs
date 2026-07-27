@@ -257,29 +257,46 @@ pub fn compute_mac(pepper: &Pepper, secret: &[u8]) -> [u8; MAC_BYTES] {
     mac.finalize().into_bytes().into()
 }
 
-/// Constant-time verification of a presented secret against a stored MAC.
+/// The MAC of a presented secret, computed **once** per request.
 ///
-/// The comparison never short-circuits on the first differing byte, so response
-/// time carries no information about how many leading bytes matched — which is
-/// what would otherwise let an attacker construct a valid MAC one byte at a
-/// time.
-pub fn verify(pepper: &Pepper, presented: &PresentedCredential, stored_mac: &[u8]) -> bool {
-    let computed = compute_mac(pepper, presented.secret());
+/// Hoisting this above the registry lookup is what makes a hit and a miss cost
+/// the same: every request performs exactly one real HMAC regardless of whether
+/// the credential exists. It is then reused both to decide whether a cached
+/// record may be trusted and to verify against whatever record is finally
+/// loaded, so no path computes it twice.
+pub fn presented_mac(pepper: &Pepper, presented: &PresentedCredential) -> [u8; MAC_BYTES] {
+    compute_mac(pepper, presented.secret())
+}
+
+/// Constant-time comparison of a computed MAC against a stored one.
+///
+/// Never short-circuits on the first differing byte, so response time carries no
+/// information about how many leading bytes matched — which is what would
+/// otherwise let an attacker construct a valid MAC one byte at a time.
+pub fn mac_matches(computed: &[u8; MAC_BYTES], stored_mac: &[u8]) -> bool {
     // `subtle`'s slice impl returns 0 for a length mismatch without leaking
     // where it diverged; `credentials_secret_mac_len_ck` makes that case a
     // corrupted row rather than an attacker-reachable path.
     bool::from(computed[..].ct_eq(stored_mac))
 }
 
-/// A fixed decoy, used only to equalise the cost of a lookup miss.
+/// Convenience for callers that hold no precomputed MAC.
+pub fn verify(pepper: &Pepper, presented: &PresentedCredential, stored_mac: &[u8]) -> bool {
+    mac_matches(&presented_mac(pepper, presented), stored_mac)
+}
+
+/// A fixed decoy, used only to equalise the cost of a database visit.
 const DECOY_SECRET: [u8; SECRET_BYTES] = [0x5a; SECRET_BYTES];
 
 /// Perform the same HMAC work as a real verification, and discard it.
 ///
-/// An indexed miss is otherwise structurally cheaper than hit + HMAC +
-/// compare, which leaves a measurable oracle for *which credential ids exist*
-/// even though both paths return the same rejection. Doing the work anyway
-/// removes that difference.
+/// Retained from decision A-1, but now run on **every** database visit rather
+/// than only on a miss. Once [`presented_mac`] is hoisted above the lookup,
+/// both a hit and a miss already perform one real HMAC; charging the decoy only
+/// to a miss would make a miss one HMAC *more* expensive than a hit — the same
+/// asymmetry as before, pointing the other way. Running it on every visit keeps
+/// every attacker-reachable path at exactly one real MAC plus one decoy plus
+/// one indexed query.
 ///
 /// **What this does not cover, stated rather than implied:** a *malformed*
 /// credential is rejected before any database round-trip, and that round-trip

@@ -119,10 +119,24 @@ impl CredentialAuthSettings {
     }
 
     pub fn from_values(env: CredentialAuthEnv) -> Result<Self> {
-        let enabled = env
-            .enabled
-            .as_deref()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        // Strict, because the failure mode of a lenient parse is silent: an
+        // `is_some_and(== "true")` reading turns `treu`, `yes`, `1` and `on`
+        // into "disabled", so an operator who believes they enabled credential
+        // authentication gets the unauthenticated legacy path and no signal at
+        // all. For an authentication switch, a typo must be an error.
+        let enabled = match env.enabled.as_deref().map(str::trim) {
+            // Unset, or set to nothing, is the V1 default.
+            None | Some("") => false,
+            Some(value) if value.eq_ignore_ascii_case("true") => true,
+            Some(value) if value.eq_ignore_ascii_case("false") => false,
+            Some(other) => bail!(
+                "AEON_CREDENTIAL_AUTH_ENABLED must be exactly `true` or `false` \
+                 (case-insensitive); got {other:?}. It is not interpreted \
+                 loosely: silently reading an unrecognised value as `false` \
+                 would select the unauthenticated legacy path while the \
+                 operator believed credential authentication was on."
+            ),
+        };
 
         // A malformed pepper is an error whether or not the subsystem is
         // enabled. Someone who set the variable meant to set it, and silently
@@ -372,7 +386,9 @@ impl Authenticator {
     /// How many decoy MACs have been computed.
     ///
     /// Exposed so the timing-parity branch can be *observed* to run rather than
-    /// assumed to; see the `db_tests` assertion on a lookup miss.
+    /// assumed to. It increments once per database visit — which also makes it
+    /// a direct probe for "did this request reach PostgreSQL?", and so the
+    /// instrument the oracle regression tests measure with.
     pub fn dummy_mac_count(&self) -> u64 {
         self.dummy_macs.load(Ordering::Relaxed)
     }
@@ -386,24 +402,34 @@ impl Authenticator {
     /// Order of operations matters and is deliberate:
     ///
     /// 1. parse — a malformed string never reaches the database;
-    /// 2. load (cache, then indexed fetch) — a miss performs a decoy MAC;
-    /// 3. **verify the MAC**;
-    /// 4. check status and expiry;
-    /// 5. only then write anything — cache the record and stamp `last_used_at`.
+    /// 2. **compute the presented secret's MAC**, before any lookup;
+    /// 3. load — the cache may answer only if it corroborates that MAC,
+    ///    otherwise an indexed fetch, which is charged a decoy MAC either way;
+    /// 4. verify the MAC against whatever record was loaded;
+    /// 5. check status and expiry;
+    /// 6. only then write anything — cache the record and stamp `last_used_at`.
     ///
-    /// Step 4 comes after step 3 so that "is this credential revoked?" cannot be
+    /// Step 2 before step 3 is what equalises a hit and a miss: every request
+    /// performs exactly one real HMAC whether or not the credential exists.
+    ///
+    /// Step 5 comes after step 4 so that "is this credential revoked?" cannot be
     /// answered without holding its secret. Checking status first would make
     /// the registry's lifecycle state readable by anyone who guessed an id.
     ///
-    /// **Step 5 comes last, and that placement is load-bearing.** An earlier
-    /// revision cached the record inside `load`, before the MAC comparison.
-    /// That reintroduced exactly the oracle the decoy MAC exists to close: an
-    /// attacker repeating wrong-secret probes against a *known* id warmed the
-    /// cache and skipped PostgreSQL from the second probe onwards, while an
-    /// unknown id paid a round trip every time. Uniform responses and a decoy
-    /// HMAC do not help when the two paths diverge by a database call. A record
-    /// is now cached only once it has actually authenticated, so a wrong secret
-    /// leaves no trace to measure.
+    /// **Step 6 comes last, and that placement is load-bearing.** The first
+    /// revision cached the record inside `load`, before the MAC comparison, so
+    /// an attacker's own wrong-secret probes warmed the cache and skipped
+    /// PostgreSQL from the second probe onwards. Caching only after a full
+    /// success fixed that half — but not the other half, where a *legitimate*
+    /// request warmed the entry and a later wrong-secret probe for the same id
+    /// was still served from memory. Uniform responses and a decoy HMAC do not
+    /// help when two paths diverge by a database call.
+    ///
+    /// Both halves are closed by binding cache reuse to the presented secret
+    /// (step 3). Every attacker-reachable outcome — unknown id, cold wrong
+    /// secret, warmed wrong secret — now costs one real MAC, one decoy MAC and
+    /// one indexed query. Only the holder of the correct secret reaches the
+    /// cache-served path.
     ///
     /// The same ordering keeps `last_used_at` truthful and stops an
     /// unauthenticated probe from having a database-write side effect.
@@ -417,17 +443,18 @@ impl Authenticator {
         };
         let id = parsed.credential_id();
 
-        let loaded = match self.load(id).await {
+        // Hoisted above the lookup so a hit and a miss perform the same one
+        // real HMAC, and reused for both cache admission and verification.
+        let presented_mac = secret::presented_mac(&self.pepper, &parsed);
+
+        let loaded = match self.load(id, &presented_mac).await {
             Ok(Some(loaded)) => loaded,
-            Ok(None) => {
-                self.decoy();
-                return self.reject(at, Some(id), FailureReason::UnknownCredential);
-            }
+            Ok(None) => return self.reject(at, Some(id), FailureReason::UnknownCredential),
             Err(reason) => return self.reject(at, Some(id), reason),
         };
         let record = loaded.record;
 
-        if !secret::verify(&self.pepper, &parsed, &record.secret_mac) {
+        if !secret::mac_matches(&presented_mac, &record.secret_mac) {
             return self.reject(at, Some(id), FailureReason::BadSecret);
         }
 
@@ -496,15 +523,29 @@ impl Authenticator {
     /// database failure that looked like a miss would be indistinguishable from
     /// "no such credential" — which is a rejection either way, but for the
     /// wrong reason and with the wrong audit record.
-    async fn load(&self, id: Uuid) -> Result<Option<Loaded>, FailureReason> {
+    async fn load(
+        &self,
+        id: Uuid,
+        presented_mac: &[u8; secret::MAC_BYTES],
+    ) -> Result<Option<Loaded>, FailureReason> {
         match self.cache.get(id, self.clock.as_ref()) {
-            Ok(Some(record)) => {
+            // The cache may answer only when it *corroborates the presented
+            // secret*. Keying it on the credential id alone was the residual
+            // half of the timing oracle: once a legitimate request warmed an
+            // entry, any wrong-secret probe for that id was served from memory
+            // while an unknown id still paid an indexed query — so a warmed id
+            // was measurably distinguishable from an invented one.
+            Ok(Some(record)) if secret::mac_matches(presented_mac, &record.secret_mac) => {
                 return Ok(Some(Loaded {
                     record,
                     from_cache: true,
                 }))
             }
-            Ok(None) => {}
+            // A cached record that does *not* corroborate the secret is not a
+            // fast rejection either — that would leak the same bit. Fall
+            // through to the database and behave exactly like a cold request.
+            // The entry is left untouched: not refreshed, not evicted.
+            Ok(Some(_)) | Ok(None) => {}
             Err(error) => {
                 tracing::error!(%error, credential_id = %id, "credential cache unusable");
                 return Err(FailureReason::Backend);
@@ -522,6 +563,11 @@ impl Authenticator {
                 return Err(FailureReason::Backend);
             }
         };
+
+        // Charged to every database visit, hit or miss — see `dummy_verify`.
+        // Doing it only on a miss would leave a one-HMAC asymmetry in the
+        // opposite direction.
+        self.decoy();
 
         Ok(fetched.map(|record| Loaded {
             record,
@@ -623,6 +669,26 @@ pub struct IssueSpec<'a> {
 
 // ── Startup ──────────────────────────────────────────────────────────────────
 
+/// Prove the `credentials` table matches the contract this build assumes,
+/// before an [`Authenticator`] is constructed against it.
+///
+/// Called only when credential authentication is enabled. A V1 deployment that
+/// has not adopted credentials never runs this and starts exactly as before —
+/// including one that has migration 0029 applied but the subsystem switched
+/// off.
+///
+/// Fails closed on a mismatch *and* on an inspection failure: a schema that
+/// cannot be verified is treated exactly like one that is wrong.
+pub async fn assert_schema_contract(pool: &PgPool) -> Result<()> {
+    store::verify_schema(pool).await.context(
+        "refusing to enable credential authentication: `CREATE TABLE IF NOT EXISTS` \
+         silently accepts a pre-existing table, so the schema is verified rather \
+         than assumed",
+    )?;
+    tracing::info!("credential schema contract verified");
+    Ok(())
+}
+
 /// Refuse to enable multi-tenant mode against an empty registry (plan §2
 /// "Startup", test #31).
 ///
@@ -692,7 +758,10 @@ mod tests {
 
     #[test]
     fn a_missing_pepper_does_not_break_an_inactive_deployment() {
-        for enabled in [None, Some("false"), Some("no"), Some("")] {
+        // `Some("no")` is deliberately absent: it is no longer a way to spell
+        // "disabled", it is a startup error. See
+        // `an_unrecognised_enable_value_is_a_startup_error_not_a_silent_disable`.
+        for enabled in [None, Some("false"), Some("FALSE"), Some("")] {
             assert!(
                 CredentialAuthSettings::from_values(env(enabled, None)).is_ok(),
                 "enabled={enabled:?} with no pepper must still start"
@@ -701,16 +770,39 @@ mod tests {
     }
 
     #[test]
-    fn only_the_literal_true_enables_the_subsystem() {
-        for raw in ["true", "TRUE", "True"] {
+    fn true_enables_and_false_disables_case_insensitively() {
+        for raw in ["true", "TRUE", "True", " true "] {
             let settings =
                 CredentialAuthSettings::from_values(env(Some(raw), Some(&hex_pepper()))).unwrap();
             assert!(settings.enabled, "{raw:?} should enable");
         }
-        for raw in ["false", "1", "yes", "on", ""] {
+        for raw in ["false", "FALSE", "False", "", "   "] {
             let settings =
                 CredentialAuthSettings::from_values(env(Some(raw), Some(&hex_pepper()))).unwrap();
             assert!(!settings.enabled, "{raw:?} should not enable");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_enable_value_is_a_startup_error_not_a_silent_disable() {
+        // The dangerous failure mode is silence: an operator who typed `treu`
+        // gets the unauthenticated legacy path and no signal. `yes`, `on` and
+        // `1` are the same hazard with better spelling — plausible enough that
+        // someone will write them, and meaningless to a strict parser.
+        for raw in [
+            "treu", "ture", "yes", "no", "on", "off", "1", "0", "enabled", "y",
+        ] {
+            let error = CredentialAuthSettings::from_values(env(Some(raw), Some(&hex_pepper())))
+                .expect_err("{raw:?} must be refused rather than read as false");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("must be exactly `true` or `false`"),
+                "for {raw:?}: {rendered}"
+            );
+            assert!(
+                rendered.contains(raw),
+                "the error must quote the offending value, got: {rendered}"
+            );
         }
     }
 
