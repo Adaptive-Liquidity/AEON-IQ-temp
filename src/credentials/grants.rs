@@ -1305,6 +1305,143 @@ mod db_tests {
         assert!(failure.contains("elsewhere"), "{failure}");
     }
 
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_non_volatile_replacement_is_rejected(pool: PgPool) {
+        // `ALTER FUNCTION … STABLE` moves nothing else this contract inspects:
+        // same body, same configuration, same SECURITY INVOKER, same signature,
+        // same trigger definition. What it changes is *when* the function sees
+        // data — which is the whole basis of the locking argument below.
+        sqlx::query("ALTER FUNCTION public.credentials_reject_tenant_wide_with_grants() STABLE")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(
+            failure.contains("is STABLE, expected VOLATILE"),
+            "{failure}"
+        );
+    }
+
+    /// Drive the interleaving the `FOR SHARE`/`FOR UPDATE` pairing exists for:
+    /// a grant commits while a `false -> true` UPDATE is already waiting on the
+    /// credential's row lock. Returns what that UPDATE did.
+    async fn transition_racing_a_grant(
+        pool: &PgPool,
+        cred: Uuid,
+        tenant: Uuid,
+        target: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let mut inserter = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN")
+            .execute(&mut *inserter)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO public.credential_agent_grants (credential_id, tenant_id, agent_uuid) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(cred)
+        .bind(tenant)
+        .bind(target)
+        .execute(&mut *inserter)
+        .await
+        .unwrap();
+
+        // The UPDATE takes FOR NO KEY UPDATE on the same row, which conflicts
+        // with the FOR SHARE the grant trigger took and still holds, so it
+        // blocks until the insert commits.
+        let updater = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
+                    .bind(cred)
+                    .execute(&pool)
+                    .await
+                    .map(|_| ())
+            })
+        };
+
+        // Wait for it to actually be blocked rather than sleeping a guess. If
+        // it never blocks, the interleaving under test did not happen and the
+        // result would mean nothing either way — so say so instead of scoring
+        // it.
+        let mut blocked = false;
+        for _ in 0..200 {
+            let (waiting,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                    AND pid <> pg_backend_pid()",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            blocked,
+            "the UPDATE never waited on the row lock; the race under test did not occur"
+        );
+
+        sqlx::raw_sql("COMMIT")
+            .execute(&mut *inserter)
+            .await
+            .unwrap();
+        drop(inserter);
+        updater.await.unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_non_volatile_trigger_function_misses_a_concurrent_grant(pool: PgPool) {
+        // Why volatility is worth pinning at all. PL/pgSQL runs a non-VOLATILE
+        // function read-only, so its queries reuse the calling statement's
+        // snapshot instead of taking a fresh one. The UPDATE that waited behind
+        // the grant's row lock then looks for grants as of *before* that grant
+        // committed, finds none, and lets the contradiction through — with a
+        // body, a configuration and a trigger definition that all still match.
+        let tenant = Uuid::new_v4();
+
+        // Shipped and VOLATILE: it takes a fresh snapshot on waking, sees the
+        // grant that committed while it waited, and refuses.
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-volatile").await;
+        let refused = transition_racing_a_grant(&pool, cred, tenant, target).await;
+        assert!(
+            format!("{refused:?}").contains("tenant_wide cannot be set"),
+            "VOLATILE must refuse the racing transition: {refused:?}"
+        );
+
+        // STABLE: same statement, same body, wrong answer.
+        sqlx::query("ALTER FUNCTION public.credentials_reject_tenant_wide_with_grants() STABLE")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-stable").await;
+        transition_racing_a_grant(&pool, cred, tenant, target)
+            .await
+            .expect("STABLE reuses the waiting statement's snapshot and misses the grant");
+
+        // …leaving exactly the state the trigger exists to prevent.
+        let (contradictory,): (bool,) = sqlx::query_as(
+            "SELECT c.tenant_wide AND EXISTS (SELECT 1 FROM public.credential_agent_grants g \
+              WHERE g.credential_id = c.id) FROM public.credentials c WHERE c.id = $1",
+        )
+        .bind(cred)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            contradictory,
+            "the contradiction was really created, not merely permitted in principle"
+        );
+    }
+
     // ── 0031: rollbacks resolve to public regardless of search_path ──────────
 
     #[sqlx::test(migrations = "./migrations")]

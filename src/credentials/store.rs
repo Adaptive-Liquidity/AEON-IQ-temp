@@ -899,11 +899,21 @@ const REQUIRED_FUNCTIONS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `(schema, argument count, result type, language, SECURITY DEFINER, configuration, body)`.
+/// `(schema, argument count, result type, language, volatility, SECURITY
+/// DEFINER, configuration, body)`.
 ///
-/// Named rather than repeated inline: seven columns is past the point where a
+/// Named rather than repeated inline: eight columns is past the point where a
 /// bare tuple tells a reader anything.
-type FunctionFacts = (String, i16, String, String, bool, Option<String>, String);
+type FunctionFacts = (
+    String,
+    i16,
+    String,
+    String,
+    String,
+    bool,
+    Option<String>,
+    String,
+);
 
 async fn verify_trigger_functions(
     pool: &PgPool,
@@ -916,7 +926,8 @@ async fn verify_trigger_functions(
         // schema is what put it there.
         let candidates: Vec<FunctionFacts> = sqlx::query_as(
             "SELECT n.nspname, p.pronargs, pg_get_function_result(p.oid), l.lanname, \
-                        p.prosecdef, array_to_string(p.proconfig, ','), p.prosrc \
+                        p.provolatile::text, p.prosecdef, \
+                        array_to_string(p.proconfig, ','), p.prosrc \
                    FROM pg_proc p \
                    JOIN pg_namespace n ON n.oid = p.pronamespace \
                    JOIN pg_language l ON l.oid = p.prolang \
@@ -942,7 +953,7 @@ async fn verify_trigger_functions(
             ));
         }
 
-        let Some((_, nargs, result, language, security_definer, config, body)) =
+        let Some((_, nargs, result, language, volatility, security_definer, config, body)) =
             public_candidates.first().copied()
         else {
             let elsewhere: Vec<&str> = candidates
@@ -979,6 +990,27 @@ async fn verify_trigger_functions(
             problems.push(format!(
                 "trigger function `public.{name}` is SECURITY DEFINER; it must be SECURITY \
                  INVOKER, or it would run with the definer's privileges on every write"
+            ));
+        }
+
+        // Volatility is the one attribute here that changes *when* the function
+        // sees data rather than what it does. PL/pgSQL runs a non-VOLATILE
+        // function read-only, so its queries reuse the calling statement's
+        // snapshot instead of taking a fresh one — and an UPDATE that waited
+        // behind a grant's row lock would then look for grants as of before
+        // that grant committed, find none, and let the contradiction through.
+        // Nothing else in this contract moves when someone runs
+        // `ALTER FUNCTION … STABLE`, which is exactly why it is checked.
+        if volatility != "v" {
+            problems.push(format!(
+                "trigger function `public.{name}` is {}, expected VOLATILE — a non-volatile \
+                 PL/pgSQL function reuses the calling statement's snapshot, so it can miss a \
+                 row committed while that statement waited for a lock",
+                match volatility.as_str() {
+                    "s" => "STABLE",
+                    "i" => "IMMUTABLE",
+                    other => other,
+                }
             ));
         }
 
