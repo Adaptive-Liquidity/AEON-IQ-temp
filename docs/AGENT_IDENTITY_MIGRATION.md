@@ -175,9 +175,23 @@ Rows created through the tenant-aware path need one extra step, which the script
 performs first: their `agent_id` is the UUID compatibility key, so the script
 moves `external_agent_id` back into `agent_id` before dropping the column.
 Without that, the agent would come back reachable only by a UUID it never
-advertised. Where the baseline genuinely cannot hold the data — two tenants
-sharing one `external_agent_id`, exactly what the global `UNIQUE` forbids — the
-script **raises and changes nothing** rather than picking a winner.
+advertised.
+
+That rename cannot be done in isolation. `sessions.agent_id` and
+`archival_batches.agent_id` reference the value being changed, and both are
+`ON UPDATE NO ACTION` — PostgreSQL's default, which neither declaration
+overrides — so renaming the parent while a child still points at the old value
+is rejected outright. The script therefore drops those foreign keys, repoints
+the children, renames the parents, and restores each constraint from
+`pg_get_constraintdef`, so the baseline definition comes back exactly as it was.
+
+Where the baseline genuinely cannot hold the data — two tenants sharing one
+`external_agent_id`, exactly what the global `UNIQUE` forbids — the script
+**raises and changes nothing** rather than picking a winner.
+
+None of this is reachable in a step-1 deployment, because `insert_agent` is not
+yet wired into request handling; the script short-circuits when no identifier
+has moved. It matters from §10 step 5 onward.
 
 The script also deletes the `_sqlx_migrations` row for version 28 so
 `sqlx migrate run` re-applies 0028 cleanly afterwards.

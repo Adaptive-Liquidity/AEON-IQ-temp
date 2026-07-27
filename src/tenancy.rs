@@ -1495,6 +1495,80 @@ mod db_tests {
     }
 
     #[sqlx::test(migrations = "./migrations")]
+    async fn rollback_repoints_dependent_rows_when_restoring_identifiers(pool: PgPool) {
+        // A tenant-scoped agent carries a UUID compatibility key in agent_id,
+        // and sessions/archival_batches reference *that*. Both foreign keys are
+        // ON UPDATE NO ACTION, so restoring the identifier without repointing
+        // the children first is rejected by PostgreSQL and aborts the rollback.
+        insert_agent(&pool, tenant_a(), "scoped-agent")
+            .await
+            .unwrap();
+        let compat_key: (String,) =
+            sqlx::query_as("SELECT agent_id FROM agents WHERE external_agent_id = $1")
+                .bind("scoped-agent")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        sqlx::query("INSERT INTO sessions (session_id, agent_id) VALUES ($1, $2)")
+            .bind("session-1")
+            .bind(&compat_key.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO archival_batches (agent_id, source_count, l3_count) VALUES ($1, 1, 1)",
+        )
+        .bind(&compat_key.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(ROLLBACK_SQL).execute(&pool).await.unwrap();
+
+        // Parent and both children now agree on the caller-facing identifier.
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT COUNT(*)::bigint FROM agents WHERE agent_id = 'scoped-agent'",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT COUNT(*)::bigint FROM sessions WHERE agent_id = 'scoped-agent'",
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT COUNT(*)::bigint FROM archival_batches WHERE agent_id = 'scoped-agent'",
+            )
+            .await,
+            1
+        );
+
+        // Both foreign keys are back, so the cascade still reaches the children.
+        sqlx::query("DELETE FROM agents WHERE agent_id = $1")
+            .bind("scoped-agent")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM sessions").await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM archival_batches").await,
+            0
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
     async fn rollback_refuses_when_the_baseline_cannot_hold_the_identifiers(pool: PgPool) {
         // Two tenants legitimately share one external_agent_id under 0028 — and
         // that is exactly what the baseline's global UNIQUE on agent_id cannot

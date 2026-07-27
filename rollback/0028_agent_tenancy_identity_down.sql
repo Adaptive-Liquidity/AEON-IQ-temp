@@ -40,6 +40,7 @@ BEGIN;
 DO $$
 DECLARE
     unrepresentable BIGINT;
+    fk              RECORD;
 BEGIN
     IF NOT EXISTS (
         SELECT 1
@@ -47,6 +48,16 @@ BEGIN
         WHERE table_schema = current_schema()
           AND table_name   = 'agents'
           AND column_name  = 'external_agent_id'
+    ) THEN
+        RETURN;
+    END IF;
+
+    -- Nothing was created through the tenant-aware path, so no identifier moved
+    -- and the foreign keys below never need to be touched.  This is the only
+    -- case a deployment of step 1 can actually be in, because `insert_agent` is
+    -- not yet reachable from request handling.
+    IF NOT EXISTS (
+        SELECT 1 FROM agents WHERE agent_id IS DISTINCT FROM external_agent_id
     ) THEN
         RETURN;
     END IF;
@@ -78,9 +89,53 @@ BEGIN
             unrepresentable;
     END IF;
 
+    -- `sessions.agent_id` (0001_initial.sql:23) and `archival_batches.agent_id`
+    -- (0006_archival_versioning.sql:10) reference the value about to change, and
+    -- both are ON UPDATE NO ACTION -- PostgreSQL's default, which neither
+    -- declaration overrides.  Renaming the parent while a child still points at
+    -- the old value is therefore rejected outright and aborts the rollback.
+    -- Drop those keys, repoint the children, rename the parents, then restore
+    -- each constraint from `pg_get_constraintdef`, so the baseline definition
+    -- comes back exactly as it was rather than as something re-typed here.
+    CREATE TEMP TABLE _agents_fk_snapshot ON COMMIT DROP AS
+        SELECT c.conrelid::regclass::text  AS child_table,
+               c.conname                   AS constraint_name,
+               pg_get_constraintdef(c.oid) AS definition,
+               a.attname                   AS child_column
+          FROM pg_constraint c
+          JOIN unnest(c.conkey) AS k(attnum) ON TRUE
+          JOIN pg_attribute a
+            ON a.attrelid = c.conrelid AND a.attnum = k.attnum
+         WHERE c.contype  = 'f'
+           AND c.confrelid = 'agents'::regclass
+           -- Only keys that target agents(agent_id).  Once §10 step 4 repoints
+           -- dependants at agents(id), those must not be caught by this.
+           AND c.confkey = ARRAY[(
+               SELECT attnum FROM pg_attribute
+                WHERE attrelid = 'agents'::regclass AND attname = 'agent_id'
+           )];
+
+    FOR fk IN SELECT * FROM _agents_fk_snapshot LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',
+                       fk.child_table, fk.constraint_name);
+    END LOOP;
+
+    FOR fk IN SELECT * FROM _agents_fk_snapshot LOOP
+        EXECUTE format(
+            'UPDATE %s AS c SET %I = a.external_agent_id FROM agents a '
+            'WHERE c.%I = a.agent_id '
+            '  AND a.agent_id IS DISTINCT FROM a.external_agent_id',
+            fk.child_table, fk.child_column, fk.child_column);
+    END LOOP;
+
     UPDATE agents
        SET agent_id = external_agent_id
      WHERE agent_id IS DISTINCT FROM external_agent_id;
+
+    FOR fk IN SELECT * FROM _agents_fk_snapshot LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I %s',
+                       fk.child_table, fk.constraint_name, fk.definition);
+    END LOOP;
 END $$;
 
 DROP TRIGGER  IF EXISTS agents_bridge_identity_columns_trg ON agents;
