@@ -1485,7 +1485,7 @@ mod db_tests {
         assert!(column("agent_uuid").await, "0031 renamed it");
         assert!(!column("agent_id").await);
 
-        // Down: back to the 0030 name, and the 0030 function bodies with it.
+        // Down: back to the 0030 name. The name is the reversible half.
         sqlx::raw_sql(MIGRATION_0031_DOWN)
             .execute(&pool)
             .await
@@ -1497,16 +1497,20 @@ mod db_tests {
         assert!(!column("agent_uuid").await);
 
         let (config,): (Option<String>,) = sqlx::query_as(
-            "SELECT array_to_string(proconfig, ',') FROM pg_proc \
-              WHERE proname = 'credentials_reject_tenant_wide_with_grants'",
+            "SELECT array_to_string(p.proconfig, ',') FROM pg_proc p \
+               JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' \
+                AND p.proname = 'credentials_reject_tenant_wide_with_grants'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
-            config, None,
-            "the rollback must clear 0031's pinned search_path, or a database \
-             unwound to 0030 would quietly differ from one that never had 0031"
+            config.as_deref(),
+            Some("search_path=pg_catalog, public"),
+            "the security half is forward-only: the rollback must not unpin \
+             search_path, because a supported rollback path is not a supported \
+             way to re-arm a fixed vulnerability"
         );
 
         // Up again: re-applying 0031 is idempotent and lands back on agent_uuid.
@@ -1522,6 +1526,337 @@ mod db_tests {
             None,
             "and the contract holds again"
         );
+    }
+
+    // ── 0031: the security half is forward-only ─────────────────────────────
+    //
+    // The down script reverses the rename and the ledger row, and nothing else.
+    // An earlier revision also restored 0030's function bodies and then reset
+    // their configuration, which made a supported rollback path a way to re-arm
+    // two fixed defects: the unconditional trigger that blocks revocation, and
+    // the unqualified, unpinned bodies a caller's search_path can redirect.
+    //
+    // Note what these tests can and cannot use after the rollback. The column
+    // is `agent_id` again, so `grant`, `revoke_grant` and `authorize_agent` —
+    // which are compiled against `agent_uuid` — no longer apply, and everything
+    // below reaches for raw SQL instead. That is the intended shape: a build
+    // that requires 0031 does not run against a schema unwound to 0030, and
+    // `store::verify_schema` is what stops it.
+
+    /// `(security_invoker, proconfig, body)` for one trigger function in
+    /// `public`. Panics if it is not there, which is itself the first thing
+    /// worth knowing after a rollback.
+    async fn function_facts(pool: &PgPool, name: &str) -> (bool, Option<String>, String) {
+        sqlx::query_as(
+            "SELECT NOT p.prosecdef, array_to_string(p.proconfig, ','), p.prosrc \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' AND p.proname = $1 AND p.pronargs = 0",
+        )
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("public.{name} must survive the rollback: {e}"))
+    }
+
+    /// How many of the two grant trigger functions exist in `public`.
+    async fn trigger_function_count(pool: &PgPool) -> i64 {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'public' \
+                AND p.proname IN ('credentials_reject_tenant_wide_with_grants', \
+                                  'credential_agent_grants_reject_tenant_wide')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        count
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_0031_rollback_reverts_the_name_and_the_ledger_only(pool: PgPool) {
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+
+        // 1. The naming correction is reversed — that half genuinely is
+        //    reversible, and rollback/0030 keys its ordering guard on it.
+        let (renamed_back,): (bool,) = sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+              WHERE table_schema = 'public' AND table_name = 'credential_agent_grants' \
+                AND column_name = 'agent_id')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(renamed_back, "agent_uuid must come back as agent_id");
+
+        // 2. And the ledger row, so sqlx will re-apply 0031 rather than skip it.
+        let (ledger,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM public._sqlx_migrations WHERE version = 31")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger, 0, "the version-31 row must be removed");
+
+        for (name, qualified) in [
+            (
+                "credentials_reject_tenant_wide_with_grants",
+                "FROM public.credential_agent_grants g",
+            ),
+            (
+                "credential_agent_grants_reject_tenant_wide",
+                "FROM public.credentials c",
+            ),
+        ] {
+            let (invoker, config, body) = function_facts(&pool, name).await;
+
+            // 9. SECURITY INVOKER survives.
+            assert!(invoker, "public.{name} must not become SECURITY DEFINER");
+
+            // 10. …and so does the pinned search_path.
+            assert_eq!(
+                config.as_deref(),
+                Some("search_path=pg_catalog, public"),
+                "public.{name} must keep 0031's pinned search_path"
+            );
+
+            // …and the qualification it exists to back up. Both together:
+            // neither is load-bearing alone.
+            assert!(
+                body.contains(qualified),
+                "public.{name} must keep naming public explicitly: {body}"
+            );
+        }
+
+        // 3. The transition arm in particular — the line 0030 did not have, and
+        //    the one whose absence blocks revocation.
+        let (_, _, body) =
+            function_facts(&pool, "credentials_reject_tenant_wide_with_grants").await;
+        assert!(
+            body.contains("TG_OP = 'UPDATE'") && body.contains("OLD.tenant_wide"),
+            "the transition-aware arm must survive the rollback: {body}"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_transition_aware_trigger_still_governs_after_the_0031_rollback(pool: PgPool) {
+        let tenant = Uuid::new_v4();
+        let (cred, target) = contradictory(&pool, tenant).await;
+
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+
+        // 4/5. The writes 0030's body refused. Restoring that body here — which
+        //      is exactly what the earlier revision of the down script did —
+        //      fails on the first of the three.
+        sqlx::query("UPDATE public.credentials SET last_used_at = NOW() WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("maintenance must survive the rollback");
+        sqlx::query("UPDATE public.credentials SET status = 'disabled' WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("disabling must survive the rollback");
+        sqlx::query(
+            "UPDATE public.credentials SET status = 'revoked', revoked_at = NOW() WHERE id = $1",
+        )
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .expect("revocation must survive the rollback");
+
+        // 6. The repair path is still open.
+        sqlx::query("UPDATE public.credentials SET tenant_wide = FALSE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("clearing tenant_wide must still repair rather than be refused");
+
+        // 3/7. …and the rule the trigger exists for is still armed: this is not
+        //      a trigger that permits everything.
+        let error = sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect_err("re-entering the contradictory state must still be refused");
+        assert!(
+            format!("{error:?}").contains("tenant_wide cannot be set"),
+            "{error:?}"
+        );
+
+        // …and lifts once the grants are gone. Raw SQL: the column is `agent_id`
+        // again, so `revoke_grant` does not apply here.
+        sqlx::query(
+            "DELETE FROM public.credential_agent_grants \
+              WHERE credential_id = $1 AND agent_id = $2",
+        )
+        .bind(cred)
+        .bind(target)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("with no grants left, tenant_wide is a legal choice");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_hostile_search_path_cannot_redirect_the_triggers_after_the_rollback(pool: PgPool) {
+        // 8. The pinned `search_path` is the half most easily lost, because
+        //    nothing observable breaks when it goes: the triggers still fire,
+        //    still have the right names, and simply consult whichever tables
+        //    the caller points them at.
+        let tenant = Uuid::new_v4();
+        let guarded = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, guarded, tenant, target).await.unwrap();
+        let wide = credential(&pool, tenant, true).await;
+        let other = agent(&pool, tenant, "ext-b").await;
+
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+
+        // A shadow schema whose contents flip both answers if either function
+        // resolves its relations through the session search_path: an empty
+        // grants table (so the credentials trigger would see no grants to
+        // conflict with) and an empty credentials table (so the grants trigger
+        // would read NULL for tenant_wide and wave the grant through).
+        for ddl in [
+            "CREATE SCHEMA shadow",
+            "CREATE TABLE shadow.credential_agent_grants (credential_id UUID, agent_id UUID)",
+            "CREATE TABLE shadow.credentials (id UUID, tenant_wide BOOLEAN)",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("SET search_path = shadow, public")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+
+        // The credentials-side trigger still reads public.
+        let error = sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(guarded)
+            .execute(&mut *conn)
+            .await
+            .expect_err("the function's pinned search_path must win over the session's");
+        assert!(
+            format!("{error:?}").contains("tenant_wide cannot be set"),
+            "{error:?}"
+        );
+
+        // The grants-side trigger too.
+        let error = sqlx::query(
+            "INSERT INTO public.credential_agent_grants (credential_id, tenant_id, agent_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(wide)
+        .bind(tenant)
+        .bind(other)
+        .execute(&mut *conn)
+        .await
+        .expect_err("the grants-side function must read public.credentials, not shadow's");
+        assert!(format!("{error:?}").contains("is tenant_wide"), "{error:?}");
+
+        // Falsification. With 0030's bodies — unqualified and unpinned, exactly
+        // what the earlier rollback restored — the same two statements succeed,
+        // because `credential_agent_grants` and `credentials` now mean the
+        // shadow tables. The assertions above are not passing by accident.
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.credential_agent_grants_reject_tenant_wide() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ DECLARE w BOOLEAN; BEGIN \
+             SELECT c.tenant_wide INTO w FROM credentials c WHERE c.id = NEW.credential_id; \
+             IF w THEN RAISE EXCEPTION 'is tenant_wide'; END IF; RETURN NEW; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO public.credential_agent_grants (credential_id, tenant_id, agent_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(wide)
+        .bind(tenant)
+        .bind(other)
+        .execute(&mut *conn)
+        .await
+        .expect("0030's grants-side body resolves through the session search_path — the defect");
+
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.credentials_reject_tenant_wide_with_grants() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN \
+             IF NEW.tenant_wide \
+                AND EXISTS (SELECT 1 FROM credential_agent_grants g \
+                             WHERE g.credential_id = NEW.id) \
+             THEN RAISE EXCEPTION 'tenant_wide cannot be set'; END IF; RETURN NEW; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(guarded)
+            .execute(&mut *conn)
+            .await
+            .expect("0030's credentials-side body resolves through the session search_path too");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn re_running_the_0031_rollback_creates_nothing(pool: PgPool) {
+        // 11. The concrete failure of the earlier revision: its
+        //     `CREATE OR REPLACE FUNCTION` calls ran unconditionally, so a pass
+        //     after 0030 had already been unwound put both 0030 functions back
+        //     on a database that should have had neither. A rollback that
+        //     resurrects objects is not a rollback.
+        assert_eq!(trigger_function_count(&pool).await, 2);
+
+        for attempt in 1..=3 {
+            sqlx::raw_sql(MIGRATION_0031_DOWN)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("0031 rollback attempt {attempt}: {e}"));
+        }
+        assert_eq!(
+            trigger_function_count(&pool).await,
+            2,
+            "re-runs neither drop nor duplicate the hardened functions"
+        );
+
+        // Now the state that regressed: 0030 unwound as well, so nothing should
+        // exist — and running 0031's rollback again must keep it that way.
+        sqlx::raw_sql(MIGRATION_0030_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0030 rollback");
+        assert_eq!(trigger_function_count(&pool).await, 0);
+
+        for attempt in 1..=2 {
+            sqlx::raw_sql(MIGRATION_0031_DOWN)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("post-0030 0031 rollback attempt {attempt}: {e}"));
+        }
+        assert_eq!(
+            trigger_function_count(&pool).await,
+            0,
+            "the rollback must not resurrect 0030's functions"
+        );
+
+        let (present,): (bool,) =
+            sqlx::query_as("SELECT to_regclass('public.credential_agent_grants') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!present, "and it must not resurrect the table either");
     }
 
     #[sqlx::test(migrations = "./migrations")]
