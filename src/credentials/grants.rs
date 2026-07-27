@@ -98,11 +98,11 @@ pub struct AgentGrant {
     pub credential_id: Uuid,
     pub tenant_id: Uuid,
     /// `agents.id` (UUID), never `agents.agent_id` (the legacy TEXT identifier).
-    pub agent_id: Uuid,
+    pub agent_uuid: Uuid,
     pub created_at: DateTime<Utc>,
 }
 
-/// May the authenticated credential act for `agent_id`?
+/// May the authenticated credential act for `agent_uuid`?
 ///
 /// The tenant is taken from [`AeonAuthContext`] and is **not** a parameter:
 /// there is deliberately no way for a caller to propose one.
@@ -120,7 +120,7 @@ pub struct AgentGrant {
 pub async fn authorize_agent(
     pool: &PgPool,
     context: &AeonAuthContext,
-    agent_id: Uuid,
+    agent_uuid: Uuid,
 ) -> Result<AgentDecision, StoreError> {
     let tenant_id = context.tenant_id();
 
@@ -130,7 +130,7 @@ pub async fn authorize_agent(
                          WHERE g.credential_id = c.id) AS has_any_grant, \
                 EXISTS (SELECT 1 FROM credential_agent_grants g \
                          WHERE g.credential_id = c.id \
-                           AND g.tenant_id = $2 AND g.agent_id = $3) AS grants_agent, \
+                           AND g.tenant_id = $2 AND g.agent_uuid = $3) AS grants_agent, \
                 EXISTS (SELECT 1 FROM agents a \
                          WHERE a.id = $3 AND a.tenant_id = $2) AS agent_in_tenant \
            FROM credentials c \
@@ -138,7 +138,7 @@ pub async fn authorize_agent(
     )
     .bind(context.credential_id())
     .bind(tenant_id)
-    .bind(agent_id)
+    .bind(agent_uuid)
     .fetch_optional(pool)
     .await?;
 
@@ -192,19 +192,19 @@ pub async fn grant(
     pool: &PgPool,
     credential_id: Uuid,
     tenant_id: Uuid,
-    agent_id: Uuid,
+    agent_uuid: Uuid,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO credential_agent_grants (credential_id, tenant_id, agent_id) \
+        "INSERT INTO credential_agent_grants (credential_id, tenant_id, agent_uuid) \
          VALUES ($1, $2, $3)",
     )
     .bind(credential_id)
     .bind(tenant_id)
-    .bind(agent_id)
+    .bind(agent_uuid)
     .execute(pool)
     .await?;
 
-    tracing::info!(%credential_id, %tenant_id, %agent_id, "agent grant added");
+    tracing::info!(%credential_id, %tenant_id, %agent_uuid, "agent grant added");
     Ok(())
 }
 
@@ -212,19 +212,19 @@ pub async fn grant(
 pub async fn revoke_grant(
     pool: &PgPool,
     credential_id: Uuid,
-    agent_id: Uuid,
+    agent_uuid: Uuid,
 ) -> Result<bool, StoreError> {
     let result = sqlx::query(
-        "DELETE FROM credential_agent_grants WHERE credential_id = $1 AND agent_id = $2",
+        "DELETE FROM credential_agent_grants WHERE credential_id = $1 AND agent_uuid = $2",
     )
     .bind(credential_id)
-    .bind(agent_id)
+    .bind(agent_uuid)
     .execute(pool)
     .await?;
 
     let removed = result.rows_affected() > 0;
     if removed {
-        tracing::info!(%credential_id, %agent_id, "agent grant withdrawn");
+        tracing::info!(%credential_id, %agent_uuid, "agent grant withdrawn");
     }
     Ok(removed)
 }
@@ -235,9 +235,9 @@ pub async fn list_grants(
     credential_id: Uuid,
 ) -> Result<Vec<AgentGrant>, StoreError> {
     let rows: Vec<(Uuid, Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT credential_id, tenant_id, agent_id, created_at \
+        "SELECT credential_id, tenant_id, agent_uuid, created_at \
            FROM credential_agent_grants WHERE credential_id = $1 \
-          ORDER BY created_at, agent_id",
+          ORDER BY created_at, agent_uuid",
     )
     .bind(credential_id)
     .fetch_all(pool)
@@ -246,10 +246,10 @@ pub async fn list_grants(
     Ok(rows
         .into_iter()
         .map(
-            |(credential_id, tenant_id, agent_id, created_at)| AgentGrant {
+            |(credential_id, tenant_id, agent_uuid, created_at)| AgentGrant {
                 credential_id,
                 tenant_id,
-                agent_id,
+                agent_uuid,
                 created_at,
             },
         )
@@ -266,6 +266,193 @@ mod db_tests {
     const MIGRATION_0030: &str = include_str!("../../migrations/0030_credential_agent_grants.sql");
     const MIGRATION_0030_DOWN: &str =
         include_str!("../../rollback/0030_credential_agent_grants_down.sql");
+    const MIGRATION_0031: &str =
+        include_str!("../../migrations/0031_credential_agent_grants_hardening.sql");
+    const MIGRATION_0031_DOWN: &str =
+        include_str!("../../rollback/0031_credential_agent_grants_hardening_down.sql");
+    const MIGRATION_0028_DOWN: &str =
+        include_str!("../../rollback/0028_agent_tenancy_identity_down.sql");
+
+    /// Put a credential into the contradictory state the triggers exist to
+    /// prevent, the only way it can happen in practice: with the trigger off.
+    ///
+    /// Returns `(credential, agent)`.
+    async fn contradictory(pool: &PgPool, tenant: Uuid) -> (Uuid, Uuid) {
+        let cred = credential(pool, tenant, false).await;
+        let target = agent(pool, tenant, "ext-drifted").await;
+        grant(pool, cred, tenant, target).await.unwrap();
+
+        sqlx::query(
+            "ALTER TABLE credentials DISABLE TRIGGER credentials_not_tenant_wide_with_grants",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(pool)
+            .await
+            .expect("with the trigger off, the contradictory state is writable");
+        sqlx::query(
+            "ALTER TABLE credentials ENABLE TRIGGER credentials_not_tenant_wide_with_grants",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        (cred, target)
+    }
+
+    // ── 0031: a drifted credential must remain revocable and repairable ──────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_contradictory_credential_can_still_be_revoked_disabled_and_maintained(pool: PgPool) {
+        // 0030's trigger fired on every UPDATE and refused whenever tenant_wide
+        // was set and grants existed. That is right for the write that *creates*
+        // the contradiction and wrong for every other write: the control meant
+        // to prevent a bad state was preventing its repair. A credential nobody
+        // could revoke is a worse outcome than the state it was guarding
+        // against, because `authorize_agent` already denies it.
+        let tenant = Uuid::new_v4();
+        let (cred, target) = contradictory(&pool, tenant).await;
+
+        // 1. Authorization still denies it, throughout.
+        assert_eq!(
+            authorize_agent(&pool, &context(cred, tenant), target)
+                .await
+                .unwrap(),
+            AgentDecision::Denied(DenialReason::ContradictoryMode)
+        );
+
+        // 4. Maintenance writes succeed (checked first: it is the one that
+        //    happens on every authenticated request).
+        sqlx::query("UPDATE credentials SET last_used_at = NOW() WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("last_used_at must not be blocked by a state it did not create");
+
+        // 3. Disabling succeeds.
+        sqlx::query("UPDATE credentials SET status = 'disabled' WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("disabling must succeed");
+
+        // 2. Revocation succeeds — the one that actually matters under attack.
+        sqlx::query("UPDATE credentials SET status = 'revoked', revoked_at = NOW() WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("revocation must succeed");
+
+        // …and it is still denied afterwards, for the same reason.
+        assert_eq!(
+            authorize_agent(&pool, &context(cred, tenant), target)
+                .await
+                .unwrap(),
+            AgentDecision::Denied(DenialReason::ContradictoryMode)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_contradictory_credential_can_be_repaired_by_clearing_tenant_wide(pool: PgPool) {
+        let tenant = Uuid::new_v4();
+        let (cred, target) = contradictory(&pool, tenant).await;
+
+        // 5. true -> false repairs it. Always allowed: this is the exit.
+        sqlx::query("UPDATE credentials SET tenant_wide = FALSE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("clearing tenant_wide must repair rather than be refused");
+
+        // The credential is now a plain agent-restricted one, and its grant works.
+        assert_eq!(
+            authorize_agent(&pool, &context(cred, tenant), target)
+                .await
+                .unwrap(),
+            AgentDecision::Granted(GrantBasis::ExplicitGrant)
+        );
+
+        // 6. false -> true is still refused while the grant exists.
+        let error = sqlx::query("UPDATE credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect_err("re-entering the contradictory state must be refused");
+        assert!(
+            format!("{error:?}").contains("tenant_wide cannot be set"),
+            "{error:?}"
+        );
+
+        // 7. …and succeeds once the grants are gone.
+        revoke_grant(&pool, cred, target).await.unwrap();
+        sqlx::query("UPDATE credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("with no grants left, tenant_wide is a legal choice");
+        assert_eq!(
+            authorize_agent(&pool, &context(cred, tenant), target)
+                .await
+                .unwrap(),
+            AgentDecision::Granted(GrantBasis::TenantWide)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_insert_that_creates_the_contradiction_is_still_refused(pool: PgPool) {
+        // The INSERT arm of the transition rule. Narrowing the trigger to
+        // transitions must not open a hole for a row that arrives contradictory.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, cred, tenant, target).await.unwrap();
+
+        // A *second* credential id reusing the same grants is not possible (the
+        // grant's FK ties it to one credential), so the INSERT arm is exercised
+        // by re-inserting this credential's id after removing the row itself
+        // while leaving the grant — which cascade makes impossible — so instead
+        // the arm is exercised directly against the trigger's own predicate.
+        let error = sqlx::query(
+            "INSERT INTO credentials (id, tenant_id, principal_id, secret_mac, mode, tenant_wide) \
+             SELECT $1, $2, 'p', $3, 'v2_required', TRUE",
+        )
+        .bind(cred)
+        .bind(tenant)
+        .bind(vec![0u8; 32])
+        .execute(&pool)
+        .await
+        .expect_err("inserting a tenant_wide credential whose id already holds grants");
+        // Either the trigger or the primary key stops it; both are refusals,
+        // and the trigger is what stops the case where the id is free.
+        assert!(
+            format!("{error:?}").contains("duplicate key")
+                || format!("{error:?}").contains("tenant_wide cannot be set")
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_uncontradicted_tenant_wide_credential_is_unaffected(pool: PgPool) {
+        // The transition rule must not weaken the ordinary path: a tenant-wide
+        // credential with no grants still cannot be given one.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, true).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+
+        assert!(
+            grant(&pool, cred, tenant, target).await.is_err(),
+            "granting a tenant-wide credential is still refused"
+        );
+
+        // And ordinary maintenance on it still works.
+        sqlx::query("UPDATE credentials SET last_used_at = NOW() WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("maintenance on a consistent tenant-wide credential");
+    }
 
     /// A credential written straight through the store, so these tests do not
     /// need a pepper or an authenticator to exercise grants.
@@ -465,7 +652,7 @@ mod db_tests {
         // an application check that could be bypassed.
         assert!(
             sqlx::query(
-                "INSERT INTO credential_agent_grants (credential_id, tenant_id, agent_id) \
+                "INSERT INTO credential_agent_grants (credential_id, tenant_id, agent_uuid) \
                  VALUES ($1, $2, $3)"
             )
             .bind(cred_a)
@@ -662,7 +849,7 @@ mod db_tests {
 
         let remaining = list_grants(&pool, cred).await.unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].agent_id, kept);
+        assert_eq!(remaining[0].agent_uuid, kept);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -690,12 +877,25 @@ mod db_tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn the_migration_is_idempotent(pool: PgPool) {
+        // 0030's idempotency is a property of the schema *at* 0030. Re-applying
+        // it on top of 0031 would be re-applying an older migration over a
+        // newer one, which is not a thing this repository ever does.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+
         for attempt in 1..=2 {
             sqlx::raw_sql(MIGRATION_0030)
                 .execute(&pool)
                 .await
                 .unwrap_or_else(|e| panic!("re-applying 0030 (attempt {attempt}) failed: {e}"));
         }
+
+        sqlx::raw_sql(MIGRATION_0031)
+            .execute(&pool)
+            .await
+            .expect("0031 re-applied");
 
         // …and the table still behaves afterwards.
         let tenant = Uuid::new_v4();
@@ -751,6 +951,12 @@ mod db_tests {
         assert!(still_there, "the refusal must change nothing");
 
         // In the right order it succeeds.
+        // 0031 first: it is the later migration, and 0030's rollback now
+        // refuses while it is applied.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
         sqlx::raw_sql(MIGRATION_0030_DOWN)
             .execute(&pool)
             .await
@@ -768,6 +974,12 @@ mod db_tests {
         let target = agent(&pool, tenant, "ext-a").await;
         grant(&pool, cred, tenant, target).await.unwrap();
 
+        // 0031 first: it is the later migration, and 0030's rollback now
+        // refuses while it is applied.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
         sqlx::raw_sql(MIGRATION_0030_DOWN)
             .execute(&pool)
             .await
@@ -815,6 +1027,13 @@ mod db_tests {
         let cred = credential(&pool, tenant, false).await;
         let target = agent(&pool, tenant, "ext-a").await;
         grant(&pool, cred, tenant, target).await.unwrap();
+
+        // 0031 first: it is the later migration, and 0030's rollback now
+        // refuses while it is applied.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
 
         for attempt in 1..=3 {
             sqlx::raw_sql(MIGRATION_0030_DOWN)
@@ -916,6 +1135,359 @@ mod db_tests {
         );
     }
 
+    // ── 0031: the trigger FUNCTIONS are pinned, not just the declarations ────
+
+    /// Run the contract check and return the flattened failure, or `None`.
+    async fn schema_failure(pool: &PgPool) -> Option<String> {
+        match crate::credentials::assert_schema_contract(pool).await {
+            Ok(()) => None,
+            Err(error) => Some(
+                error
+                    .chain()
+                    .map(|cause| cause.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            ),
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_migrated_functions_satisfy_the_contract(pool: PgPool) {
+        // The control. Without it every rejection below could be passing
+        // because the checker rejects everything it is shown.
+        assert_eq!(schema_failure(&pool).await, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_trigger_function_with_a_no_op_body_is_rejected(pool: PgPool) {
+        // `pg_get_triggerdef` proves the declaration — which table, which event,
+        // which function name. It says nothing about what the function does, so
+        // a same-named replacement that returns NEW satisfies every
+        // declaration-level check while enforcing nothing.
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.credentials_reject_tenant_wide_with_grants() \
+             RETURNS TRIGGER LANGUAGE plpgsql SECURITY INVOKER \
+             SET search_path = pg_catalog, public AS $$ BEGIN RETURN NEW; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // It enforces nothing: the forbidden transition now succeeds.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, cred, tenant, target).await.unwrap();
+        sqlx::query("UPDATE credentials SET tenant_wide = TRUE WHERE id = $1")
+            .bind(cred)
+            .execute(&pool)
+            .await
+            .expect("the no-op body permits the contradictory state");
+
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("has an unexpected body"), "{failure}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_altered_predicate_is_rejected(pool: PgPool) {
+        // Subtler than a no-op: the structure is intact and only the condition
+        // is inverted, so it refuses the writes it should allow and allows the
+        // one it should refuse.
+        sqlx::query(
+            "CREATE OR REPLACE FUNCTION public.credentials_reject_tenant_wide_with_grants() \
+             RETURNS TRIGGER LANGUAGE plpgsql SECURITY INVOKER \
+             SET search_path = pg_catalog, public AS $$ \
+             BEGIN IF NEW.tenant_wide THEN RETURN NEW; END IF; RETURN NEW; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("has an unexpected body"), "{failure}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_security_definer_replacement_is_rejected(pool: PgPool) {
+        sqlx::query(
+            "ALTER FUNCTION public.credential_agent_grants_reject_tenant_wide() SECURITY DEFINER",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("is SECURITY DEFINER"), "{failure}");
+        assert!(failure.contains("definer's privileges"), "{failure}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn an_unexpected_function_configuration_is_rejected(pool: PgPool) {
+        // A different search_path on the function changes how the names in its
+        // body resolve, which is the whole reason it is pinned.
+        sqlx::query(
+            "ALTER FUNCTION public.credentials_reject_tenant_wide_with_grants() \
+             SET search_path = public",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("has configuration"), "{failure}");
+
+        // Removing it entirely is reported differently, and just as firmly.
+        sqlx::query("ALTER FUNCTION public.credentials_reject_tenant_wide_with_grants() RESET ALL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("has no `SET search_path`"), "{failure}");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_function_in_the_wrong_schema_is_rejected(pool: PgPool) {
+        // Reported as *misplaced* rather than merely missing — the difference
+        // matters when a shadow schema is what put it there.
+        sqlx::query("CREATE SCHEMA elsewhere")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE FUNCTION elsewhere.credential_agent_grants_reject_tenant_wide() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP FUNCTION public.credential_agent_grants_reject_tenant_wide() CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let failure = schema_failure(&pool).await.expect("must be rejected");
+        assert!(failure.contains("does not exist in `public`"), "{failure}");
+        assert!(failure.contains("elsewhere"), "{failure}");
+    }
+
+    // ── 0031: rollbacks resolve to public regardless of search_path ──────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_rollbacks_ignore_a_hostile_search_path(pool: PgPool) {
+        // Every rollback runs as `psql -f` in whatever session an operator
+        // happens to have. If a schema ahead of `public` can capture the names
+        // in those scripts, a rollback becomes an arbitrary-object-deletion
+        // primitive — and the function drops are the sharpest edge, since they
+        // named no schema at all before this change.
+        let tenant = Uuid::new_v4();
+        let cred = credential(&pool, tenant, false).await;
+        let target = agent(&pool, tenant, "ext-a").await;
+        grant(&pool, cred, tenant, target).await.unwrap();
+
+        sqlx::query("CREATE SCHEMA shadow")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for ddl in [
+            "CREATE TABLE shadow._sqlx_migrations (version BIGINT PRIMARY KEY, description TEXT)",
+            "INSERT INTO shadow._sqlx_migrations VALUES (28,'shadow'),(30,'shadow'),(31,'shadow')",
+            "CREATE TABLE shadow.credential_agent_grants (marker TEXT)",
+            "INSERT INTO shadow.credential_agent_grants VALUES ('untouched')",
+            "CREATE TABLE shadow.credentials (marker TEXT)",
+            "INSERT INTO shadow.credentials VALUES ('untouched')",
+            "CREATE TABLE shadow.agents (marker TEXT)",
+            "INSERT INTO shadow.agents VALUES ('untouched')",
+            "CREATE TABLE shadow.agent_tenancy_migrations (marker TEXT)",
+            "CREATE FUNCTION shadow.credentials_reject_tenant_wide_with_grants() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$",
+            "CREATE FUNCTION shadow.credential_agent_grants_reject_tenant_wide() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$",
+            "CREATE FUNCTION shadow.agents_bridge_identity_columns() \
+             RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$",
+        ] {
+            sqlx::query(ddl).execute(&pool).await.unwrap();
+        }
+
+        // One connection, shadow first, all three scripts in order.
+        let mut conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("SET search_path = shadow, public")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        for (label, script) in [
+            ("0031", MIGRATION_0031_DOWN),
+            ("0030", MIGRATION_0030_DOWN),
+            ("0028", MIGRATION_0028_DOWN),
+        ] {
+            sqlx::raw_sql(script)
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("{label} rollback under a hostile search_path: {e}"));
+        }
+        drop(conn);
+
+        // The intended public objects are gone…
+        for relation in [
+            "public.credential_agent_grants",
+            "public.agent_tenancy_migrations",
+        ] {
+            let (present,): (bool,) = sqlx::query_as("SELECT to_regclass($1) IS NOT NULL")
+                .bind(relation)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(!present, "{relation} should have been dropped");
+        }
+        let (public_ledger,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM public._sqlx_migrations WHERE version IN (28, 30, 31)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(public_ledger, 0, "the public ledger rows were cleared");
+
+        // …and nothing in `shadow` was touched. Spelled out rather than built
+        // with `format!`: sqlx refuses a dynamic query string, and rightly so.
+        for (relation, query) in [
+            (
+                "shadow.credential_agent_grants",
+                "SELECT count(*) FROM shadow.credential_agent_grants WHERE marker = 'untouched'",
+            ),
+            (
+                "shadow.credentials",
+                "SELECT count(*) FROM shadow.credentials WHERE marker = 'untouched'",
+            ),
+            (
+                "shadow.agents",
+                "SELECT count(*) FROM shadow.agents WHERE marker = 'untouched'",
+            ),
+        ] {
+            let (count,): (i64,) = sqlx::query_as(query)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{relation} should still exist: {e}"));
+            assert_eq!(count, 1, "{relation} was modified");
+        }
+        let (shadow_ledger,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM shadow._sqlx_migrations WHERE version IN (28, 30, 31)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(shadow_ledger, 3, "the shadow ledger must be untouched");
+
+        let (shadow_functions,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'shadow'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            shadow_functions, 3,
+            "all three shadow functions must survive; the drops name public explicitly"
+        );
+
+        assert!(cred != target, "fixtures were distinct");
+    }
+
+    // ── 0031: ordering, rename and round trip ───────────────────────────────
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_0030_rollback_refuses_until_0031_is_unwound(pool: PgPool) {
+        let mut conn = pool.acquire().await.unwrap();
+        let error = sqlx::raw_sql(MIGRATION_0030_DOWN)
+            .execute(&mut *conn)
+            .await
+            .expect_err("0030's rollback must refuse while 0031 is applied");
+        sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+        drop(conn);
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("0031"), "{rendered}");
+        assert!(
+            rendered.contains("rollback/0031_credential_agent_grants_hardening_down.sql"),
+            "the error must name the script to run first: {rendered}"
+        );
+
+        // Nothing was dropped by the refusal.
+        let (present,): (bool,) =
+            sqlx::query_as("SELECT to_regclass('public.credential_agent_grants') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(present);
+
+        // In the right order it succeeds.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+        sqlx::raw_sql(MIGRATION_0030_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0030 rollback, once 0031 is gone");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_rename_round_trips_through_0031_and_back(pool: PgPool) {
+        let column = |name: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let (present,): (bool,) = sqlx::query_as(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                      WHERE table_schema = 'public' AND table_name = 'credential_agent_grants' \
+                        AND column_name = $1)",
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                present
+            }
+        };
+
+        assert!(column("agent_uuid").await, "0031 renamed it");
+        assert!(!column("agent_id").await);
+
+        // Down: back to the 0030 name, and the 0030 function bodies with it.
+        sqlx::raw_sql(MIGRATION_0031_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
+        assert!(
+            column("agent_id").await,
+            "the rollback restores 0030's name"
+        );
+        assert!(!column("agent_uuid").await);
+
+        let (config,): (Option<String>,) = sqlx::query_as(
+            "SELECT array_to_string(proconfig, ',') FROM pg_proc \
+              WHERE proname = 'credentials_reject_tenant_wide_with_grants'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            config, None,
+            "the rollback must clear 0031's pinned search_path, or a database \
+             unwound to 0030 would quietly differ from one that never had 0031"
+        );
+
+        // Up again: re-applying 0031 is idempotent and lands back on agent_uuid.
+        for attempt in 1..=2 {
+            sqlx::raw_sql(MIGRATION_0031)
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("re-applying 0031 (attempt {attempt}): {e}"));
+        }
+        assert!(column("agent_uuid").await);
+        assert_eq!(
+            schema_failure(&pool).await,
+            None,
+            "and the contract holds again"
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn the_grants_table_carries_every_frozen_constraint(pool: PgPool) {
         for name in [
@@ -944,7 +1516,7 @@ mod db_tests {
             ),
             (
                 "credential_agent_grants_agent_fkey",
-                "FOREIGN KEY (tenant_id, agent_id) REFERENCES agents(tenant_id, id) ON DELETE CASCADE",
+                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id) ON DELETE CASCADE",
             ),
         ] {
             let (definition,): (String,) = sqlx::query_as(

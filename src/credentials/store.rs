@@ -603,7 +603,7 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
 const REQUIRED_GRANT_COLUMNS: &[(&str, &str, bool, Option<&str>)] = &[
     ("credential_id", "uuid", false, None),
     ("tenant_id", "uuid", false, None),
-    ("agent_id", "uuid", false, None),
+    ("agent_uuid", "uuid", false, None),
     (
         "created_at",
         "timestamp with time zone",
@@ -624,7 +624,7 @@ const REQUIRED_GRANT_FOREIGN_KEYS: &[(&str, &str)] = &[
     ),
     (
         "credential_agent_grants_agent_fkey",
-        "FOREIGN KEY (tenant_id, agent_id) REFERENCES agents(tenant_id, id) ON DELETE CASCADE",
+        "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id) ON DELETE CASCADE",
     ),
 ];
 
@@ -745,8 +745,8 @@ async fn verify_grants_schema(
              granted to the same credential more than once"
                 .into(),
         ),
-        Some((name, _, cols, _)) if cols != "credential_id,agent_id" => problems.push(format!(
-            "primary key `{name}` covers ({cols}), expected (credential_id, agent_id)"
+        Some((name, _, cols, _)) if cols != "credential_id,agent_uuid" => problems.push(format!(
+            "primary key `{name}` covers ({cols}), expected (credential_id, agent_uuid)"
         )),
         Some(_) => {}
     }
@@ -828,6 +828,163 @@ async fn verify_grants_schema(
         if !granted {
             problems.push(format!(
                 "the connected role lacks {privilege} on `credential_agent_grants`"
+            ));
+        }
+    }
+
+    verify_trigger_functions(pool, problems).await?;
+
+    Ok(())
+}
+
+// ── Trigger function bodies ──────────────────────────────────────────────────
+//
+// `pg_get_triggerdef` proves the trigger *declaration* — which table, which
+// event, which function name. It says nothing about what that function does.
+// A replacement under the same name with a `RETURN NEW;` body satisfies every
+// declaration-level check while enforcing nothing, which is the whole point of
+// the control.
+//
+// So the functions themselves are pinned: identity, signature, language,
+// security context, configuration, and body.
+
+/// The code of a function body, with SQL line comments removed and whitespace
+/// collapsed.
+///
+/// Comments are stripped so rewording a comment is not a contract change, while
+/// any change to an actual statement is. The strip is deliberately simple — it
+/// cuts at the first `--` on a line — which would also cut inside a string
+/// literal containing `--`. Neither of these bodies has one, and a future body
+/// that did would fail the control test loudly rather than silently weaken the
+/// comparison.
+fn normalise_plpgsql(raw: &str) -> String {
+    raw.lines()
+        .map(|line| match line.find("--") {
+            Some(index) => &line[..index],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Both functions carry this, so a caller's session `search_path` cannot change
+/// how the names in their bodies resolve. They are SECURITY INVOKER, so this is
+/// not about privilege escalation — it is about a hostile path making
+/// `credential_agent_grants` resolve to a shadow table and the check inspect the
+/// wrong rows.
+const REQUIRED_FUNCTION_CONFIG: &str = "search_path=pg_catalog, public";
+
+/// `(function name, expected comment-free normalised body)`.
+const REQUIRED_FUNCTIONS: &[(&str, &str)] = &[
+    (
+        "credential_agent_grants_reject_tenant_wide",
+        "DECLARE is_tenant_wide BOOLEAN; BEGIN SELECT c.tenant_wide INTO is_tenant_wide \
+         FROM public.credentials c WHERE c.id = NEW.credential_id FOR SHARE; \
+         IF is_tenant_wide THEN RAISE EXCEPTION 'credential % is tenant_wide; \
+         tenant-wide and per-agent grants are mutually exclusive', NEW.credential_id \
+         USING ERRCODE = 'check_violation'; END IF; RETURN NEW; END;",
+    ),
+    (
+        "credentials_reject_tenant_wide_with_grants",
+        "BEGIN IF NOT NEW.tenant_wide THEN RETURN NEW; END IF; \
+         IF TG_OP = 'UPDATE' AND OLD.tenant_wide THEN RETURN NEW; END IF; \
+         IF to_regclass('public.credential_agent_grants') IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM public.credential_agent_grants g \
+         WHERE g.credential_id = NEW.id) THEN RAISE EXCEPTION 'credential % holds \
+         per-agent grants; tenant_wide cannot be set while they exist', NEW.id \
+         USING ERRCODE = 'check_violation'; END IF; RETURN NEW; END;",
+    ),
+];
+
+/// `(schema, argument count, result type, language, SECURITY DEFINER, configuration, body)`.
+///
+/// Named rather than repeated inline: seven columns is past the point where a
+/// bare tuple tells a reader anything.
+type FunctionFacts = (String, i16, String, String, bool, Option<String>, String);
+
+async fn verify_trigger_functions(
+    pool: &PgPool,
+    problems: &mut Vec<String>,
+) -> Result<(), sqlx::Error> {
+    for (name, want_body) in REQUIRED_FUNCTIONS {
+        // Queried by name across every schema, not by `public.name`, so a
+        // function that exists only somewhere else is reported as *misplaced*
+        // rather than merely missing — the difference matters when a shadow
+        // schema is what put it there.
+        let candidates: Vec<FunctionFacts> = sqlx::query_as(
+            "SELECT n.nspname, p.pronargs, pg_get_function_result(p.oid), l.lanname, \
+                        p.prosecdef, array_to_string(p.proconfig, ','), p.prosrc \
+                   FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                   JOIN pg_language l ON l.oid = p.prolang \
+                  WHERE p.proname = $1",
+        )
+        .bind(name)
+        .fetch_all(pool)
+        .await?;
+
+        let Some((_, nargs, result, language, security_definer, config, body)) =
+            candidates.iter().find(|(schema, ..)| schema == "public")
+        else {
+            let elsewhere: Vec<&str> = candidates
+                .iter()
+                .map(|(schema, ..)| schema.as_str())
+                .collect();
+            problems.push(if elsewhere.is_empty() {
+                format!("trigger function `public.{name}` is missing")
+            } else {
+                format!(
+                    "trigger function `{name}` does not exist in `public`; it was found in \
+                     {elsewhere:?}, which the trigger will not resolve to"
+                )
+            });
+            continue;
+        };
+
+        if *nargs != 0 {
+            problems.push(format!(
+                "trigger function `public.{name}` takes {nargs} argument(s), expected 0"
+            ));
+        }
+        if result != "trigger" {
+            problems.push(format!(
+                "trigger function `public.{name}` returns `{result}`, expected `trigger`"
+            ));
+        }
+        if language != "plpgsql" {
+            problems.push(format!(
+                "trigger function `public.{name}` is written in `{language}`, expected `plpgsql`"
+            ));
+        }
+        if *security_definer {
+            problems.push(format!(
+                "trigger function `public.{name}` is SECURITY DEFINER; it must be SECURITY \
+                 INVOKER, or it would run with the definer's privileges on every write"
+            ));
+        }
+
+        match config.as_deref() {
+            Some(found) if found == REQUIRED_FUNCTION_CONFIG => {}
+            Some(found) => problems.push(format!(
+                "trigger function `public.{name}` has configuration `{found}`, expected \
+                 `{REQUIRED_FUNCTION_CONFIG}` — a different search_path changes how the \
+                 names in its body resolve"
+            )),
+            None => problems.push(format!(
+                "trigger function `public.{name}` has no `SET search_path`, so a caller's \
+                 session search_path decides how the names in its body resolve"
+            )),
+        }
+
+        if normalise_plpgsql(body) != normalise_plpgsql(want_body) {
+            problems.push(format!(
+                "trigger function `public.{name}` has an unexpected body: found `{}`, \
+                 expected `{}`",
+                normalise_plpgsql(body),
+                normalise_plpgsql(want_body),
             ));
         }
     }

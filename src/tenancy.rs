@@ -761,15 +761,22 @@ mod db_tests {
     const ROLLBACK_SQL: &str = include_str!("../rollback/0028_agent_tenancy_identity_down.sql");
     const GRANTS_ROLLBACK_SQL: &str =
         include_str!("../rollback/0030_credential_agent_grants_down.sql");
+    const GRANTS_HARDENING_ROLLBACK_SQL: &str =
+        include_str!("../rollback/0031_credential_agent_grants_hardening_down.sql");
 
     /// Unwind to the 0027 baseline, in order.
     ///
-    /// Migration 0030's agent-side foreign key depends on
-    /// `agents_tenant_id_id_key`, which the 0028 rollback drops, so 0028's
-    /// script refuses until 0030 has been unwound. Every test that rolls step 1
+    /// Unwind order is 0031 -> 0030 -> 0028. 0030's agent-side foreign key
+    /// depends on `agents_tenant_id_id_key`, which the 0028 rollback drops, and
+    /// 0030's rollback in turn refuses while 0031 is applied. Each script
+    /// refuses up front and names the one to run first. Every test that rolls step 1
     /// back goes through here rather than reaching for `ROLLBACK_SQL` directly,
     /// so a future migration adding another dependency has one place to update.
     async fn rollback_to_0027(pool: &PgPool) {
+        sqlx::raw_sql(GRANTS_HARDENING_ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0031 rollback");
         sqlx::raw_sql(GRANTS_ROLLBACK_SQL)
             .execute(pool)
             .await
@@ -1603,6 +1610,10 @@ mod db_tests {
         // aborted transaction that must be cleared before it is reused.
         // 0030 first, or the migration-order guard fires and this test would
         // pass for the wrong reason.
+        sqlx::raw_sql(GRANTS_HARDENING_ROLLBACK_SQL)
+            .execute(&pool)
+            .await
+            .expect("0031 rollback");
         sqlx::raw_sql(GRANTS_ROLLBACK_SQL)
             .execute(&pool)
             .await
