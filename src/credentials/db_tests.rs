@@ -858,3 +858,156 @@ async fn last_used_is_recorded_on_a_cache_miss_and_not_on_every_request(pool: Pg
     assert!(auth.authenticate(issued.presented()).await.result.is_ok());
     assert_eq!(last_used(issued.credential_id).await, Some(first));
 }
+
+// ── Nothing is written before the MAC verifies ───────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_wrong_secret_never_populates_the_cache(pool: PgPool) {
+    // Regression test for a timing oracle that survived the decoy MAC.
+    //
+    // An earlier revision cached the record during the lookup, before the MAC
+    // comparison. Probing a *known* id with a wrong secret therefore warmed the
+    // cache and skipped PostgreSQL from the second probe onwards, while an
+    // unknown id paid a round trip every time — so repeated probing separated
+    // real ids from invented ones despite identical responses and an equalised
+    // HMAC cost.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    let issued = auth
+        .issue(spec(Uuid::new_v4(), &["memory:read"]))
+        .await
+        .expect("issuance");
+
+    let wrong = format!("{}.{}", issued.credential_id, "ff".repeat(32));
+    for attempt in 1..=5 {
+        let error = auth
+            .authenticate(&wrong)
+            .await
+            .result
+            .expect_err("wrong secret");
+        assert_eq!(error.reason(), FailureReason::BadSecret, "probe {attempt}");
+    }
+
+    // If any probe had cached the record, the *correct* secret would now be
+    // servable with no database at all. Take the table away and find out.
+    sqlx::query("DROP TABLE credentials")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = auth
+        .authenticate(issued.presented())
+        .await
+        .result
+        .expect_err("a wrong-secret probe must leave nothing cached to measure");
+    assert_eq!(error.reason(), FailureReason::Backend);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn only_a_fully_successful_authentication_advances_last_used(pool: PgPool) {
+    // An unauthenticated probe must have no database-write side effect, and
+    // `last_used_at` must mean "last used", not "last guessed at".
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    let issued = auth
+        .issue(spec(Uuid::new_v4(), &["memory:read"]))
+        .await
+        .expect("issuance");
+
+    let last_used = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let (value,): (Option<DateTime<Utc>>,) =
+                sqlx::query_as("SELECT last_used_at FROM credentials WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            value
+        }
+    };
+
+    let wrong = format!("{}.{}", issued.credential_id, "ff".repeat(32));
+    assert!(auth.authenticate(&wrong).await.result.is_err());
+    assert_eq!(
+        last_used(issued.credential_id).await,
+        None,
+        "a wrong secret must not stamp last_used_at"
+    );
+
+    // A correct secret on a *revoked* credential does not count either: the
+    // attempt was rejected, so it was not a use.
+    revoke_elsewhere(&pool, issued.credential_id).await;
+    let cold = authenticator(&pool, &clock);
+    assert!(cold.authenticate(issued.presented()).await.result.is_err());
+    assert_eq!(last_used(issued.credential_id).await, None);
+
+    // A successful one does.
+    sqlx::query("UPDATE credentials SET status = 'active', revoked_at = NULL WHERE id = $1")
+        .bind(issued.credential_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let fresh = authenticator(&pool, &clock);
+    assert!(fresh.authenticate(issued.presented()).await.result.is_ok());
+    assert!(last_used(issued.credential_id).await.is_some());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_rejected_issuance_leaves_no_row(pool: PgPool) {
+    // An expiry at or before `created_at` violates `credentials_expires_ck`.
+    // With issuance as one statement the whole write fails and nothing is
+    // committed. The earlier INSERT-then-UPDATE version would have left an
+    // active, *non-expiring* row whose plaintext secret the caller had already
+    // discarded — unusable by anyone, yet counted by the readiness gate.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+
+    let mut s = spec(Uuid::new_v4(), &["memory:read"]);
+    s.expires_at = Some(start() - ChronoDuration::hours(1));
+    assert!(
+        auth.issue(s).await.is_err(),
+        "an expiry in the past must be refused"
+    );
+
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM credentials")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "a failed issuance must leave nothing behind");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_startup_gate_does_not_count_expired_credentials(pool: PgPool) {
+    // `status = 'active'` alone would call this registry ready even though
+    // nobody in it can authenticate — the exact condition the gate exists to
+    // catch. Written directly so `created_at` can be backdated far enough for
+    // an already-elapsed expiry to satisfy `credentials_expires_ck`.
+    sqlx::query(
+        "INSERT INTO credentials \
+             (id, tenant_id, principal_id, secret_mac, mode, created_at, expires_at) \
+         VALUES ($1, $2, 'stale', $3, 'v2_required', \
+                 NOW() - INTERVAL '2 hours', NOW() - INTERVAL '1 hour')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .expect("an active-but-expired row is representable");
+
+    let error = assert_registry_ready_for_multi_tenant(&pool, true)
+        .await
+        .expect_err("an all-expired registry is an empty one");
+    assert!(error.to_string().contains("no active credentials"));
+
+    // One unexpired credential is enough to clear it.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    auth.issue(spec(Uuid::new_v4(), &["admin"]))
+        .await
+        .expect("issuance");
+    assert_registry_ready_for_multi_tenant(&pool, true)
+        .await
+        .expect("an unexpired active credential satisfies the gate");
+}

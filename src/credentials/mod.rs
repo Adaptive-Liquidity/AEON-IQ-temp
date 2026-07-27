@@ -327,6 +327,16 @@ pub struct Authentication {
     pub audit: AuthAudit,
 }
 
+/// A record and where it came from.
+///
+/// `from_cache` is what stops a successful authentication from re-writing an
+/// entry it just read — which would turn the absolute TTL into a sliding one
+/// and let a continuously used revoked credential live forever.
+struct Loaded {
+    record: CredentialRecord,
+    from_cache: bool,
+}
+
 // ── Authenticator ────────────────────────────────────────────────────────────
 
 /// Verifies presented credentials against the registry.
@@ -378,11 +388,25 @@ impl Authenticator {
     /// 1. parse — a malformed string never reaches the database;
     /// 2. load (cache, then indexed fetch) — a miss performs a decoy MAC;
     /// 3. **verify the MAC**;
-    /// 4. only then check status and expiry.
+    /// 4. check status and expiry;
+    /// 5. only then write anything — cache the record and stamp `last_used_at`.
     ///
-    /// Step 4 comes last so that "is this credential revoked?" cannot be
+    /// Step 4 comes after step 3 so that "is this credential revoked?" cannot be
     /// answered without holding its secret. Checking status first would make
     /// the registry's lifecycle state readable by anyone who guessed an id.
+    ///
+    /// **Step 5 comes last, and that placement is load-bearing.** An earlier
+    /// revision cached the record inside `load`, before the MAC comparison.
+    /// That reintroduced exactly the oracle the decoy MAC exists to close: an
+    /// attacker repeating wrong-secret probes against a *known* id warmed the
+    /// cache and skipped PostgreSQL from the second probe onwards, while an
+    /// unknown id paid a round trip every time. Uniform responses and a decoy
+    /// HMAC do not help when the two paths diverge by a database call. A record
+    /// is now cached only once it has actually authenticated, so a wrong secret
+    /// leaves no trace to measure.
+    ///
+    /// The same ordering keeps `last_used_at` truthful and stops an
+    /// unauthenticated probe from having a database-write side effect.
     pub async fn authenticate(&self, presented: &str) -> Authentication {
         let at = self.clock.now();
 
@@ -393,14 +417,15 @@ impl Authenticator {
         };
         let id = parsed.credential_id();
 
-        let record = match self.load(id).await {
-            Ok(Some(record)) => record,
+        let loaded = match self.load(id).await {
+            Ok(Some(loaded)) => loaded,
             Ok(None) => {
                 self.decoy();
                 return self.reject(at, Some(id), FailureReason::UnknownCredential);
             }
             Err(reason) => return self.reject(at, Some(id), reason),
         };
+        let record = loaded.record;
 
         if !secret::verify(&self.pepper, &parsed, &record.secret_mac) {
             return self.reject(at, Some(id), FailureReason::BadSecret);
@@ -415,6 +440,29 @@ impl Authenticator {
                 CredentialStatus::Active => FailureReason::Expired,
             };
             return self.reject(at, Some(id), reason);
+        }
+
+        if !loaded.from_cache {
+            if let Err(error) = self.cache.insert(
+                id,
+                record.clone(),
+                record.cache_bound(),
+                self.clock.as_ref(),
+            ) {
+                // Fail closed, consistent with the read path: a poisoned lock
+                // means a thread panicked mid-update, and the next request's
+                // `cache.get` would refuse anyway.
+                tracing::error!(%error, credential_id = %id, "credential cache unusable");
+                return self.reject(at, Some(id), FailureReason::Backend);
+            }
+
+            // Best-effort attribution, and deliberately *not* a reason to fail:
+            // the caller has authenticated, so rejecting because a bookkeeping
+            // UPDATE failed would deny service over a non-security condition.
+            // Logged rather than swallowed.
+            if let Err(error) = store::touch_last_used(&self.pool, id, at).await {
+                tracing::warn!(%error, credential_id = %id, "could not record last_used_at");
+            }
         }
 
         let context = AeonAuthContext::new(
@@ -438,16 +486,24 @@ impl Authenticator {
         }
     }
 
-    /// Cache first, then one indexed fetch.
+    /// Cache first, then one indexed fetch. **Read-only** — nothing is written
+    /// here, because at this point the MAC has not been checked and the caller
+    /// may be an attacker probing an id they do not hold the secret for. See
+    /// [`Authenticator::authenticate`] step 5.
     ///
     /// Every error path returns `Err`, never `Ok(None)`: a cache failure that
     /// looked like a miss would silently fall through to the database, and a
     /// database failure that looked like a miss would be indistinguishable from
     /// "no such credential" — which is a rejection either way, but for the
     /// wrong reason and with the wrong audit record.
-    async fn load(&self, id: Uuid) -> Result<Option<CredentialRecord>, FailureReason> {
+    async fn load(&self, id: Uuid) -> Result<Option<Loaded>, FailureReason> {
         match self.cache.get(id, self.clock.as_ref()) {
-            Ok(Some(record)) => return Ok(Some(record)),
+            Ok(Some(record)) => {
+                return Ok(Some(Loaded {
+                    record,
+                    from_cache: true,
+                }))
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::error!(%error, credential_id = %id, "credential cache unusable");
@@ -467,27 +523,10 @@ impl Authenticator {
             }
         };
 
-        if let Some(record) = fetched.as_ref() {
-            if let Err(error) = self.cache.insert(
-                id,
-                record.clone(),
-                record.cache_bound(),
-                self.clock.as_ref(),
-            ) {
-                tracing::error!(%error, credential_id = %id, "credential cache unusable");
-                return Err(FailureReason::Backend);
-            }
-
-            // Best-effort attribution. Deliberately does not fail the request:
-            // the credential is valid and the caller is authenticated, so
-            // rejecting because a bookkeeping UPDATE failed would deny service
-            // over a non-security condition. Logged rather than swallowed.
-            if let Err(error) = store::touch_last_used(&self.pool, id, self.clock.now()).await {
-                tracing::warn!(%error, credential_id = %id, "could not record last_used_at");
-            }
-        }
-
-        Ok(fetched)
+        Ok(fetched.map(|record| Loaded {
+            record,
+            from_cache: false,
+        }))
     }
 
     fn decoy(&self) {

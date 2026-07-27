@@ -212,11 +212,25 @@ pub struct NewCredential<'a> {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// Write a credential in **one** statement.
+///
+/// An earlier revision inserted the row and then set `expires_at` in a second
+/// `UPDATE`, on the mistaken belief that `credentials_expires_ck` needed
+/// `created_at` to already exist. It does not: a `CHECK` is evaluated against
+/// the completed row, after `DEFAULT NOW()` has been applied, so a single
+/// `INSERT` satisfies it.
+///
+/// The two-statement version was not merely redundant, it was unsafe. Without a
+/// transaction, a failed `UPDATE` left a committed, active, **non-expiring** row
+/// whose plaintext secret the caller had already discarded — an orphan nobody
+/// can authenticate with, which nonetheless counted towards
+/// [`active_count`] and so towards the multi-tenant readiness gate.
 pub async fn insert(pool: &PgPool, new: NewCredential<'_>) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO credentials \
-             (id, tenant_id, principal_id, secret_mac, mode, scopes, tenant_wide, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')",
+             (id, tenant_id, principal_id, secret_mac, mode, scopes, tenant_wide, \
+              status, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)",
     )
     .bind(new.id)
     .bind(new.tenant_id)
@@ -225,18 +239,9 @@ pub async fn insert(pool: &PgPool, new: NewCredential<'_>) -> Result<(), StoreEr
     .bind(new.mode.as_str())
     .bind(new.scopes.to_wire())
     .bind(new.tenant_wide)
+    .bind(new.expires_at)
     .execute(pool)
     .await?;
-
-    // Written separately so `credentials_expires_ck` compares against the
-    // server-generated `created_at` rather than a client-supplied one.
-    if let Some(expires_at) = new.expires_at {
-        sqlx::query("UPDATE credentials SET expires_at = $2 WHERE id = $1")
-            .bind(new.id)
-            .bind(expires_at)
-            .execute(pool)
-            .await?;
-    }
     Ok(())
 }
 
@@ -275,11 +280,19 @@ pub async fn touch_last_used(pool: &PgPool, id: Uuid, at: DateTime<Utc>) -> Resu
 /// Used by the §2 startup check: an empty registry plus multi-tenant mode means
 /// nothing can authenticate, so the deployment would come up unreachable or —
 /// worse — be "fixed" by re-enabling the legacy key.
+///
+/// Expiry is part of the question, not a detail. `status = 'active'` alone would
+/// count a registry whose every row expired an hour ago, which
+/// [`CredentialRecord::is_usable_at`] rejects one by one — so the gate would
+/// call a deployment ready that nobody can authenticate against, which is the
+/// exact condition it exists to catch.
 pub async fn active_count(pool: &PgPool) -> Result<i64, StoreError> {
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM credentials WHERE status = 'active'")
-            .fetch_one(pool)
-            .await?;
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM credentials \
+          WHERE status = 'active' AND (expires_at IS NULL OR expires_at > NOW())",
+    )
+    .fetch_one(pool)
+    .await?;
     Ok(count)
 }
 
