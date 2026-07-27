@@ -15,6 +15,7 @@ mod providers;
 mod proxy;
 mod rate_limit;
 mod rmk_worker;
+mod tenancy;
 #[cfg(test)]
 mod test_support;
 mod url_guard;
@@ -58,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(Config::from_env()?);
     let role = config::ProcessRole::from_env()?;
+    // Parsed before anything touches the database so a half-specified migration
+    // mode fails immediately rather than after partial work.
+    let tenancy_settings = tenancy::TenancySettings::from_env()?;
     tracing::info!(
         "MemoryOS Kernel starting on port {} with role {:?}",
         config.port,
@@ -104,6 +108,44 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     db::run_migrations(&db).await?;
     tracing::info!("Database migrations applied");
+
+    // ── Legacy agent tenancy ──────────────────────────────────────────────────
+    // Runs only when an operator has explicitly selected a migration mode.  With
+    // no mode set, no agent is assigned a tenant: there is no default tenant and
+    // none is generated (plan §6 / decision A-2).
+    if let Some(plan) = tenancy_settings.legacy_plan.as_ref() {
+        let report = tenancy::run_legacy_backfill(&db, plan).await?;
+        tracing::info!(
+            mode = report.mode.as_str(),
+            legacy_tenant_id = ?report.legacy_tenant_id,
+            agents_total = report.agents_total,
+            agents_assigned = report.agents_assigned,
+            agents_unmapped = report.agents_unmapped,
+            already_applied = report.already_applied,
+            "Legacy agent tenancy migration applied"
+        );
+        if report.agents_unmapped > 0 {
+            tracing::warn!(
+                agents_unmapped = report.agents_unmapped,
+                "Agents remain unmapped. They belong to no tenant and are served to \
+                 nobody; multi-tenant mode cannot be enabled until every agent is mapped."
+            );
+        }
+    }
+
+    // Inert unless MULTI_TENANT_ENABLED=true, which nothing sets by default.
+    tenancy::assert_multi_tenant_preconditions(
+        &db,
+        &tenancy_settings,
+        tenancy::ManagementAuth {
+            legacy_key_accepted: config.management_api_key.is_some(),
+            // `check_management_key` skips the whole comparison when no key is
+            // configured (auth.rs:22), so this combination leaves every
+            // /api/v1/* route open rather than merely un-keyed.
+            unauthenticated: config.management_api_key.is_none() && config.allow_unauth_management,
+        },
+    )
+    .await?;
 
     // Redirects are disabled: provider API calls (LLM, embeddings, extraction)
     // should never be redirected cross-host.  Following redirects by default
