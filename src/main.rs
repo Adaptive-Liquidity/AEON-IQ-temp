@@ -137,7 +137,13 @@ async fn main() -> anyhow::Result<()> {
     tenancy::assert_multi_tenant_preconditions(
         &db,
         &tenancy_settings,
-        config.management_api_key.is_some(),
+        tenancy::ManagementAuth {
+            legacy_key_accepted: config.management_api_key.is_some(),
+            // `check_management_key` skips the whole comparison when no key is
+            // configured (auth.rs:22), so this combination leaves every
+            // /api/v1/* route open rather than merely un-keyed.
+            unauthenticated: config.management_api_key.is_none() && config.allow_unauth_management,
+        },
     )
     .await?;
 

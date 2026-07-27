@@ -392,6 +392,22 @@ pub async fn count_unmapped_agents(pool: &PgPool) -> Result<i64> {
     Ok(row.0)
 }
 
+/// What the management API accepts at startup.
+///
+/// Both fields matter to the gate, and neither implies the other. "No legacy
+/// key" is retirement only when something authenticates in its place; on its
+/// own it can equally mean nothing authenticates at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagementAuth {
+    /// `MANAGEMENT_API_KEY` is set, so the legacy key still authorises every
+    /// route with no tenant of its own.
+    pub legacy_key_accepted: bool,
+    /// No key is set and `ALLOW_UNAUTH_MANAGEMENT=true`, so
+    /// `auth::check_management_key` performs no check at all (`auth.rs:22` —
+    /// the whole comparison is inside `if let Some(required)`).
+    pub unauthenticated: bool,
+}
+
 /// Refuse to enable multi-tenant mode unless every §6 precondition holds.
 ///
 /// Returns `Ok(())` immediately when multi-tenant mode is not enabled, which is
@@ -400,7 +416,7 @@ pub async fn count_unmapped_agents(pool: &PgPool) -> Result<i64> {
 pub async fn assert_multi_tenant_preconditions(
     pool: &PgPool,
     settings: &TenancySettings,
-    legacy_management_key_accepted: bool,
+    management_auth: ManagementAuth,
 ) -> Result<()> {
     if !settings.multi_tenant_enabled {
         return Ok(());
@@ -444,7 +460,22 @@ pub async fn assert_multi_tenant_preconditions(
         );
     }
 
-    if legacy_management_key_accepted {
+    // Checked before the legacy-key condition because it is the worse state of
+    // the two: an absent MANAGEMENT_API_KEY satisfies "the legacy key is no
+    // longer accepted" while leaving every /api/v1/* route open to anyone.
+    // Treating that as retirement would let this gate bless a multi-tenant
+    // deployment with no authentication whatsoever.
+    if management_auth.unauthenticated {
+        bail!(
+            "MANAGEMENT_API_KEY is unset and ALLOW_UNAUTH_MANAGEMENT=true, so every \
+             /api/v1/* route is unauthenticated. Multi-tenant mode must not be enabled \
+             without authentication: removing the legacy key counts as retirement only \
+             once a replacement exists, and the credential registry is plan §10 steps \
+             2-3, which have not landed."
+        );
+    }
+
+    if management_auth.legacy_key_accepted {
         bail!(
             "MANAGEMENT_API_KEY is still accepted. Legacy-key retirement (plan §10 step 6) \
              must complete before multi-tenant mode is enabled, because the legacy key \
@@ -463,37 +494,48 @@ pub async fn assert_multi_tenant_preconditions(
 // tests in this module, which is what proves the identity model works before
 // anything depends on it.
 
-/// The legacy compatibility key for a tenant-scoped agent.
+/// The legacy compatibility key for a tenant-scoped agent: its own UUID.
 ///
 /// `agents.agent_id` stays globally `UNIQUE` until §10 step 7, because
 /// `sessions.agent_id` and `archival_batches.agent_id` still reference it and
 /// PostgreSQL requires a unique target.  Two tenants may now share an
 /// `external_agent_id`, which that global constraint cannot represent, so rows
-/// created through the tenant-aware path get a tenant-qualified legacy key
-/// instead.  It is deterministic in `(tenant_id, external_agent_id)` and cannot
-/// collide, because `UNIQUE (tenant_id, external_agent_id)` already makes that
-/// pair unique.
+/// created through the tenant-aware path need some other value there.
+///
+/// It is the agent's UUID rather than anything derived from
+/// `external_agent_id`.  `agents.agent_id` is arbitrary text, so a scheme that
+/// embeds the caller-supplied identifier can always be made to collide: a
+/// legacy V1 agent may already be named exactly the string such a scheme would
+/// generate, and an otherwise-valid `(tenant_id, external_agent_id)` pair would
+/// then be rejected by `agents_agent_id_key`.  Deriving the key from the row's
+/// own UUID puts it outside caller control entirely.
 ///
 /// Rows written through the unchanged V1 path keep their identifier verbatim —
-/// the qualification applies only to rows V1 could not have created.
+/// this applies only to rows V1 could not have created.  The whole mechanism
+/// disappears at §10 step 7 along with the column it feeds; the rollback script
+/// restores `agent_id` from `external_agent_id` before dropping it.
 #[allow(dead_code)] // wired into request handling in plan §10 step 5
-pub fn legacy_compat_agent_id(tenant_id: Uuid, external_agent_id: &str) -> String {
-    format!("{external_agent_id}#{tenant_id}")
+pub fn legacy_compat_agent_id(agent_uuid: Uuid) -> String {
+    agent_uuid.to_string()
 }
 
 /// Create a tenant-scoped agent and return its internal UUID.
 #[allow(dead_code)] // wired into request handling in plan §10 step 5
 pub async fn insert_agent(pool: &PgPool, tenant_id: Uuid, external_agent_id: &str) -> Result<Uuid> {
-    let row: (Uuid,) = sqlx::query_as(
-        "INSERT INTO agents (agent_id, tenant_id, external_agent_id) \
-         VALUES ($1, $2, $3) RETURNING id",
+    // Generated here rather than left to the column default so the
+    // compatibility key can be derived from it in the same statement.
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, agent_id, tenant_id, external_agent_id) \
+         VALUES ($1, $2, $3, $4)",
     )
-    .bind(legacy_compat_agent_id(tenant_id, external_agent_id))
+    .bind(id)
+    .bind(legacy_compat_agent_id(id))
     .bind(tenant_id)
     .bind(external_agent_id)
-    .fetch_one(pool)
+    .execute(pool)
     .await?;
-    Ok(row.0)
+    Ok(id)
 }
 
 /// Resolve a caller-supplied `external_agent_id` **within one tenant**.
@@ -689,17 +731,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_compat_key_is_deterministic_and_tenant_qualified() {
-        let tenant_a = Uuid::parse_str(TENANT_A).unwrap();
-        let tenant_b = Uuid::parse_str(TENANT_B).unwrap();
+    fn legacy_compat_key_is_the_agent_uuid_and_owes_nothing_to_caller_input() {
+        let agent_uuid = Uuid::parse_str("cccccccc-0000-4000-8000-000000000003").unwrap();
 
-        assert_eq!(
-            legacy_compat_agent_id(tenant_a, "assistant"),
-            legacy_compat_agent_id(tenant_a, "assistant")
-        );
+        assert_eq!(legacy_compat_agent_id(agent_uuid), agent_uuid.to_string());
         assert_ne!(
-            legacy_compat_agent_id(tenant_a, "assistant"),
-            legacy_compat_agent_id(tenant_b, "assistant")
+            legacy_compat_agent_id(agent_uuid),
+            legacy_compat_agent_id(Uuid::parse_str(TENANT_A).unwrap())
         );
     }
 }
@@ -782,6 +820,32 @@ mod db_tests {
         row.0 > 0
     }
 
+    /// `MANAGEMENT_API_KEY` is set — the V1 production shape.
+    fn legacy_key_set() -> ManagementAuth {
+        ManagementAuth {
+            legacy_key_accepted: true,
+            unauthenticated: false,
+        }
+    }
+
+    /// The legacy key is gone *and* something authenticates in its place. That
+    /// replacement is the credential registry of plan §10 steps 2-3; this is
+    /// the only management-auth state the gate is meant to accept.
+    fn legacy_key_retired() -> ManagementAuth {
+        ManagementAuth {
+            legacy_key_accepted: false,
+            unauthenticated: false,
+        }
+    }
+
+    /// No key and `ALLOW_UNAUTH_MANAGEMENT=true`: every `/api/v1/*` route open.
+    fn management_unauthenticated() -> ManagementAuth {
+        ManagementAuth {
+            legacy_key_accepted: false,
+            unauthenticated: true,
+        }
+    }
+
     fn mapped(pairs: &[(&str, Uuid)]) -> LegacyTenancyPlan {
         LegacyTenancyPlan::Mapped {
             mappings: pairs
@@ -815,6 +879,31 @@ mod db_tests {
                 .await
                 .unwrap(),
             Some(in_b)
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn a_legacy_identifier_cannot_squat_a_compatibility_key(pool: PgPool) {
+        // `agents.agent_id` is arbitrary text, so a legacy V1 agent may already
+        // be named whatever a compatibility-key scheme would generate. A key
+        // derived from the caller-supplied external id would collide here and
+        // reject an otherwise-valid (tenant_id, external_agent_id) pair; a key
+        // derived from the row's own UUID cannot be steered into a collision.
+        legacy_upsert_agent(&pool, &format!("assistant#{}", tenant_a())).await;
+        legacy_upsert_agent(&pool, "assistant").await;
+
+        let scoped = insert_agent(&pool, tenant_a(), "assistant").await.unwrap();
+
+        assert_eq!(
+            resolve_agent_uuid(&pool, tenant_a(), "assistant")
+                .await
+                .unwrap(),
+            Some(scoped)
+        );
+        // Three distinct agents: two legacy, one tenant-scoped.
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM agents").await,
+            3
         );
     }
 
@@ -1012,7 +1101,7 @@ mod db_tests {
             multi_tenant_enabled: true,
         };
 
-        let error = assert_multi_tenant_preconditions(&pool, &settings, false)
+        let error = assert_multi_tenant_preconditions(&pool, &settings, legacy_key_retired())
             .await
             .unwrap_err();
 
@@ -1032,7 +1121,7 @@ mod db_tests {
             multi_tenant_enabled: true,
         };
 
-        let error = assert_multi_tenant_preconditions(&pool, &settings, false)
+        let error = assert_multi_tenant_preconditions(&pool, &settings, legacy_key_retired())
             .await
             .unwrap_err();
 
@@ -1054,7 +1143,7 @@ mod db_tests {
             legacy_plan: Some(plan),
             multi_tenant_enabled: true,
         };
-        let error = assert_multi_tenant_preconditions(&pool, &settings, false)
+        let error = assert_multi_tenant_preconditions(&pool, &settings, legacy_key_retired())
             .await
             .unwrap_err();
 
@@ -1076,7 +1165,7 @@ mod db_tests {
             legacy_plan: Some(plan),
             multi_tenant_enabled: true,
         };
-        let error = assert_multi_tenant_preconditions(&pool, &settings, true)
+        let error = assert_multi_tenant_preconditions(&pool, &settings, legacy_key_set())
             .await
             .unwrap_err();
 
@@ -1099,7 +1188,7 @@ mod db_tests {
             }),
             multi_tenant_enabled: true,
         };
-        let error = assert_multi_tenant_preconditions(&pool, &settings, false)
+        let error = assert_multi_tenant_preconditions(&pool, &settings, legacy_key_retired())
             .await
             .unwrap_err();
 
@@ -1121,9 +1210,35 @@ mod db_tests {
             legacy_plan: Some(plan),
             multi_tenant_enabled: true,
         };
-        assert_multi_tenant_preconditions(&pool, &settings, false)
+        assert_multi_tenant_preconditions(&pool, &settings, legacy_key_retired())
             .await
             .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn enablement_is_refused_while_management_routes_are_unauthenticated(pool: PgPool) {
+        legacy_upsert_agent(&pool, "alpha").await;
+        let plan = LegacyTenancyPlan::SingleTenant {
+            tenant_id: tenant_a(),
+        };
+        run_legacy_backfill(&pool, &plan).await.unwrap();
+
+        // Every other precondition holds, and MANAGEMENT_API_KEY is absent — so
+        // a gate that read "no legacy key" as "legacy key retired" would let a
+        // deployment with no authentication at all enable multi-tenant mode.
+        let settings = TenancySettings {
+            legacy_plan: Some(plan),
+            multi_tenant_enabled: true,
+        };
+        let error =
+            assert_multi_tenant_preconditions(&pool, &settings, management_unauthenticated())
+                .await
+                .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("ALLOW_UNAUTH_MANAGEMENT"),
+            "unexpected error: {error:#}"
+        );
     }
 
     // ── V1 behaviour is unchanged ─────────────────────────────────────────────
@@ -1225,9 +1340,13 @@ mod db_tests {
         // The default deployment: no mode, no backfill, unmapped rows, legacy
         // key still accepted — and startup is still allowed, because nothing
         // has opted into multi-tenancy.
-        assert_multi_tenant_preconditions(&pool, &TenancySettings::default(), true)
-            .await
-            .unwrap();
+        assert_multi_tenant_preconditions(
+            &pool,
+            &TenancySettings::default(),
+            management_unauthenticated(),
+        )
+        .await
+        .unwrap();
         assert_eq!(count_unmapped_agents(&pool).await.unwrap(), 1);
     }
 
@@ -1355,10 +1474,59 @@ mod db_tests {
             .await,
             1
         );
+        // The tenant-scoped agent is back under the identifier its caller used,
+        // not under the UUID compatibility key it carried while 0028 was
+        // applied. Without the restore step it would be reachable only by a
+        // value it never advertised.
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT COUNT(*)::bigint FROM agents WHERE agent_id = 'scoped-agent'",
+            )
+            .await,
+            1
+        );
         legacy_upsert_agent(&pool, "post-rollback-agent").await;
         assert_eq!(
             scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM agents").await,
             3
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn rollback_refuses_when_the_baseline_cannot_hold_the_identifiers(pool: PgPool) {
+        // Two tenants legitimately share one external_agent_id under 0028 — and
+        // that is exactly what the baseline's global UNIQUE on agent_id cannot
+        // represent. Silently keeping one and mangling the other would be worse
+        // than refusing, so the script raises and changes nothing.
+        insert_agent(&pool, tenant_a(), "assistant").await.unwrap();
+        insert_agent(&pool, tenant_b(), "assistant").await.unwrap();
+
+        // On a dedicated connection: the script opens an explicit transaction
+        // (right for `psql -f`, where autocommit would otherwise leave a failed
+        // rollback half-applied), so the RAISE leaves this connection in an
+        // aborted transaction that must be cleared before it is reused.
+        let mut conn = pool.acquire().await.unwrap();
+        let error = sqlx::raw_sql(ROLLBACK_SQL)
+            .execute(&mut *conn)
+            .await
+            .unwrap_err();
+        sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+        drop(conn);
+
+        assert!(
+            error
+                .to_string()
+                .contains("would lose caller-facing identifiers"),
+            "unexpected error: {error}"
+        );
+        // The refusal is inside the script's transaction, so nothing was
+        // dropped and the deployment is still on 0028.
+        assert!(column_exists(&pool, "agents", "external_agent_id").await);
+        assert!(constraint_exists(&pool, "agents_tenant_id_external_agent_id_key").await);
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM agents").await,
+            2
         );
     }
 }

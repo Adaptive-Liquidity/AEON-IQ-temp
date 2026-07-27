@@ -61,20 +61,29 @@ through the tenant-aware path — see *Legacy compatibility key* below.
 
 Two tenants may now hold the same `external_agent_id`. The retained global
 `UNIQUE` on `agent_id` cannot represent that, so rows created through
-`src/tenancy.rs::insert_agent` get a tenant-qualified legacy key:
+`src/tenancy.rs::insert_agent` put the agent's **own UUID** in the legacy
+column:
 
 ```
-agent_id = "<external_agent_id>#<tenant_id>"
+agent_id = agents.id::text
 ```
 
-It is deterministic in `(tenant_id, external_agent_id)` and cannot collide,
-because `UNIQUE (tenant_id, external_agent_id)` already makes that pair unique.
+It is deliberately **not** derived from `external_agent_id`. `agents.agent_id`
+is arbitrary text, so any scheme that embeds the caller-supplied identifier can
+be made to collide: a legacy V1 agent may already be named exactly the string
+such a scheme would generate, and an otherwise-valid
+`(tenant_id, external_agent_id)` pair would then be rejected by
+`agents_agent_id_key`. Deriving the key from the row's own UUID puts it outside
+caller control, and keeps the tenant UUID out of a field that `GET /agents`
+currently returns.
 
 Rows written through the unchanged V1 path keep their identifier **verbatim** —
 `INSERT INTO agents (agent_id) VALUES ($1)` still produces
 `agent_id = external_agent_id = $1`, mirrored by the bridge trigger. The
-qualification applies only to rows V1 could not have created in the first place.
-The whole mechanism disappears at step 7 with the column it exists to feed.
+compatibility key applies only to rows V1 could not have created in the first
+place, and the rollback script restores `agent_id` from `external_agent_id`
+before dropping the column. The whole mechanism disappears at step 7 with the
+column it exists to feed.
 
 ## Migration modes
 
@@ -132,9 +141,19 @@ hold (plan §6):
 1. a migration mode is set;
 2. a migration record exists and matches the configured mode and tenant;
 3. no agent is unmapped;
-4. `MANAGEMENT_API_KEY` is no longer accepted — legacy-key retirement (§10
+4. the management API is not unauthenticated — `MANAGEMENT_API_KEY` unset
+   together with `ALLOW_UNAUTH_MANAGEMENT=true` leaves every `/api/v1/*` route
+   open, because `auth::check_management_key` performs no check at all when no
+   key is configured (`auth.rs:22`);
+5. `MANAGEMENT_API_KEY` is no longer accepted — legacy-key retirement (§10
    step 6) must complete first, because that key authorises every route and has
    no tenant of its own.
+
+Conditions 4 and 5 are separate on purpose. Removing the key satisfies 5 but not
+4, and treating "no legacy key" as retirement would let the gate bless a
+multi-tenant deployment with no authentication whatsoever. Retirement counts
+only once a replacement exists, and the replacement is the credential registry
+of §10 steps 2–3.
 
 With `MULTI_TENANT_ENABLED` unset or false — the default — the gate returns
 immediately and changes nothing.
@@ -147,10 +166,18 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
 ```
 
 Everything in step 1 is additive, so this restores the 0027 baseline without
-data loss: `agents.agent_id`, its global `UNIQUE`, both dependent foreign keys
-and every agent row are untouched by both the migration and the rollback. What
-is discarded is the tenant assignments and the record rows, which the same
-operator inputs reproduce exactly.
+losing an identifier: `agents.agent_id`, its global `UNIQUE`, both dependent
+foreign keys and every agent row are untouched by both the migration and the
+rollback. What is discarded is the tenant assignments and the record rows, which
+the same operator inputs reproduce exactly.
+
+Rows created through the tenant-aware path need one extra step, which the script
+performs first: their `agent_id` is the UUID compatibility key, so the script
+moves `external_agent_id` back into `agent_id` before dropping the column.
+Without that, the agent would come back reachable only by a UUID it never
+advertised. Where the baseline genuinely cannot hold the data — two tenants
+sharing one `external_agent_id`, exactly what the global `UNIQUE` forbids — the
+script **raises and changes nothing** rather than picking a winner.
 
 The script also deletes the `_sqlx_migrations` row for version 28 so
 `sqlx migrate run` re-applies 0028 cleanly afterwards.
