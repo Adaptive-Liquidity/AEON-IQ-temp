@@ -17,8 +17,9 @@
 //!   admin, not to a default.
 //! * **Enablement fails closed.**  `assert_multi_tenant_preconditions` refuses
 //!   startup when the mode is absent, when the recorded migration disagrees
-//!   with the configured one, while any row is unmapped, or while the legacy
-//!   `MANAGEMENT_API_KEY` is still accepted (plan §6).
+//!   with the configured one, while any row is unmapped, while the management
+//!   API is unauthenticated, or while the legacy `MANAGEMENT_API_KEY` is still
+//!   accepted (plan §6).
 //!
 //! Nothing here changes V1 behaviour: with no tenancy environment variables
 //! set, `TenancySettings::from_env` yields no plan, no backfill runs, and the
