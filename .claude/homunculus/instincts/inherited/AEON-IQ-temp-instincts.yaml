@@ -1,0 +1,366 @@
+# Instincts generated from https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+# Generated: 2026-07-27T16:17:48.119Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: AEON-IQ-temp-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix
+
+## Evidence
+
+- 2 commits analyzed
+- Detected conventional commit pattern
+- Examples: fix(credentials): bind cache reuse to the presented secret, verify the schema, parse the enable flag strictly, fix(credentials): compare CHECK expressions and column defaults in the schema gate
+
+---
+id: AEON-IQ-temp-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Length
+
+## Action
+
+Write moderate-length commit messages (~96 characters)
+
+## Evidence
+
+- Average commit message length: 96 chars
+- Based on 2 commits
+
+---
+id: AEON-IQ-temp-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: AEON-IQ-temp-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: AEON-IQ-temp-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: AEON-IQ-temp-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: AEON-IQ-temp-workflow-harden-schema-contract-and-verification
+trigger: "when doing harden schema contract and verification"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Workflow Harden Schema Contract And Verification
+
+## Action
+
+Follow the harden-schema-contract-and-verification workflow:
+1. Identify weaknesses or bypasses in current schema validation logic.
+2. Update contract verification logic to check for stricter constraints (e.g., CHECK expressions, column defaults, primary keys, unique constraints).
+3. Update or add tests that demonstrate both the broken and fixed behaviors.
+4. Modify the main credential/authentication module to enforce the stricter contract at startup.
+5. Verify changes against a real or test database, ensuring startup fails closed on contract violations.
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: src/credentials/store.rs, src/credentials/db_tests.rs, src/credentials/mod.rs
+
+---
+id: aeon-iq-temp-instinct-camelcase-files
+trigger: "When creating or renaming a source file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Camelcase Files
+
+## Action
+
+Name the file using camelCase (e.g., myFile.rs)
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: aeon-iq-temp-instinct-camelcase-functions
+trigger: "When defining a function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Camelcase Functions
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: aeon-iq-temp-instinct-pascalcase-classes
+trigger: "When defining a class or struct"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Pascalcase Classes
+
+## Action
+
+Name the class/struct using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: aeon-iq-temp-instinct-screaming-constants
+trigger: "When declaring a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Screaming Constants
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: aeon-iq-temp-instinct-relative-imports
+trigger: "When importing modules"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Relative Imports
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: aeon-iq-temp-instinct-named-exports
+trigger: "When exporting functions or types"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Named Exports
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: aeon-iq-temp-instinct-separate-tests
+trigger: "When adding or updating tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Separate Tests
+
+## Action
+
+Place tests in a separate file (e.g., db_tests.rs) within the same module folder
+
+## Evidence
+
+- Pattern in architecture.testLocation: separate
+- Files like src/credentials/db_tests.rs
+
+---
+id: aeon-iq-temp-instinct-test-both-broken-fixed
+trigger: "When fixing a bug or hardening a contract"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Test Both Broken Fixed
+
+## Action
+
+Add or update tests to demonstrate both the broken (pre-fix) and fixed (post-fix) behaviors
+
+## Evidence
+
+- Workflow step: Update or add tests that demonstrate both the broken and fixed behaviors
+- Seen in harden-schema-contract-and-verification workflow
+
+---
+id: aeon-iq-temp-instinct-conventional-commits-fix
+trigger: "When committing a bug fix"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Conventional Commits Fix
+
+## Action
+
+Use the conventional commit format: fix(scope): summary
+
+## Evidence
+
+- commits.prefixes: fix
+- Examples: fix(credentials): ...
+
+---
+id: aeon-iq-temp-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Commit Length
+
+## Action
+
+Write a descriptive commit message, aiming for ~96 characters on average
+
+## Evidence
+
+- commits.averageLength: 96
+
+---
+id: aeon-iq-temp-instinct-harden-schema-contract
+trigger: "When someone wants to harden schema validation and contract enforcement for a database-backed authentication or credentials subsystem"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Harden Schema Contract
+
+## Action
+
+Follow the workflow: identify weaknesses, update contract verification for stricter constraints, update/add tests for both broken and fixed behaviors, modify the main module to enforce at startup, and verify changes against a real/test database
+
+## Evidence
+
+- Workflow: harden-schema-contract-and-verification
+- Files: src/credentials/store.rs, src/credentials/db_tests.rs, src/credentials/mod.rs, src/main.rs
+
