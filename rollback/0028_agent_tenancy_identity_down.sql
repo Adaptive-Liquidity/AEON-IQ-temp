@@ -37,6 +37,12 @@
 
 BEGIN;
 
+-- Never trust the caller's session search_path.  Without this a schema placed
+-- ahead of `public` could capture every unqualified name below, including the
+-- function drop, which names no schema at all.  `SET LOCAL` confines it to this
+-- transaction, so the operator's session is unchanged afterwards.
+SET LOCAL search_path = pg_catalog, public;
+
 -- ── Migration order ──────────────────────────────────────────────────────────
 -- Migration 0030 (agent grants) hangs a composite foreign key off
 -- `agents_tenant_id_id_key`, which this script drops.  Unwinding out of order
@@ -70,7 +76,7 @@ BEGIN
     IF NOT EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_schema = current_schema()
+        WHERE table_schema = 'public'
           AND table_name   = 'agents'
           AND column_name  = 'external_agent_id'
     ) THEN
@@ -82,7 +88,7 @@ BEGIN
     -- case a deployment of step 1 can actually be in, because `insert_agent` is
     -- not yet reachable from request handling.
     IF NOT EXISTS (
-        SELECT 1 FROM agents WHERE agent_id IS DISTINCT FROM external_agent_id
+        SELECT 1 FROM public.agents WHERE agent_id IS DISTINCT FROM external_agent_id
     ) THEN
         RETURN;
     END IF;
@@ -91,16 +97,16 @@ BEGIN
         -- Several agents share one caller-facing identifier: the baseline's
         -- global UNIQUE on agent_id can hold at most one of them.
         SELECT external_agent_id
-          FROM agents
+          FROM public.agents
          GROUP BY external_agent_id
         HAVING COUNT(*) > 1
         UNION ALL
         -- Or the identifier we would restore is already held by another row.
         SELECT a.external_agent_id
-          FROM agents a
+          FROM public.agents a
          WHERE a.agent_id IS DISTINCT FROM a.external_agent_id
            AND EXISTS (
-               SELECT 1 FROM agents b
+               SELECT 1 FROM public.agents b
                 WHERE b.agent_id = a.external_agent_id
                   AND b.id <> a.id
            )
@@ -123,21 +129,23 @@ BEGIN
     -- each constraint from `pg_get_constraintdef`, so the baseline definition
     -- comes back exactly as it was rather than as something re-typed here.
     CREATE TEMP TABLE _agents_fk_snapshot ON COMMIT DROP AS
-        SELECT c.conrelid::regclass::text  AS child_table,
+        SELECT format('%I.%I', n.nspname, cl.relname) AS child_table,
                c.conname                   AS constraint_name,
                pg_get_constraintdef(c.oid) AS definition,
                a.attname                   AS child_column
           FROM pg_constraint c
+          JOIN pg_class cl ON cl.oid = c.conrelid
+          JOIN pg_namespace n ON n.oid = cl.relnamespace
           JOIN unnest(c.conkey) AS k(attnum) ON TRUE
           JOIN pg_attribute a
             ON a.attrelid = c.conrelid AND a.attnum = k.attnum
          WHERE c.contype  = 'f'
-           AND c.confrelid = 'agents'::regclass
+           AND c.confrelid = 'public.agents'::regclass
            -- Only keys that target agents(agent_id).  Once §10 step 4 repoints
            -- dependants at agents(id), those must not be caught by this.
            AND c.confkey = ARRAY[(
                SELECT attnum FROM pg_attribute
-                WHERE attrelid = 'agents'::regclass AND attname = 'agent_id'
+                WHERE attrelid = 'public.agents'::regclass AND attname = 'agent_id'
            )];
 
     FOR fk IN SELECT * FROM _agents_fk_snapshot LOOP
@@ -147,13 +155,13 @@ BEGIN
 
     FOR fk IN SELECT * FROM _agents_fk_snapshot LOOP
         EXECUTE format(
-            'UPDATE %s AS c SET %I = a.external_agent_id FROM agents a '
+            'UPDATE %s AS c SET %I = a.external_agent_id FROM public.agents a '
             'WHERE c.%I = a.agent_id '
             '  AND a.agent_id IS DISTINCT FROM a.external_agent_id',
             fk.child_table, fk.child_column, fk.child_column);
     END LOOP;
 
-    UPDATE agents
+    UPDATE public.agents
        SET agent_id = external_agent_id
      WHERE agent_id IS DISTINCT FROM external_agent_id;
 
@@ -163,27 +171,27 @@ BEGIN
     END LOOP;
 END $$;
 
-DROP TRIGGER  IF EXISTS agents_bridge_identity_columns_trg ON agents;
-DROP FUNCTION IF EXISTS agents_bridge_identity_columns();
+DROP TRIGGER  IF EXISTS agents_bridge_identity_columns_trg ON public.agents;
+DROP FUNCTION IF EXISTS public.agents_bridge_identity_columns();
 
-ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_tenant_id_external_agent_id_key;
-ALTER TABLE agents DROP CONSTRAINT IF EXISTS agents_tenant_id_id_key;
+ALTER TABLE public.agents DROP CONSTRAINT IF EXISTS agents_tenant_id_external_agent_id_key;
+ALTER TABLE public.agents DROP CONSTRAINT IF EXISTS agents_tenant_id_id_key;
 
-DROP INDEX IF EXISTS idx_agents_unmapped;
+DROP INDEX IF EXISTS public.idx_agents_unmapped;
 
-ALTER TABLE agents DROP COLUMN IF EXISTS external_agent_id;
-ALTER TABLE agents DROP COLUMN IF EXISTS tenant_id;
+ALTER TABLE public.agents DROP COLUMN IF EXISTS external_agent_id;
+ALTER TABLE public.agents DROP COLUMN IF EXISTS tenant_id;
 
-DROP INDEX IF EXISTS idx_agent_tenancy_migrations_applied;
-DROP TABLE IF EXISTS agent_tenancy_migrations;
+DROP INDEX IF EXISTS public.idx_agent_tenancy_migrations_applied;
+DROP TABLE IF EXISTS public.agent_tenancy_migrations;
 
 -- Let `sqlx migrate run` re-apply 0028 cleanly afterwards.  Guarded because the
 -- ledger table does not exist on a database whose migrations were applied by
 -- some other tool.
 DO $$
 BEGIN
-    IF to_regclass('_sqlx_migrations') IS NOT NULL THEN
-        DELETE FROM _sqlx_migrations WHERE version = 28;
+    IF to_regclass('public._sqlx_migrations') IS NOT NULL THEN
+        DELETE FROM public._sqlx_migrations WHERE version = 28;
     END IF;
 END $$;
 
