@@ -314,34 +314,93 @@ pub async fn active_count(pool: &PgPool) -> Result<i64, StoreError> {
 // None of this runs when credential authentication is disabled, so a V1
 // deployment that never adopted credentials still starts exactly as before.
 
-/// `(column, information_schema.data_type, nullable)`.
-const REQUIRED_COLUMNS: &[(&str, &str, bool)] = &[
-    ("id", "uuid", false),
-    ("tenant_id", "uuid", false),
-    ("principal_id", "text", false),
-    ("secret_mac", "bytea", false),
-    ("mode", "text", false),
-    ("scopes", "ARRAY", false),
-    ("tenant_wide", "boolean", false),
-    ("status", "text", false),
-    ("created_at", "timestamp with time zone", false),
-    ("last_used_at", "timestamp with time zone", true),
-    ("revoked_at", "timestamp with time zone", true),
-    ("expires_at", "timestamp with time zone", true),
+/// `(column, information_schema.data_type, nullable, expected column_default)`.
+///
+/// The default is part of the contract, not decoration. [`insert`] omits
+/// `created_at` and relies on `DEFAULT now()`; strip that default and the column
+/// is still `TIMESTAMPTZ NOT NULL`, still passes a type-and-nullability check,
+/// and every `issue()` fails on a NULL violation — a schema the gate would have
+/// called "verified" while nothing could be issued against it.
+///
+/// `None` means "must have no default", checked exactly rather than ignored:
+/// this is an authentication table, and a value nobody declared is a value
+/// nobody reasoned about.
+const REQUIRED_COLUMNS: &[(&str, &str, bool, Option<&str>)] = &[
+    ("id", "uuid", false, None),
+    ("tenant_id", "uuid", false, None),
+    ("principal_id", "text", false, None),
+    ("secret_mac", "bytea", false, None),
+    ("mode", "text", false, None),
+    ("scopes", "ARRAY", false, Some("'{}'::text[]")),
+    ("tenant_wide", "boolean", false, Some("false")),
+    ("status", "text", false, Some("'active'::text")),
+    (
+        "created_at",
+        "timestamp with time zone",
+        false,
+        Some("now()"),
+    ),
+    ("last_used_at", "timestamp with time zone", true, None),
+    ("revoked_at", "timestamp with time zone", true, None),
+    ("expires_at", "timestamp with time zone", true, None),
 ];
 
-/// CHECK constraints that must exist **and be validated**. A `NOT VALID`
-/// constraint is enforced for new writes but was never checked against existing
-/// rows, so it does not establish the invariant for what is already stored.
-const REQUIRED_CHECKS: &[&str] = &[
-    "credentials_mode_ck",
-    "credentials_status_ck",
-    "credentials_secret_mac_len_ck",
-    "credentials_principal_id_ck",
-    "credentials_revoked_ck",
-    "credentials_expires_ck",
-    "credentials_scopes_ck",
+/// CHECK constraints that must exist, be **validated**, and carry the
+/// **expected expression**.
+///
+/// A `NOT VALID` constraint is enforced for new writes but was never checked
+/// against existing rows, so it does not establish the invariant for what is
+/// already stored.
+///
+/// Matching on name and validation state alone is not enough either: a
+/// pre-existing table can carry `credentials_principal_id_ck CHECK (true)` —
+/// right name, validated, and completely inert. Since `CredentialRow::validate`
+/// does not re-check `principal_id`, that would let an empty principal be
+/// written and then authenticate. So the expression itself is compared.
+///
+/// These are `pg_get_constraintdef` output, which is PostgreSQL's normalised
+/// rendering rather than the migration's source text — hence the extra
+/// parentheses and `::text` casts. It is stable within a major version;
+/// `the_migrated_schema_satisfies_the_contract` fails loudly on the pinned
+/// pg16 image if a future version renders them differently.
+const REQUIRED_CHECKS: &[(&str, &str)] = &[
+    (
+        "credentials_mode_ck",
+        "CHECK ((mode = ANY (ARRAY['legacy_only'::text, 'v2_required'::text])))",
+    ),
+    (
+        "credentials_status_ck",
+        "CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text, 'disabled'::text])))",
+    ),
+    (
+        "credentials_secret_mac_len_ck",
+        "CHECK ((octet_length(secret_mac) = 32))",
+    ),
+    (
+        "credentials_principal_id_ck",
+        "CHECK (((length(principal_id) >= 1) AND (length(principal_id) <= 255)))",
+    ),
+    (
+        "credentials_revoked_ck",
+        "CHECK (((status = 'revoked'::text) = (revoked_at IS NOT NULL)))",
+    ),
+    (
+        "credentials_expires_ck",
+        "CHECK (((expires_at IS NULL) OR (expires_at > created_at)))",
+    ),
+    (
+        "credentials_scopes_ck",
+        "CHECK ((scopes <@ ARRAY['recall:v2'::text, 'memory:read'::text, \
+         'memory:write'::text, 'memory:export'::text, 'memory:history'::text, \
+         'admin'::text, 'proxy:chat'::text]))",
+    ),
 ];
+
+/// Collapse whitespace so a comparison is not defeated by line wrapping in the
+/// constant above.
+fn normalise_sql(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 const REQUIRED_INDEXES: &[&str] = &[
     "credentials_pkey",
@@ -382,18 +441,18 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
     let mut problems = Vec::new();
 
     // ── Columns, types and nullability ───────────────────────────────────────
-    let columns: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT column_name, data_type, is_nullable \
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable, column_default \
            FROM information_schema.columns \
           WHERE table_schema = 'public' AND table_name = 'credentials'",
     )
     .fetch_all(pool)
     .await?;
 
-    for (name, want_type, want_nullable) in REQUIRED_COLUMNS {
-        match columns.iter().find(|(column, _, _)| column == name) {
+    for (name, want_type, want_nullable, want_default) in REQUIRED_COLUMNS {
+        match columns.iter().find(|(column, _, _, _)| column == name) {
             None => problems.push(format!("column `{name}` is missing")),
-            Some((_, got_type, got_nullable)) => {
+            Some((_, got_type, got_nullable, got_default)) => {
                 if got_type != want_type {
                     problems.push(format!(
                         "column `{name}` has type `{got_type}`, expected `{want_type}`"
@@ -411,6 +470,16 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
                         },
                     ));
                 }
+
+                let got_default = got_default.as_deref().map(normalise_sql);
+                let want_default = want_default.map(normalise_sql);
+                if got_default != want_default {
+                    problems.push(format!(
+                        "column `{name}` has default {}, expected {}",
+                        got_default.as_deref().unwrap_or("(none)"),
+                        want_default.as_deref().unwrap_or("(none)"),
+                    ));
+                }
             }
         }
     }
@@ -418,25 +487,26 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
     // ── Constraints ──────────────────────────────────────────────────────────
     // `conkey` ordinality is preserved so a primary key on the wrong column, or
     // a composite unique in the wrong order, is caught rather than assumed.
-    let constraints: Vec<(String, String, bool, String)> = sqlx::query_as(
+    let constraints: Vec<(String, String, bool, String, String)> = sqlx::query_as(
         "SELECT c.conname, c.contype::text, c.convalidated, \
                 COALESCE((SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
                             FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
                             JOIN pg_attribute a \
-                              ON a.attrelid = c.conrelid AND a.attnum = k.attnum), '') \
+                              ON a.attrelid = c.conrelid AND a.attnum = k.attnum), ''), \
+                pg_get_constraintdef(c.oid) \
            FROM pg_constraint c \
           WHERE c.conrelid = 'public.credentials'::regclass",
     )
     .fetch_all(pool)
     .await?;
 
-    match constraints.iter().find(|(_, kind, _, _)| kind == "p") {
+    match constraints.iter().find(|(_, kind, _, _, _)| kind == "p") {
         None => problems.push(
             "no PRIMARY KEY; `id` would not identify exactly one row, so a duplicate \
              credential id could authenticate as whichever row was returned"
                 .into(),
         ),
-        Some((name, _, _, cols)) if cols != "id" => problems.push(format!(
+        Some((name, _, _, cols, _)) if cols != "id" => problems.push(format!(
             "primary key `{name}` covers ({cols}), expected (id)"
         )),
         Some(_) => {}
@@ -444,7 +514,7 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
 
     if !constraints
         .iter()
-        .any(|(_, kind, _, cols)| kind == "u" && cols == "id,tenant_id")
+        .any(|(_, kind, _, cols, _)| kind == "u" && cols == "id,tenant_id")
     {
         problems.push(
             "no UNIQUE (id, tenant_id); step 3's credential_agent_grants composite \
@@ -453,16 +523,27 @@ pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
         );
     }
 
-    for want in REQUIRED_CHECKS {
+    for (want, want_def) in REQUIRED_CHECKS {
         match constraints
             .iter()
-            .find(|(name, kind, _, _)| name == want && kind == "c")
+            .find(|(name, kind, _, _, _)| name == want && kind == "c")
         {
             None => problems.push(format!("CHECK constraint `{want}` is missing")),
-            Some((_, _, false, _)) => problems.push(format!(
+            Some((_, _, false, _, _)) => problems.push(format!(
                 "CHECK constraint `{want}` is NOT VALID: it constrains new writes but \
                  existing rows were never verified against it"
             )),
+            // The name and validation state can both be right while the
+            // expression is inert — `CHECK (true)` under the expected name is
+            // the drift this catches.
+            Some((_, _, _, _, got_def)) if normalise_sql(got_def) != normalise_sql(want_def) => {
+                problems.push(format!(
+                    "CHECK constraint `{want}` has the expected name but a different \
+                     expression: found `{}`, expected `{}`",
+                    normalise_sql(got_def),
+                    normalise_sql(want_def),
+                ))
+            }
             Some(_) => {}
         }
     }

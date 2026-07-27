@@ -879,6 +879,103 @@ async fn an_unvalidated_constraint_is_rejected(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_check_with_the_right_name_but_a_weakened_expression_is_rejected(pool: PgPool) {
+    // The subtlest drift of all: right name, `convalidated = true`, and
+    // completely inert. `CredentialRow::validate` does not re-check
+    // `principal_id`, so under `CHECK (true)` an empty principal could be
+    // written and would then authenticate.
+    sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_principal_id_ck")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE credentials ADD CONSTRAINT credentials_principal_id_ck CHECK (true)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // It is present and validated — everything a name-and-state check looks at.
+    let (validated,): (bool,) = sqlx::query_as(
+        "SELECT convalidated FROM pg_constraint \
+          WHERE conrelid = 'credentials'::regclass AND conname = 'credentials_principal_id_ck'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(validated, "the weakened constraint is validated");
+
+    // …and the empty principal it was supposed to forbid is now writable.
+    sqlx::query(
+        "INSERT INTO credentials (id, tenant_id, principal_id, secret_mac, mode) \
+         VALUES ($1, $2, '', $3, 'v2_required')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(vec![0u8; 32])
+    .execute(&pool)
+    .await
+    .expect("CHECK (true) forbids nothing");
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains(
+            "credentials_principal_id_ck` has the expected name but a different expression"
+        ),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_column_default_is_rejected(pool: PgPool) {
+    // `insert` omits `created_at` and relies on DEFAULT now(). Strip the
+    // default and the column is still TIMESTAMPTZ NOT NULL — it passes a
+    // type-and-nullability check — but every issuance fails on a NULL
+    // violation. A gate that reported "verified" here would be worse than no
+    // gate, because it would be believed.
+    sqlx::query("ALTER TABLE credentials ALTER COLUMN created_at DROP DEFAULT")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Demonstrate the consequence before asserting the gate catches it.
+    let clock = Arc::new(TestClock::new(start()));
+    let auth = authenticator(&pool, &clock);
+    assert!(
+        auth.issue(spec(Uuid::new_v4(), &["memory:read"]))
+            .await
+            .is_err(),
+        "without the default, every issuance fails"
+    );
+
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains("`created_at` has default (none), expected now()"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unexpected_column_default_is_rejected(pool: PgPool) {
+    // Exact comparison, not merely "has a default": a value nobody declared is
+    // a value nobody reasoned about.
+    sqlx::query("ALTER TABLE credentials ALTER COLUMN status SET DEFAULT 'disabled'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(failure.contains("`status` has default"), "{failure}");
+
+    sqlx::query("ALTER TABLE credentials ALTER COLUMN tenant_id SET DEFAULT gen_random_uuid()")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let failure = schema_failure(&pool).await.expect("must be rejected");
+    assert!(
+        failure.contains("`tenant_id` has default gen_random_uuid(), expected (none)"),
+        "{failure}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn a_missing_composite_uniqueness_is_rejected(pool: PgPool) {
     sqlx::query("ALTER TABLE credentials DROP CONSTRAINT credentials_id_tenant_id_key")
         .execute(&pool)
