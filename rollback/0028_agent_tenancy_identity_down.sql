@@ -9,18 +9,22 @@
 --       -f rollback/0028_agent_tenancy_identity_down.sql
 --
 -- No identifier is lost.  0028 added columns and a record table but never
--- modified, moved or deleted pre-existing data.  `agents.agent_id`, its global
--- UNIQUE constraint and both dependent foreign keys (`sessions.agent_id`,
--- `archival_batches.agent_id`) are untouched by both the migration and this
--- script, so every V1 row and relationship survives the round trip.
+-- modified, moved or deleted pre-existing data, and it left `agents.agent_id`
+-- and its global UNIQUE constraint alone, so every V1 row and relationship
+-- survives the round trip untouched.
 --
 -- Rows created through the tenant-aware path need one extra step.  Their
 -- `agent_id` is a compatibility key (the row's UUID), not the caller-facing
 -- identifier, which lives in `external_agent_id`.  Dropping that column without
 -- restoring it first would leave the agent reachable only by a UUID it never
 -- advertised, and re-applying 0028 would then backfill `external_agent_id` from
--- the UUID — an identifier no operator input reproduces.  The first statement
--- below therefore moves the caller-facing identifier back into `agent_id`.
+-- the UUID — an identifier no operator input reproduces.  The first block below
+-- therefore moves the caller-facing identifier back into `agent_id`, which also
+-- means it briefly drops and re-creates the two foreign keys that reference
+-- that column (`sessions.agent_id`, `archival_batches.agent_id`) — see the
+-- comment on that block for why.  Both come back with their original
+-- definitions, and the block is skipped entirely when no identifier has moved,
+-- which is every step-1 deployment.
 --
 -- Where the baseline schema genuinely cannot hold the data — two tenants
 -- sharing one `external_agent_id`, which is exactly what the global UNIQUE on
