@@ -718,6 +718,7 @@ mod tests {
 mod db_tests {
     use super::*;
 
+    const MIGRATION_SQL: &str = include_str!("../migrations/0028_agent_tenancy_identity.sql");
     const ROLLBACK_SQL: &str = include_str!("../rollback/0028_agent_tenancy_identity_down.sql");
 
     fn tenant_a() -> Uuid {
@@ -1228,6 +1229,63 @@ mod db_tests {
             .await
             .unwrap();
         assert_eq!(count_unmapped_agents(&pool).await.unwrap(), 1);
+    }
+
+    // ── Upgrading a populated deployment ──────────────────────────────────────
+
+    /// `#[sqlx::test]` applies every migration to an *empty* database, so the
+    /// `external_agent_id` backfill in 0028 never sees a row there. This test
+    /// walks the path a real deployment takes: rewind to the 0027 baseline,
+    /// create agents exactly as a pre-0028 release did, then apply 0028.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn upgrading_a_populated_deployment_preserves_identifiers(pool: PgPool) {
+        sqlx::raw_sql(ROLLBACK_SQL).execute(&pool).await.unwrap();
+        assert!(!column_exists(&pool, "agents", "external_agent_id").await);
+
+        for agent in ["alpha", "beta"] {
+            legacy_upsert_agent(&pool, agent).await;
+        }
+        let ids_before: Vec<(String, Uuid)> =
+            sqlx::query_as("SELECT agent_id, id FROM agents ORDER BY agent_id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+
+        let rows: Vec<(String, String, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT agent_id, external_agent_id, id, tenant_id FROM agents ORDER BY agent_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        for (i, (agent_id, external_agent_id, id, tenant_id)) in rows.iter().enumerate() {
+            assert_eq!(
+                agent_id, external_agent_id,
+                "the caller-facing identifier must be preserved verbatim"
+            );
+            assert_eq!(
+                (agent_id.clone(), *id),
+                ids_before[i],
+                "existing agents keep their identifier and their UUID across the upgrade"
+            );
+            assert!(
+                tenant_id.is_none(),
+                "the migration must not assign a tenant to anything"
+            );
+        }
+
+        assert!(constraint_exists(&pool, "agents_tenant_id_external_agent_id_key").await);
+        assert!(constraint_exists(&pool, "agents_tenant_id_id_key").await);
+
+        // Re-applying is a no-op: every statement in 0028 is guarded.
+        sqlx::raw_sql(MIGRATION_SQL).execute(&pool).await.unwrap();
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM agents").await,
+            2
+        );
     }
 
     // ── Reversibility ─────────────────────────────────────────────────────────
