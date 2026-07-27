@@ -170,6 +170,15 @@ async fn main() -> anyhow::Result<()> {
     credentials::assert_registry_ready_for_multi_tenant(&db, tenancy_settings.multi_tenant_enabled)
         .await?;
 
+    // Before the authenticator exists, not after: `CREATE TABLE IF NOT EXISTS`
+    // will happily leave a pre-existing `credentials` table in place with no
+    // primary key or weakened CHECK constraints, and record the migration as
+    // applied. Skipped entirely while the subsystem is off, so a V1 deployment
+    // is unaffected.
+    if credential_auth_settings.enabled {
+        credentials::assert_schema_contract(&db).await?;
+    }
+
     let credential_auth = credential_auth_settings.build(db.clone())?.map(Arc::new);
     match credential_auth.as_ref() {
         Some(_) => tracing::info!(

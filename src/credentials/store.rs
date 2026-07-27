@@ -296,6 +296,298 @@ pub async fn active_count(pool: &PgPool) -> Result<i64, StoreError> {
     Ok(count)
 }
 
+// ── Schema contract ──────────────────────────────────────────────────────────
+//
+// `CREATE TABLE IF NOT EXISTS` is idempotent in the sense that re-running it is
+// harmless, but it is *not* a guarantee about what is there. If a table named
+// `credentials` already exists — hand-made, restored from an older dump, or
+// created by something else entirely — PostgreSQL skips the whole definition
+// and the migration records success against a table that may have no primary
+// key, no MAC-length check and no per-tenant uniqueness.
+//
+// For an authentication authority that is not acceptable: `fetch` assumes `id`
+// identifies exactly one authoritative row, and the CHECK constraints are what
+// make a truncated MAC or a forged status unrepresentable. So when credential
+// authentication is enabled the schema is *proved* before the authenticator is
+// built, and startup fails closed on any mismatch.
+//
+// None of this runs when credential authentication is disabled, so a V1
+// deployment that never adopted credentials still starts exactly as before.
+
+/// `(column, information_schema.data_type, nullable, expected column_default)`.
+///
+/// The default is part of the contract, not decoration. [`insert`] omits
+/// `created_at` and relies on `DEFAULT now()`; strip that default and the column
+/// is still `TIMESTAMPTZ NOT NULL`, still passes a type-and-nullability check,
+/// and every `issue()` fails on a NULL violation — a schema the gate would have
+/// called "verified" while nothing could be issued against it.
+///
+/// `None` means "must have no default", checked exactly rather than ignored:
+/// this is an authentication table, and a value nobody declared is a value
+/// nobody reasoned about.
+const REQUIRED_COLUMNS: &[(&str, &str, bool, Option<&str>)] = &[
+    ("id", "uuid", false, None),
+    ("tenant_id", "uuid", false, None),
+    ("principal_id", "text", false, None),
+    ("secret_mac", "bytea", false, None),
+    ("mode", "text", false, None),
+    ("scopes", "ARRAY", false, Some("'{}'::text[]")),
+    ("tenant_wide", "boolean", false, Some("false")),
+    ("status", "text", false, Some("'active'::text")),
+    (
+        "created_at",
+        "timestamp with time zone",
+        false,
+        Some("now()"),
+    ),
+    ("last_used_at", "timestamp with time zone", true, None),
+    ("revoked_at", "timestamp with time zone", true, None),
+    ("expires_at", "timestamp with time zone", true, None),
+];
+
+/// CHECK constraints that must exist, be **validated**, and carry the
+/// **expected expression**.
+///
+/// A `NOT VALID` constraint is enforced for new writes but was never checked
+/// against existing rows, so it does not establish the invariant for what is
+/// already stored.
+///
+/// Matching on name and validation state alone is not enough either: a
+/// pre-existing table can carry `credentials_principal_id_ck CHECK (true)` —
+/// right name, validated, and completely inert. Since `CredentialRow::validate`
+/// does not re-check `principal_id`, that would let an empty principal be
+/// written and then authenticate. So the expression itself is compared.
+///
+/// These are `pg_get_constraintdef` output, which is PostgreSQL's normalised
+/// rendering rather than the migration's source text — hence the extra
+/// parentheses and `::text` casts. It is stable within a major version;
+/// `the_migrated_schema_satisfies_the_contract` fails loudly on the pinned
+/// pg16 image if a future version renders them differently.
+const REQUIRED_CHECKS: &[(&str, &str)] = &[
+    (
+        "credentials_mode_ck",
+        "CHECK ((mode = ANY (ARRAY['legacy_only'::text, 'v2_required'::text])))",
+    ),
+    (
+        "credentials_status_ck",
+        "CHECK ((status = ANY (ARRAY['active'::text, 'revoked'::text, 'disabled'::text])))",
+    ),
+    (
+        "credentials_secret_mac_len_ck",
+        "CHECK ((octet_length(secret_mac) = 32))",
+    ),
+    (
+        "credentials_principal_id_ck",
+        "CHECK (((length(principal_id) >= 1) AND (length(principal_id) <= 255)))",
+    ),
+    (
+        "credentials_revoked_ck",
+        "CHECK (((status = 'revoked'::text) = (revoked_at IS NOT NULL)))",
+    ),
+    (
+        "credentials_expires_ck",
+        "CHECK (((expires_at IS NULL) OR (expires_at > created_at)))",
+    ),
+    (
+        "credentials_scopes_ck",
+        "CHECK ((scopes <@ ARRAY['recall:v2'::text, 'memory:read'::text, \
+         'memory:write'::text, 'memory:export'::text, 'memory:history'::text, \
+         'admin'::text, 'proxy:chat'::text]))",
+    ),
+];
+
+/// Collapse whitespace so a comparison is not defeated by line wrapping in the
+/// constant above.
+fn normalise_sql(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+const REQUIRED_INDEXES: &[&str] = &[
+    "credentials_pkey",
+    "credentials_id_tenant_id_key",
+    "idx_credentials_tenant_principal",
+    "idx_credentials_active",
+];
+
+#[derive(Debug, thiserror::Error)]
+pub enum SchemaError {
+    /// The schema could not be inspected at all. Fails closed: an
+    /// unverifiable schema is treated exactly like a wrong one.
+    #[error("the credential schema could not be inspected")]
+    Backend(#[from] sqlx::Error),
+    #[error(
+        "the `credentials` table does not match the contract this build requires:\n{}",
+        .0.iter().map(|p| format!("  • {p}")).collect::<Vec<_>>().join("\n")
+    )]
+    Contract(Vec<String>),
+}
+
+/// Prove the `credentials` table matches what this build assumes.
+///
+/// Collects **every** mismatch rather than failing on the first, so an operator
+/// repairing a drifted schema sees the whole list in one startup attempt
+/// instead of discovering it one restart at a time.
+pub async fn verify_schema(pool: &PgPool) -> Result<(), SchemaError> {
+    let (present,): (bool,) =
+        sqlx::query_as("SELECT to_regclass('public.credentials') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    if !present {
+        return Err(SchemaError::Contract(vec![
+            "table `credentials` does not exist; migration 0029 has not been applied".into(),
+        ]));
+    }
+
+    let mut problems = Vec::new();
+
+    // ── Columns, types and nullability ───────────────────────────────────────
+    let columns: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT column_name, data_type, is_nullable, column_default \
+           FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'credentials'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (name, want_type, want_nullable, want_default) in REQUIRED_COLUMNS {
+        match columns.iter().find(|(column, _, _, _)| column == name) {
+            None => problems.push(format!("column `{name}` is missing")),
+            Some((_, got_type, got_nullable, got_default)) => {
+                if got_type != want_type {
+                    problems.push(format!(
+                        "column `{name}` has type `{got_type}`, expected `{want_type}`"
+                    ));
+                }
+                let got_nullable = got_nullable == "YES";
+                if got_nullable != *want_nullable {
+                    problems.push(format!(
+                        "column `{name}` is {}, expected {}",
+                        if got_nullable { "nullable" } else { "NOT NULL" },
+                        if *want_nullable {
+                            "nullable"
+                        } else {
+                            "NOT NULL"
+                        },
+                    ));
+                }
+
+                let got_default = got_default.as_deref().map(normalise_sql);
+                let want_default = want_default.map(normalise_sql);
+                if got_default != want_default {
+                    problems.push(format!(
+                        "column `{name}` has default {}, expected {}",
+                        got_default.as_deref().unwrap_or("(none)"),
+                        want_default.as_deref().unwrap_or("(none)"),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Constraints ──────────────────────────────────────────────────────────
+    // `conkey` ordinality is preserved so a primary key on the wrong column, or
+    // a composite unique in the wrong order, is caught rather than assumed.
+    let constraints: Vec<(String, String, bool, String, String)> = sqlx::query_as(
+        "SELECT c.conname, c.contype::text, c.convalidated, \
+                COALESCE((SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
+                            FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                            JOIN pg_attribute a \
+                              ON a.attrelid = c.conrelid AND a.attnum = k.attnum), ''), \
+                pg_get_constraintdef(c.oid) \
+           FROM pg_constraint c \
+          WHERE c.conrelid = 'public.credentials'::regclass",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    match constraints.iter().find(|(_, kind, _, _, _)| kind == "p") {
+        None => problems.push(
+            "no PRIMARY KEY; `id` would not identify exactly one row, so a duplicate \
+             credential id could authenticate as whichever row was returned"
+                .into(),
+        ),
+        Some((name, _, _, cols, _)) if cols != "id" => problems.push(format!(
+            "primary key `{name}` covers ({cols}), expected (id)"
+        )),
+        Some(_) => {}
+    }
+
+    if !constraints
+        .iter()
+        .any(|(_, kind, _, cols, _)| kind == "u" && cols == "id,tenant_id")
+    {
+        problems.push(
+            "no UNIQUE (id, tenant_id); step 3's credential_agent_grants composite \
+             foreign key has no target"
+                .into(),
+        );
+    }
+
+    for (want, want_def) in REQUIRED_CHECKS {
+        match constraints
+            .iter()
+            .find(|(name, kind, _, _, _)| name == want && kind == "c")
+        {
+            None => problems.push(format!("CHECK constraint `{want}` is missing")),
+            Some((_, _, false, _, _)) => problems.push(format!(
+                "CHECK constraint `{want}` is NOT VALID: it constrains new writes but \
+                 existing rows were never verified against it"
+            )),
+            // The name and validation state can both be right while the
+            // expression is inert — `CHECK (true)` under the expected name is
+            // the drift this catches.
+            Some((_, _, _, _, got_def)) if normalise_sql(got_def) != normalise_sql(want_def) => {
+                problems.push(format!(
+                    "CHECK constraint `{want}` has the expected name but a different \
+                     expression: found `{}`, expected `{}`",
+                    normalise_sql(got_def),
+                    normalise_sql(want_def),
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+
+    // ── Indexes ──────────────────────────────────────────────────────────────
+    let indexes: Vec<(String,)> = sqlx::query_as(
+        "SELECT indexname FROM pg_indexes \
+          WHERE schemaname = 'public' AND tablename = 'credentials'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for want in REQUIRED_INDEXES {
+        if !indexes.iter().any(|(name,)| name == want) {
+            problems.push(format!("index `{want}` is missing"));
+        }
+    }
+
+    // ── Privileges ───────────────────────────────────────────────────────────
+    // Checked at startup rather than discovered at the first request, when the
+    // failure would surface as an authentication outage under load.
+    let (select, insert, update): (bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('public.credentials', 'SELECT'), \
+                has_table_privilege('public.credentials', 'INSERT'), \
+                has_table_privilege('public.credentials', 'UPDATE')",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    for (granted, privilege) in [(select, "SELECT"), (insert, "INSERT"), (update, "UPDATE")] {
+        if !granted {
+            problems.push(format!(
+                "the connected role lacks {privilege} on `credentials`"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(SchemaError::Contract(problems))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
