@@ -227,7 +227,9 @@ fn parse_tenant_map(raw: &str) -> Result<BTreeMap<String, Uuid>> {
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
-    value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 // ── Backfill ─────────────────────────────────────────────────────────────────
@@ -251,7 +253,10 @@ pub struct BackfillReport {
 /// run with the same plan is a no-op. A run whose mode or declared tenant
 /// disagrees with the recorded migration is rejected rather than silently
 /// re-assigning rows that a previous mode already placed.
-pub async fn run_legacy_backfill(pool: &PgPool, plan: &LegacyTenancyPlan) -> Result<BackfillReport> {
+pub async fn run_legacy_backfill(
+    pool: &PgPool,
+    plan: &LegacyTenancyPlan,
+) -> Result<BackfillReport> {
     let mut tx = pool.begin().await?;
 
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -629,7 +634,8 @@ mod tests {
 
     #[test]
     fn mapped_mode_rejects_an_empty_map() {
-        let error = TenancySettings::from_values(env(Some("mapped"), None, Some("{}"))).unwrap_err();
+        let error =
+            TenancySettings::from_values(env(Some("mapped"), None, Some("{}"))).unwrap_err();
 
         assert!(
             format!("{error:#}").contains("empty"),
@@ -731,34 +737,48 @@ mod db_tests {
             .unwrap();
     }
 
-    async fn scalar_i64(pool: &PgPool, sql: &str) -> i64 {
+    /// Every query below is a literal with bound parameters — sqlx 0.9 requires
+    /// `&'static str`, and interpolating identifiers into test SQL is a habit
+    /// worth not forming.
+    async fn scalar_i64(pool: &PgPool, sql: &'static str) -> i64 {
         let row: (i64,) = sqlx::query_as(sql).fetch_one(pool).await.unwrap();
         row.0
     }
 
+    async fn count_agents_in_tenant(pool: &PgPool, tenant_id: Uuid) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM agents WHERE tenant_id = $1")
+                .bind(tenant_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        row.0
+    }
+
     async fn constraint_exists(pool: &PgPool, name: &str) -> bool {
-        scalar_i64(
-            pool,
-            &format!(
-                "SELECT COUNT(*)::bigint FROM pg_constraint \
-                 WHERE conname = '{name}' AND conrelid = 'agents'::regclass"
-            ),
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM pg_constraint \
+             WHERE conname = $1 AND conrelid = 'agents'::regclass",
         )
+        .bind(name)
+        .fetch_one(pool)
         .await
-            > 0
+        .unwrap();
+        row.0 > 0
     }
 
     async fn column_exists(pool: &PgPool, table: &str, column: &str) -> bool {
-        scalar_i64(
-            pool,
-            &format!(
-                "SELECT COUNT(*)::bigint FROM information_schema.columns \
-                 WHERE table_schema = current_schema() \
-                   AND table_name = '{table}' AND column_name = '{column}'"
-            ),
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*)::bigint FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = $1 AND column_name = $2",
         )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
         .await
-            > 0
+        .unwrap();
+        row.0 > 0
     }
 
     fn mapped(pairs: &[(&str, Uuid)]) -> LegacyTenancyPlan {
@@ -921,19 +941,13 @@ mod db_tests {
         assert_eq!(second.agents_unmapped, first.agents_unmapped);
 
         // Assignments are untouched and the ledger gained no no-op row.
+        assert_eq!(count_agents_in_tenant(&pool, tenant_a()).await, 2);
         assert_eq!(
             scalar_i64(
                 &pool,
-                &format!(
-                    "SELECT COUNT(*)::bigint FROM agents WHERE tenant_id = '{}'",
-                    tenant_a()
-                ),
+                "SELECT COUNT(*)::bigint FROM agent_tenancy_migrations"
             )
             .await,
-            2
-        );
-        assert_eq!(
-            scalar_i64(&pool, "SELECT COUNT(*)::bigint FROM agent_tenancy_migrations").await,
             1
         );
     }
@@ -977,7 +991,9 @@ mod db_tests {
         );
         // The original assignment survived the rejected run.
         assert_eq!(
-            resolve_agent_uuid(&pool, tenant_b(), "alpha").await.unwrap(),
+            resolve_agent_uuid(&pool, tenant_b(), "alpha")
+                .await
+                .unwrap(),
             None
         );
         assert!(resolve_agent_uuid(&pool, tenant_a(), "alpha")
@@ -1219,7 +1235,9 @@ mod db_tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn rollback_restores_the_baseline_schema_without_data_loss(pool: PgPool) {
         legacy_upsert_agent(&pool, "legacy-agent").await;
-        insert_agent(&pool, tenant_a(), "scoped-agent").await.unwrap();
+        insert_agent(&pool, tenant_a(), "scoped-agent")
+            .await
+            .unwrap();
         run_legacy_backfill(
             &pool,
             &LegacyTenancyPlan::SingleTenant {
