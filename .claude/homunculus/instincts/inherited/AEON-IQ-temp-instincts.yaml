@@ -1,0 +1,319 @@
+# Instincts generated from https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+# Generated: 2026-07-27T13:18:16.873Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: AEON-IQ-temp-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: fix, ci
+
+## Evidence
+
+- 2 commits analyzed
+- Detected conventional commit pattern
+- Examples: fix(dashboard): patch the vulnerable direct dependencies behind the audit gate, ci(dashboard): gate on the production tree, keep the full tree visible
+
+---
+id: AEON-IQ-temp-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Commit Length
+
+## Action
+
+Write moderate-length commit messages (~74 characters)
+
+## Evidence
+
+- Average commit message length: 74 chars
+- Based on 2 commits
+
+---
+id: AEON-IQ-temp-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: AEON-IQ-temp-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: AEON-IQ-temp-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: AEON-IQ-temp-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# AEON IQ Temp Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: aeon-iq-temp-instinct-file-naming
+trigger: "When creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct File Naming
+
+## Action
+
+Name the file using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.files: camelCase
+
+---
+id: aeon-iq-temp-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Function Naming
+
+## Action
+
+Name the function using camelCase
+
+## Evidence
+
+- Pattern in namingConventions.functions: camelCase
+
+---
+id: aeon-iq-temp-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Class Naming
+
+## Action
+
+Name the class using PascalCase
+
+## Evidence
+
+- Pattern in namingConventions.classes: PascalCase
+
+---
+id: aeon-iq-temp-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Constant Naming
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE
+
+## Evidence
+
+- Pattern in namingConventions.constants: SCREAMING_SNAKE_CASE
+
+---
+id: aeon-iq-temp-instinct-import-style
+trigger: "When importing modules"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Import Style
+
+## Action
+
+Use relative import paths
+
+## Evidence
+
+- Pattern in importStyle: relative
+
+---
+id: aeon-iq-temp-instinct-export-style
+trigger: "When exporting from a module"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: named
+
+---
+id: aeon-iq-temp-instinct-typescript
+trigger: "When writing code"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Typescript
+
+## Action
+
+Use TypeScript as the programming language
+
+## Evidence
+
+- Pattern in language: TypeScript
+
+---
+id: aeon-iq-temp-instinct-test-location
+trigger: "When adding new tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Test Location
+
+## Action
+
+Place test files in a separate location from source files
+
+## Evidence
+
+- Pattern in architecture.folderStructure.testLocation: separate
+
+---
+id: aeon-iq-temp-instinct-commit-prefix
+trigger: "When making a commit"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Commit Prefix
+
+## Action
+
+Prefix the commit message with a conventional type such as 'fix' or 'ci'
+
+## Evidence
+
+- Pattern in commits.type: conventional
+- Seen in commit: fix(dashboard): patch the vulnerable direct dependencies behind the audit gate
+- Seen in commit: ci(dashboard): gate on the production tree, keep the full tree visible
+
+---
+id: aeon-iq-temp-instinct-commit-length
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: Adaptive-Liquidity/AEON-IQ-temp
+---
+
+# Aeon Iq Temp Instinct Commit Length
+
+## Action
+
+Keep the commit message concise, around 74 characters on average
+
+## Evidence
+
+- Pattern in commits.averageLength: 74
+
