@@ -234,6 +234,10 @@ pub struct MigrationPlan {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct TableEntry {
     pub table: &'static str,
+    /// The schema objects on this table that the *current* scanner relies on:
+    /// the keys its row identity uses, and the keys or foreign keys its
+    /// ownership joins assume. Verified against the catalog, never assumed.
+    pub schema_contract: &'static [SchemaObjectContract],
     /// How this table's example row identifier is built. Static, so no catalog
     /// value ever reaches query construction.
     pub row_identity: RowIdentity,
@@ -323,16 +327,28 @@ impl RowIdentity {
 pub enum SessionRole {
     /// Rows are addressed by their session; a missing session is a broken row.
     Canonical,
-    /// The agent owns the row; the session is context that must agree.
+    /// The agent owns the row, and the session is context that must *agree* —
+    /// a genuine secondary consistency path, checked and reported on mismatch.
+    ///
+    /// No table reaches it today. The five that once did turned out to have
+    /// session references that can legitimately outrun their `sessions` row, so
+    /// they are `ContextOnly` instead: context checked against nothing, because
+    /// there is nothing sound to check it against. The distinction is worth
+    /// keeping — a future table whose session row is written atomically with it
+    /// would belong here, not there.
+    #[allow(dead_code)]
     SecondaryToAgent,
     /// A memory owns the row; the session is context that must agree.
     ///
-    /// Declared for completeness of the three possible conclusions. No table
-    /// in the current schema reaches it: every session-bearing table resolved
-    /// to an agent, not to a memory. Kept so a future table can record this
-    /// conclusion without reopening the enum.
+    /// Declared for completeness. No table in the current schema reaches it:
+    /// every session-bearing table resolved to an agent, not to a memory.
     #[allow(dead_code)]
     SecondaryToMemoryLineage,
+    /// The field was inspected and is deliberately **not** an ownership path.
+    ///
+    /// Distinct from recording no conclusion at all: absent semantics say
+    /// *not investigated*, this says *investigated and non-authoritative*.
+    ContextOnly,
 }
 
 impl SessionRole {
@@ -341,6 +357,7 @@ impl SessionRole {
             Self::Canonical => "CANONICAL",
             Self::SecondaryToAgent => "SECONDARY_TO_AGENT",
             Self::SecondaryToMemoryLineage => "SECONDARY_TO_MEMORY_LINEAGE",
+            Self::ContextOnly => "CONTEXT_ONLY",
         }
     }
 }
@@ -358,6 +375,215 @@ const SURROGATE_ID: RowIdentity = RowIdentity {
         kind: IdentityKind::Surrogate,
     }],
 };
+
+/// What kind of constraint `pg_constraint` should report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConstraintKind {
+    PrimaryKey,
+    Unique,
+    ForeignKey,
+}
+
+impl ConstraintKind {
+    /// The `pg_constraint.contype` character.
+    ///
+    /// Unused in this checkpoint: it is the value the current-schema verifier
+    /// will compare against, declared beside the enum so the mapping does not
+    /// have to be re-derived at the call site when that lands.
+    #[allow(dead_code)]
+    pub const fn contype(self) -> &'static str {
+        match self {
+            Self::PrimaryKey => "p",
+            Self::Unique => "u",
+            Self::ForeignKey => "f",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryKey => "PRIMARY KEY",
+            Self::Unique => "UNIQUE",
+            Self::ForeignKey => "FOREIGN KEY",
+        }
+    }
+}
+
+/// A schema object the *current* scanner relies on.
+///
+/// Two shapes rather than one, because a constraint and a standalone index
+/// expose different validity properties, and conflating them would let a
+/// partial unique index — which guarantees nothing outside its predicate —
+/// satisfy a uniqueness requirement.
+///
+/// Verified through catalog OIDs and attribute numbers (`conkey`, `confkey`,
+/// `indkey`), never by matching rendered SQL: `pg_get_constraintdef` output is
+/// a presentation format, and a substring test over it is not a check.
+///
+/// These describe what exists **today**. Step 4B's planned constraints live in
+/// [`MigrationPlan`] and are deliberately never required here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "object", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SchemaObjectContract {
+    Constraint {
+        name: &'static str,
+        kind: ConstraintKind,
+        /// Ordered — `conkey` order is part of the guarantee.
+        local_columns: &'static [&'static str],
+        /// `None` for primary keys and unique constraints.
+        referenced_table: Option<&'static str>,
+        /// Ordered, matching `confkey`.
+        referenced_columns: &'static [&'static str],
+        /// Whether `convalidated` must be true. A `NOT VALID` foreign key
+        /// enforces new rows only, so it does not back a join the scanner
+        /// treats as authoritative.
+        require_validated: bool,
+    },
+    UniqueIndex {
+        name: &'static str,
+        /// Ordered, matching `indkey`.
+        columns: &'static [&'static str],
+        require_unique: bool,
+        require_valid: bool,
+        require_ready: bool,
+        /// A partial index guarantees uniqueness only over its predicate, so it
+        /// cannot back a join that assumes at most one match.
+        require_non_partial: bool,
+        /// An expression index does not constrain the bare columns.
+        require_no_expressions: bool,
+    },
+}
+
+impl SchemaObjectContract {
+    /// Unused in this checkpoint: the verifier will look each object up by
+    /// name in `pg_constraint` / `pg_index`. `describe` destructures the field
+    /// directly, so nothing else needs the accessor yet.
+    #[allow(dead_code)]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Constraint { name, .. } | Self::UniqueIndex { name, .. } => name,
+        }
+    }
+
+    /// One line for the artifacts. Spells out the referenced columns and the
+    /// strictness flags, because those are the parts a reader would otherwise
+    /// have to take on trust.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Constraint {
+                name,
+                kind,
+                local_columns,
+                referenced_table,
+                referenced_columns,
+                require_validated,
+            } => {
+                let mut out = format!("`{name}` {} ({})", kind.as_str(), local_columns.join(", "));
+                if let Some(table) = referenced_table {
+                    out.push_str(&format!(
+                        " REFERENCES {table}({})",
+                        referenced_columns.join(", ")
+                    ));
+                }
+                if *require_validated {
+                    out.push_str(", validated");
+                }
+                out
+            }
+            Self::UniqueIndex {
+                name,
+                columns,
+                require_unique,
+                require_valid,
+                require_ready,
+                require_non_partial,
+                require_no_expressions,
+            } => {
+                let mut flags = Vec::new();
+                if *require_unique {
+                    flags.push("unique");
+                }
+                if *require_valid {
+                    flags.push("valid");
+                }
+                if *require_ready {
+                    flags.push("ready");
+                }
+                if *require_non_partial {
+                    flags.push("non-partial");
+                }
+                if *require_no_expressions {
+                    flags.push("no expressions");
+                }
+                format!(
+                    "`{name}` INDEX ({}) - {}",
+                    columns.join(", "),
+                    flags.join(", ")
+                )
+            }
+        }
+    }
+}
+
+/// A standalone unique index, with the strict defaults.
+const fn unique_index(
+    name: &'static str,
+    columns: &'static [&'static str],
+) -> SchemaObjectContract {
+    SchemaObjectContract::UniqueIndex {
+        name,
+        columns,
+        require_unique: true,
+        require_valid: true,
+        require_ready: true,
+        require_non_partial: true,
+        require_no_expressions: true,
+    }
+}
+
+const fn primary_key(
+    name: &'static str,
+    local_columns: &'static [&'static str],
+) -> SchemaObjectContract {
+    SchemaObjectContract::Constraint {
+        name,
+        kind: ConstraintKind::PrimaryKey,
+        local_columns,
+        referenced_table: None,
+        referenced_columns: &[],
+        require_validated: true,
+    }
+}
+
+const fn unique_constraint(
+    name: &'static str,
+    local_columns: &'static [&'static str],
+) -> SchemaObjectContract {
+    SchemaObjectContract::Constraint {
+        name,
+        kind: ConstraintKind::Unique,
+        local_columns,
+        referenced_table: None,
+        referenced_columns: &[],
+        require_validated: true,
+    }
+}
+
+const fn foreign_key(
+    name: &'static str,
+    local_columns: &'static [&'static str],
+    referenced_table: &'static str,
+    referenced_columns: &'static [&'static str],
+) -> SchemaObjectContract {
+    SchemaObjectContract::Constraint {
+        name,
+        kind: ConstraintKind::ForeignKey,
+        local_columns,
+        referenced_table: Some(referenced_table),
+        referenced_columns,
+        require_validated: true,
+    }
+}
 
 // ── Shared plan fragments ───────────────────────────────────────────────────
 // Most tables owe the same work, so the differences are what stand out.
@@ -475,6 +701,7 @@ const fn agent_child_plan(
 pub const REGISTRY: &[TableEntry] = &[
     TableEntry {
         table: "agent_tenancy_migrations",
+        schema_contract: &[primary_key("agent_tenancy_migrations_pkey", &["id"])],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::SystemGlobal,
@@ -511,6 +738,23 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "agents",
+        schema_contract: &[
+            primary_key("agents_pkey", &["id"]),
+            // Every AgentText path joins on this; without it a join can match
+            // more than one agent and ownership becomes ambiguous.
+            unique_constraint("agents_agent_id_key", &["agent_id"]),
+            // Backs no scanner join, which is exactly why deriving this set
+            // from join-reachability alone missed it. It backs the tenancy
+            // invariant itself: an external identifier is unique *per tenant*,
+            // not globally, so two tenants can each own an agent by the same
+            // name without colliding.
+            unique_constraint(
+                "agents_tenant_id_external_agent_id_key",
+                &["tenant_id", "external_agent_id"],
+            ),
+            // The composite target the grant foreign key resolves through.
+            unique_constraint("agents_tenant_id_id_key", &["tenant_id", "id"]),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::TenantRoot,
@@ -534,7 +778,16 @@ pub const REGISTRY: &[TableEntry] = &[
             initial_nullability: "already present from migration 0028",
             backfill_source: "already backfilled by step 1 under an explicit \
                               LEGACY_MIGRATION_MODE",
-            required_zero_codes: &["UNMAPPED_AGENT", "FUTURE_TENANT_UNIQUENESS_COLLISION"],
+            // A tenant root whose own tenant is NULL is itself an unmapped
+            // agent, and it also emits NULL_OWNERSHIP_LINK / LEGACY_UNMAPPED.
+            // Gating only on UNMAPPED_AGENT let tranche 1 read READY while its
+            // planned SET NOT NULL could not possibly succeed.
+            required_zero_codes: &[
+                "LEGACY_UNMAPPED",
+                "NULL_OWNERSHIP_LINK",
+                "UNMAPPED_AGENT",
+                "FUTURE_TENANT_UNIQUENESS_COLLISION",
+            ],
             required_pre_validation_indexes: &["agents_tenant_id_id_key (exists)"],
             planned_composite_fks: NONE_REQUIRED,
             not_valid_appropriate: false,
@@ -560,6 +813,7 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "amp_controller_state",
+        schema_contract: &[primary_key("amp_controller_state_pkey", &["agent_id"])],
         row_identity: RowIdentity { columns: &[IdentityColumn { name: "agent_id", kind: IdentityKind::CallerText }] },
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -586,6 +840,15 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "archival_batches",
+        schema_contract: &[
+            primary_key("archival_batches_pkey", &["id"]),
+            foreign_key(
+                "archival_batches_agent_id_fkey",
+                &["agent_id"],
+                "agents",
+                &["agent_id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -609,6 +872,7 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "audit_logs",
+        schema_contract: &[primary_key("audit_logs_pkey", &["id"])],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -651,6 +915,21 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "co_access_edges",
+        schema_contract: &[
+            primary_key("co_access_edges_pkey", &["memory_a", "memory_b"]),
+            foreign_key(
+                "co_access_edges_memory_a_fkey",
+                &["memory_a"],
+                "memories",
+                &["id"],
+            ),
+            foreign_key(
+                "co_access_edges_memory_b_fkey",
+                &["memory_b"],
+                "memories",
+                &["id"],
+            ),
+        ],
         row_identity: RowIdentity { columns: &[IdentityColumn { name: "memory_a", kind: IdentityKind::Surrogate }, IdentityColumn { name: "memory_b", kind: IdentityKind::Surrogate }] },
         session_semantics: None,
         class: TableClass::MemoryLineageChild,
@@ -688,15 +967,22 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "cognitive_hypervisor_timeline",
+        schema_contract: &[primary_key("cognitive_hypervisor_timeline_pkey", &["id"])],
         row_identity: SURROGATE_ID,
-        session_semantics: Some(SessionSemantics { role: SessionRole::SecondaryToAgent, evidence: "Read by `WHERE agent_id = $1` and `WHERE id = $1`; the hash chain is per-agent. No query selects by session." }),
+        session_semantics: Some(SessionSemantics { role: SessionRole::ContextOnly, evidence: "Read by `WHERE agent_id = $1` and `WHERE id = $1`; the hash chain is per-agent. No query selects by session." }),
         class: TableClass::DirectAgentChild,
         canonical_path: Some(agent_text("agent_id", false)),
-        secondary_paths: &[session_path("agent_id", "session_id", true)],
+        secondary_paths: &[],
         consistency: Some(
-            "Where `session_id` is present the named session must belong to the same agent. The \
-             session is never a fallback: if the two disagree the row is reported \
-             OWNERSHIP_PATH_DISAGREEMENT rather than resolved by preference.",
+            "Measured, then deliberately excluded from ownership. `sessions` rows are created by \
+             exactly one code path in the codebase, the working-memory upsert, and it runs \
+             at the *end* of successful extraction. A pending job, a permanently failed job, \
+             or a memory written before that upsert therefore legitimately references a \
+             session that does not exist. Registering the session as an ownership or \
+             consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on \
+             entirely normal states, so it is recorded as context only rather than dropped \
+             silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an \
+             absent conclusion would only say *not investigated*.",
         ),
         tranche: Tranche::Memories,
         plan: agent_child_plan(
@@ -715,6 +1001,26 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "credential_agent_grants",
+        schema_contract: &[
+            primary_key(
+                "credential_agent_grants_pkey",
+                &["credential_id", "agent_uuid"],
+            ),
+            // The pair that forces one tenant across both parents. This table's
+            // entire consistency claim rests on them.
+            foreign_key(
+                "credential_agent_grants_agent_fkey",
+                &["tenant_id", "agent_uuid"],
+                "agents",
+                &["tenant_id", "id"],
+            ),
+            foreign_key(
+                "credential_agent_grants_credential_fkey",
+                &["credential_id", "tenant_id"],
+                "credentials",
+                &["id", "tenant_id"],
+            ),
+        ],
         row_identity: RowIdentity { columns: &[IdentityColumn { name: "credential_id", kind: IdentityKind::Surrogate }, IdentityColumn { name: "agent_uuid", kind: IdentityKind::Surrogate }] },
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -764,6 +1070,10 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "credentials",
+        schema_contract: &[
+            primary_key("credentials_pkey", &["id"]),
+            unique_constraint("credentials_id_tenant_id_key", &["id", "tenant_id"]),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::TenantGlobal,
@@ -806,6 +1116,7 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "entities",
+        schema_contract: &[primary_key("entities_pkey", &["id"])],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -841,14 +1152,22 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "extraction_jobs",
+        schema_contract: &[primary_key("extraction_jobs_pkey", &["id"])],
         row_identity: SURROGATE_ID,
-        session_semantics: Some(SessionSemantics { role: SessionRole::SecondaryToAgent, evidence: "The worker claims jobs with an unfiltered queue scan over `extraction_jobs`, never by session; session_id is payload context carried through to the extracted memories." }),
+        session_semantics: Some(SessionSemantics { role: SessionRole::ContextOnly, evidence: "The worker claims jobs with an unfiltered queue scan over `extraction_jobs`, never by session; session_id is payload context carried through to the extracted memories." }),
         class: TableClass::DirectAgentChild,
         canonical_path: Some(agent_text("agent_id", false)),
-        secondary_paths: &[session_path("agent_id", "session_id", true)],
+        secondary_paths: &[],
         consistency: Some(
-            "Where `session_id` is present the named session must belong to the same agent; \
-             disagreement is reported, never resolved by preferring one path.",
+            "Measured, then deliberately excluded from ownership. `sessions` rows are created by \
+             exactly one code path in the codebase, the working-memory upsert, and it runs \
+             at the *end* of successful extraction. A pending job, a permanently failed job, \
+             or a memory written before that upsert therefore legitimately references a \
+             session that does not exist. Registering the session as an ownership or \
+             consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on \
+             entirely normal states, so it is recorded as context only rather than dropped \
+             silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an \
+             absent conclusion would only say *not investigated*.",
         ),
         tranche: Tranche::Memories,
         plan: agent_child_plan(
@@ -867,12 +1186,20 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memories",
+        schema_contract: &[
+            primary_key("memories_pkey", &["id"]),
+            foreign_key(
+                "memories_archival_batch_id_fkey",
+                &["archival_batch_id"],
+                "archival_batches",
+                &["id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
-        session_semantics: Some(SessionSemantics { role: SessionRole::SecondaryToAgent, evidence: "Every read predicate is `WHERE agent_id = ...` or `WHERE id = ...`; no query selects memories by session. Deletion is by agent or by id. The session records where a memory came from, not who owns it." }),
+        session_semantics: Some(SessionSemantics { role: SessionRole::ContextOnly, evidence: "Every read predicate is `WHERE agent_id = ...` or `WHERE id = ...`; no query selects memories by session. Deletion is by agent or by id. The session records where a memory came from, not who owns it." }),
         class: TableClass::DirectAgentChild,
         canonical_path: Some(agent_text("agent_id", false)),
         secondary_paths: &[
-            session_path("agent_id", "session_id", true),
             OwnershipPath {
                 label: "row.archival_batch_id -> archival_batches.id -> agent_id -> tenant",
                 kind: PathKind::ArchivalBatch {
@@ -882,9 +1209,12 @@ pub const REGISTRY: &[TableEntry] = &[
             },
         ],
         consistency: Some(
-            "All present paths must resolve to the same agent. An archived memory whose batch \
-             belongs to a different agent than the memory itself is a blocking disagreement, not \
-             a reason to prefer one path.",
+            "The archival batch, where present, must resolve to the same agent: an archived \
+             memory whose batch belongs to a different agent is a blocking disagreement, not \
+             a reason to prefer one path. The session is context only — `sessions` rows are \
+             created solely by the working-memory upsert at the end of successful \
+             extraction, so a memory written before it legitimately references a session \
+             that does not yet exist.",
         ),
         tranche: Tranche::Memories,
         plan: MigrationPlan {
@@ -934,6 +1264,21 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memory_conflicts",
+        schema_contract: &[
+            primary_key("memory_conflicts_pkey", &["id"]),
+            foreign_key(
+                "memory_conflicts_memory_a_fkey",
+                &["memory_a"],
+                "memories",
+                &["id"],
+            ),
+            foreign_key(
+                "memory_conflicts_memory_b_fkey",
+                &["memory_b"],
+                "memories",
+                &["id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -964,6 +1309,21 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memory_entity_links",
+        schema_contract: &[
+            primary_key("memory_entity_links_pkey", &["memory_id", "entity_id"]),
+            foreign_key(
+                "memory_entity_links_memory_id_fkey",
+                &["memory_id"],
+                "memories",
+                &["id"],
+            ),
+            foreign_key(
+                "memory_entity_links_entity_id_fkey",
+                &["entity_id"],
+                "entities",
+                &["id"],
+            ),
+        ],
         row_identity: RowIdentity { columns: &[IdentityColumn { name: "memory_id", kind: IdentityKind::Surrogate }, IdentityColumn { name: "entity_id", kind: IdentityKind::Surrogate }] },
         session_semantics: None,
         class: TableClass::MemoryLineageChild,
@@ -1010,6 +1370,7 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memory_graph",
+        schema_contract: &[primary_key("memory_graph_pkey", &["id"])],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -1033,14 +1394,22 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memory_retrieval_logs",
+        schema_contract: &[primary_key("memory_retrieval_logs_pkey", &["id"])],
         row_identity: SURROGATE_ID,
-        session_semantics: Some(SessionSemantics { role: SessionRole::SecondaryToAgent, evidence: "Two insert paths exist and one omits session_id entirely (`INSERT INTO memory_retrieval_logs (agent_id, query_hash, injected_memory_ids)`), so a log line is well-formed without a session. No read predicate uses it." }),
+        session_semantics: Some(SessionSemantics { role: SessionRole::ContextOnly, evidence: "Two insert paths exist and one omits session_id entirely (`INSERT INTO memory_retrieval_logs (agent_id, query_hash, injected_memory_ids)`), so a log line is well-formed without a session. No read predicate uses it." }),
         class: TableClass::DirectAgentChild,
         canonical_path: Some(agent_text("agent_id", false)),
-        secondary_paths: &[session_path("agent_id", "session_id", true)],
+        secondary_paths: &[],
         consistency: Some(
-            "Where `session_id` is present the named session must belong to the same agent; \
-             disagreement is reported, never resolved by preferring one path.",
+            "Measured, then deliberately excluded from ownership. `sessions` rows are created by \
+             exactly one code path in the codebase, the working-memory upsert, and it runs \
+             at the *end* of successful extraction. A pending job, a permanently failed job, \
+             or a memory written before that upsert therefore legitimately references a \
+             session that does not exist. Registering the session as an ownership or \
+             consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on \
+             entirely normal states, so it is recorded as context only rather than dropped \
+             silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an \
+             absent conclusion would only say *not investigated*.",
         ),
         tranche: Tranche::Memories,
         plan: agent_child_plan(
@@ -1059,6 +1428,15 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "memory_versions",
+        schema_contract: &[
+            primary_key("memory_versions_pkey", &["id"]),
+            foreign_key(
+                "memory_versions_memory_id_fkey",
+                &["memory_id"],
+                "memories",
+                &["id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::MemoryLineageChild,
@@ -1096,6 +1474,15 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "retrieval_feedback",
+        schema_contract: &[
+            primary_key("retrieval_feedback_pkey", &["id"]),
+            foreign_key(
+                "retrieval_feedback_memory_id_fkey",
+                &["memory_id"],
+                "memories",
+                &["id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -1125,8 +1512,17 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "rmk_episodes",
+        schema_contract: &[
+            primary_key("rmk_episodes_pkey", &["id"]),
+            foreign_key(
+                "rmk_episodes_policy_id_fkey",
+                &["policy_id"],
+                "rmk_policies",
+                &["id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
-        session_semantics: Some(SessionSemantics { role: SessionRole::SecondaryToAgent, evidence: "Read by `WHERE agent_id = $1 ORDER BY session_id`: the session is a grouping key *within* an agent's episodes, not an addressing key. The owner is the agent." }),
+        session_semantics: Some(SessionSemantics { role: SessionRole::ContextOnly, evidence: "Read by `WHERE agent_id = $1 ORDER BY session_id`: the session is a grouping key *within* an agent's episodes, not an addressing key. The owner is the agent." }),
         class: TableClass::DirectAgentChild,
         canonical_path: Some(agent_text("agent_id", false)),
         secondary_paths: &[
@@ -1137,7 +1533,6 @@ pub const REGISTRY: &[TableEntry] = &[
                 },
                 nullable: true,
             },
-            session_path("agent_id", "session_id", true),
         ],
         consistency: Some(
             "An episode's policy, where set, must belong to the same agent. `policy_id` is \
@@ -1163,6 +1558,7 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "rmk_policies",
+        schema_contract: &[primary_key("rmk_policies_pkey", &["id"])],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -1197,6 +1593,21 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "sessions",
+        schema_contract: &[
+            primary_key("sessions_pkey", &["id"]),
+            // A standalone unique *index*, not a constraint — it has no
+            // pg_constraint row, so a constraint-only verifier would report
+            // false drift on a healthy schema. Every session ownership path
+            // joins on it, and a partial or invalid index would not guarantee
+            // the single match that join assumes.
+            unique_index("idx_sessions_agent_session", &["agent_id", "session_id"]),
+            foreign_key(
+                "sessions_agent_id_fkey",
+                &["agent_id"],
+                "agents",
+                &["agent_id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: None,
         class: TableClass::DirectAgentChild,
@@ -1250,6 +1661,13 @@ pub const REGISTRY: &[TableEntry] = &[
     },
     TableEntry {
         table: "working_memory",
+        schema_contract: &[
+            primary_key("working_memory_pkey", &["id"]),
+            unique_constraint(
+                "working_memory_agent_id_session_id_key",
+                &["agent_id", "session_id"],
+            ),
+        ],
         row_identity: SURROGATE_ID,
         session_semantics: Some(SessionSemantics { role: SessionRole::Canonical, evidence: "INSERT carries session_id; rows are deleted by `WHERE agent_id = $1 AND session_id = $2`, i.e. addressed *by* their session; UNIQUE (agent_id, session_id) is exactly the session's own unique key. The session is what identifies the row, so a missing one is a broken row rather than absent context." }),
         class: TableClass::SessionChild,
@@ -1258,7 +1676,14 @@ pub const REGISTRY: &[TableEntry] = &[
         consistency: Some(
             "The only table whose session reference is NOT NULL, and whose own unique key \
              `(agent_id, session_id)` is exactly the session's unique key. The denormalised \
-             agent must match the session's agent.",
+             agent must match the session's agent. OPERATIONAL CAVEAT: `working_memory` and \
+             its `sessions` row are written by two consecutive statements, not one atomic \
+             unit - the upsert writes working memory first and the session second. A live \
+             audit can therefore observe the brief state between them and report a session \
+             orphan that is about to exist. The finding is deliberately left BLOCKING, because \
+             a persistent orphan is a real inconsistency and weakening it would hide that, so \
+             a migration-readiness scan must be run with extraction writers quiesced or \
+             drained, or re-run once activity settles.",
         ),
         tranche: Tranche::Sessions,
         plan: MigrationPlan {

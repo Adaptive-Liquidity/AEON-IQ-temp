@@ -358,6 +358,14 @@ async fn an_agent_with_a_null_tenant_is_reported_as_unmapped(pool: PgPool) {
         "the agent itself: {:?}",
         codes_for(&report, "agents")
     );
+    // The root is itself an unmapped agent. Before the tenant-root-aware
+    // predicate this never fired, because the tenant-column path resolves no
+    // agent to compare against.
+    assert!(
+        has(&report, "agents", ReasonCode::UnmappedAgent),
+        "the root must report itself unmapped: {:?}",
+        codes_for(&report, "agents")
+    );
     assert!(
         has(&report, "memories", ReasonCode::UnmappedAgent),
         "the child row: {:?}",
@@ -367,24 +375,141 @@ async fn an_agent_with_a_null_tenant_is_reported_as_unmapped(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn a_root_only_unmapped_agent_keeps_tranche_one_blocked(pool: PgPool) {
+    // No child rows at all — just one agent whose tenant is NULL. This is the
+    // shape that slipped through: with nothing downstream to report, the audit
+    // saw only NULL_OWNERSHIP_LINK, and tranche 1 read READY even though its
+    // planned `SET NOT NULL on agents.tenant_id` could not possibly succeed.
+    sqlx::query("INSERT INTO agents (agent_id, external_agent_id) VALUES ('lonely', 'ext-lonely')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert!(
+        has(&report, "agents", ReasonCode::UnmappedAgent),
+        "{:?}",
+        codes_for(&report, "agents")
+    );
+    assert!(has(&report, "agents", ReasonCode::LegacyUnmapped));
+
+    let tranche_one = report
+        .tranche_readiness
+        .iter()
+        .find(|t| t.tranche == Tranche::RootsAndDirectAgentChildren)
+        .unwrap();
+    assert!(
+        !tranche_one.ready,
+        "tranche 1 must block on its own root: {:?}",
+        tranche_one.blocking_reasons
+    );
+    assert!(
+        tranche_one
+            .blocking_reasons
+            .iter()
+            .any(|r| r == "agents: UNMAPPED_AGENT"),
+        "{:?}",
+        tranche_one.blocking_reasons
+    );
+    assert!(report.is_blocked());
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn an_orphaned_session_reference_is_reported(pool: PgPool) {
+    // `working_memory` is the only table where a missing session is a genuine
+    // inconsistency, because it is the only one whose row and whose session row
+    // are created by the *same* upsert. Everywhere else a session reference can
+    // legitimately outrun its session — see the CONTEXT_ONLY test below.
     seed_clean(&pool, "agent-one", TENANT).await;
-    // A memory naming a session that does not exist. The agent still resolves,
-    // so this is specifically the *session* half failing.
     sqlx::query(
-        "INSERT INTO memories (agent_id, session_id, content, memory_type) \
-         VALUES ('agent-one', 'no-such-session', 'x', 'fact')",
+        "INSERT INTO working_memory (agent_id, session_id) \
+         VALUES ('agent-one', 'no-such-session')",
     )
     .execute(&pool)
     .await
     .unwrap();
 
     let report = audit(&pool).await;
-    assert!(
-        has(&report, "memories", ReasonCode::OrphanedSessionReference),
-        "{:?}",
-        codes_for(&report, "memories")
-    );
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| {
+            f.table_name == "working_memory"
+                && f.reason_code == ReasonCode::OrphanedSessionReference
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected an orphaned session: {:?}",
+                codes_for(&report, "working_memory")
+            )
+        });
+    // Stays BLOCKING. The two production writes are not atomic, so a live audit
+    // can catch the gap between them — the registry records that a readiness
+    // scan must run with extraction writers quiesced. A *persistent* orphan is
+    // still a real inconsistency, and weakening this finding would hide it.
+    assert_eq!(finding.severity, Severity::Blocking);
+    assert!(report.is_blocked());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_context_only_session_never_reports_an_orphan(pool: PgPool) {
+    // The five tables whose `session_id` is CONTEXT_ONLY. `sessions` rows are
+    // created by exactly one code path — the working-memory upsert — and it
+    // runs at the *end* of successful extraction, so a pending job, a
+    // permanently failed job, or a memory written before that upsert
+    // legitimately names a session that does not exist. Reporting those as
+    // orphans would block Step 4B on entirely normal states.
+    seed_clean(&pool, "agent-one", TENANT).await;
+
+    for statement in [
+        "INSERT INTO memories (agent_id, session_id, content, memory_type) \
+         VALUES ('agent-one', 'no-such-session', 'x', 'fact')",
+        "INSERT INTO extraction_jobs (agent_id, session_id, payload, status, next_attempt_at) \
+         VALUES ('agent-one', 'no-such-session', '{}'::jsonb, 'pending', NOW())",
+        "INSERT INTO memory_retrieval_logs (agent_id, session_id, query_hash) \
+         VALUES ('agent-one', 'no-such-session', 'h')",
+        "INSERT INTO cognitive_hypervisor_timeline (agent_id, session_id, event_type, occurred_at) \
+         VALUES ('agent-one', 'no-such-session', 'x', NOW())",
+        "INSERT INTO rmk_episodes (agent_id, session_id, task_success, token_savings, \
+                                   retrieval_precision, eviction_cost, reward) \
+         VALUES ('agent-one', 'no-such-session', 0, 0, 0, 0, 0)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+
+    let report = audit(&pool).await;
+    for table in [
+        "memories",
+        "extraction_jobs",
+        "memory_retrieval_logs",
+        "cognitive_hypervisor_timeline",
+        "rmk_episodes",
+    ] {
+        assert!(
+            !has(&report, table, ReasonCode::OrphanedSessionReference),
+            "{table} is CONTEXT_ONLY and must not report a session orphan: {:?}",
+            codes_for(&report, table)
+        );
+        // …and the registry says so explicitly, rather than the field merely
+        // having been forgotten.
+        let entry = inventory::entry(table).unwrap();
+        assert_eq!(
+            entry.session_semantics.map(|s| s.role),
+            Some(inventory::SessionRole::ContextOnly),
+            "{table}"
+        );
+        assert!(
+            entry
+                .secondary_paths
+                .iter()
+                .chain(entry.canonical_path.iter())
+                .all(|p| !matches!(p.kind, inventory::PathKind::Session { .. })),
+            "{table} must carry no session ownership path"
+        );
+    }
+
+    // The whole report is clean: these are normal states, not findings.
+    assert!(!report.is_blocked(), "{:?}", report.findings);
 }
 
 #[sqlx::test(migrations = "./migrations")]

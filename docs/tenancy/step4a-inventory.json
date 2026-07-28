@@ -1,6 +1,6 @@
 {
   "schema_version": "step4a.1",
-  "inventory_digest": "sha256:5a519753ae84230cb226bc370c222312f6fbc81b824397e67d5310439baeecbd",
+  "inventory_digest": "sha256:283fd55811aefba6e717cbc91f23bd2fa9eb5beeb956a1bd53266b7d0226542b",
   "reason_codes": [
     {
       "code": "UNCLASSIFIED_TABLE",
@@ -115,6 +115,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "agent_tenancy_migrations_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": null,
       "secondary_paths": [],
@@ -151,6 +164,54 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "agents_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "agents_agent_id_key",
+          "kind": "UNIQUE",
+          "local_columns": [
+            "agent_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "agents_tenant_id_external_agent_id_key",
+          "kind": "UNIQUE",
+          "local_columns": [
+            "tenant_id",
+            "external_agent_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "agents_tenant_id_id_key",
+          "kind": "UNIQUE",
+          "local_columns": [
+            "tenant_id",
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.tenant_id (authoritative)",
@@ -168,6 +229,8 @@
         "initial_nullability": "already present from migration 0028",
         "backfill_source": "already backfilled by step 1 under an explicit LEGACY_MIGRATION_MODE",
         "required_zero_codes": [
+          "LEGACY_UNMAPPED",
+          "NULL_OWNERSHIP_LINK",
           "UNMAPPED_AGENT",
           "FUTURE_TENANT_UNIQUENESS_COLLISION"
         ],
@@ -202,6 +265,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "amp_controller_state_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "agent_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -262,6 +338,32 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "archival_batches_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "archival_batches_agent_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "agent_id"
+          ],
+          "referenced_table": "agents",
+          "referenced_columns": [
+            "agent_id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -322,6 +424,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "audit_logs_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -382,6 +497,46 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "co_access_edges_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "memory_a",
+            "memory_b"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "co_access_edges_memory_a_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_a"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "co_access_edges_memory_b_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_b"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.memory_id -> memories.id -> memories.agent_id -> agents.agent_id -> agents.tenant_id",
@@ -453,8 +608,21 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "cognitive_hypervisor_timeline_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
-        "role": "SECONDARY_TO_AGENT",
+        "role": "CONTEXT_ONLY",
         "evidence": "Read by `WHERE agent_id = $1` and `WHERE id = $1`; the hash chain is per-agent. No query selects by session."
       },
       "canonical_path": {
@@ -465,18 +633,8 @@
         },
         "nullable": false
       },
-      "secondary_paths": [
-        {
-          "label": "(row.agent_id, row.session_id) -> sessions(agent_id, session_id) -> agents.agent_id -> agents.id -> agents.tenant_id",
-          "kind": {
-            "kind": "SESSION",
-            "agent_column": "agent_id",
-            "session_column": "session_id"
-          },
-          "nullable": true
-        }
-      ],
-      "consistency": "Where `session_id` is present the named session must belong to the same agent. The session is never a fallback: if the two disagree the row is reported OWNERSHIP_PATH_DISAGREEMENT rather than resolved by preference.",
+      "secondary_paths": [],
+      "consistency": "Measured, then deliberately excluded from ownership. `sessions` rows are created by exactly one code path in the codebase, the working-memory upsert, and it runs at the *end* of successful extraction. A pending job, a permanently failed job, or a memory written before that upsert therefore legitimately references a session that does not exist. Registering the session as an ownership or consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on entirely normal states, so it is recorded as context only rather than dropped silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an absent conclusion would only say *not investigated*.",
       "tranche": "TRANCHE_3_MEMORIES",
       "plan": {
         "added_columns": [
@@ -529,6 +687,50 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "credential_agent_grants_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "credential_id",
+            "agent_uuid"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "credential_agent_grants_agent_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "tenant_id",
+            "agent_uuid"
+          ],
+          "referenced_table": "agents",
+          "referenced_columns": [
+            "tenant_id",
+            "id"
+          ],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "credential_agent_grants_credential_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "credential_id",
+            "tenant_id"
+          ],
+          "referenced_table": "credentials",
+          "referenced_columns": [
+            "id",
+            "tenant_id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_uuid -> agents.id -> agents.tenant_id",
@@ -585,6 +787,31 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "credentials_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "credentials_id_tenant_id_key",
+          "kind": "UNIQUE",
+          "local_columns": [
+            "id",
+            "tenant_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.tenant_id (authoritative, NOT NULL)",
@@ -628,6 +855,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "entities_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -687,8 +927,21 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "extraction_jobs_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
-        "role": "SECONDARY_TO_AGENT",
+        "role": "CONTEXT_ONLY",
         "evidence": "The worker claims jobs with an unfiltered queue scan over `extraction_jobs`, never by session; session_id is payload context carried through to the extracted memories."
       },
       "canonical_path": {
@@ -699,18 +952,8 @@
         },
         "nullable": false
       },
-      "secondary_paths": [
-        {
-          "label": "(row.agent_id, row.session_id) -> sessions(agent_id, session_id) -> agents.agent_id -> agents.id -> agents.tenant_id",
-          "kind": {
-            "kind": "SESSION",
-            "agent_column": "agent_id",
-            "session_column": "session_id"
-          },
-          "nullable": true
-        }
-      ],
-      "consistency": "Where `session_id` is present the named session must belong to the same agent; disagreement is reported, never resolved by preferring one path.",
+      "secondary_paths": [],
+      "consistency": "Measured, then deliberately excluded from ownership. `sessions` rows are created by exactly one code path in the codebase, the working-memory upsert, and it runs at the *end* of successful extraction. A pending job, a permanently failed job, or a memory written before that upsert therefore legitimately references a session that does not exist. Registering the session as an ownership or consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on entirely normal states, so it is recorded as context only rather than dropped silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an absent conclusion would only say *not investigated*.",
       "tranche": "TRANCHE_3_MEMORIES",
       "plan": {
         "added_columns": [
@@ -758,8 +1001,34 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memories_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memories_archival_batch_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "archival_batch_id"
+          ],
+          "referenced_table": "archival_batches",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
-        "role": "SECONDARY_TO_AGENT",
+        "role": "CONTEXT_ONLY",
         "evidence": "Every read predicate is `WHERE agent_id = ...` or `WHERE id = ...`; no query selects memories by session. Deletion is by agent or by id. The session records where a memory came from, not who owns it."
       },
       "canonical_path": {
@@ -772,15 +1041,6 @@
       },
       "secondary_paths": [
         {
-          "label": "(row.agent_id, row.session_id) -> sessions(agent_id, session_id) -> agents.agent_id -> agents.id -> agents.tenant_id",
-          "kind": {
-            "kind": "SESSION",
-            "agent_column": "agent_id",
-            "session_column": "session_id"
-          },
-          "nullable": true
-        },
-        {
           "label": "row.archival_batch_id -> archival_batches.id -> agent_id -> tenant",
           "kind": {
             "kind": "ARCHIVAL_BATCH",
@@ -789,7 +1049,7 @@
           "nullable": true
         }
       ],
-      "consistency": "All present paths must resolve to the same agent. An archived memory whose batch belongs to a different agent than the memory itself is a blocking disagreement, not a reason to prefer one path.",
+      "consistency": "The archival batch, where present, must resolve to the same agent: an archived memory whose batch belongs to a different agent is a blocking disagreement, not a reason to prefer one path. The session is context only — `sessions` rows are created solely by the working-memory upsert at the end of successful extraction, so a memory written before it legitimately references a session that does not yet exist.",
       "tranche": "TRANCHE_3_MEMORIES",
       "plan": {
         "added_columns": [
@@ -848,6 +1108,45 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_conflicts_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_conflicts_memory_a_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_a"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_conflicts_memory_b_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_b"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -929,6 +1228,46 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_entity_links_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "memory_id",
+            "entity_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_entity_links_memory_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_id"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_entity_links_entity_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "entity_id"
+          ],
+          "referenced_table": "entities",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.memory_id -> memories.id -> memories.agent_id -> agents.agent_id -> agents.tenant_id",
@@ -1008,6 +1347,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_graph_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -1067,8 +1419,21 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_retrieval_logs_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
-        "role": "SECONDARY_TO_AGENT",
+        "role": "CONTEXT_ONLY",
         "evidence": "Two insert paths exist and one omits session_id entirely (`INSERT INTO memory_retrieval_logs (agent_id, query_hash, injected_memory_ids)`), so a log line is well-formed without a session. No read predicate uses it."
       },
       "canonical_path": {
@@ -1079,18 +1444,8 @@
         },
         "nullable": false
       },
-      "secondary_paths": [
-        {
-          "label": "(row.agent_id, row.session_id) -> sessions(agent_id, session_id) -> agents.agent_id -> agents.id -> agents.tenant_id",
-          "kind": {
-            "kind": "SESSION",
-            "agent_column": "agent_id",
-            "session_column": "session_id"
-          },
-          "nullable": true
-        }
-      ],
-      "consistency": "Where `session_id` is present the named session must belong to the same agent; disagreement is reported, never resolved by preferring one path.",
+      "secondary_paths": [],
+      "consistency": "Measured, then deliberately excluded from ownership. `sessions` rows are created by exactly one code path in the codebase, the working-memory upsert, and it runs at the *end* of successful extraction. A pending job, a permanently failed job, or a memory written before that upsert therefore legitimately references a session that does not exist. Registering the session as an ownership or consistency path would emit blocking ORPHANED_SESSION_REFERENCE findings on entirely normal states, so it is recorded as context only rather than dropped silently: CONTEXT_ONLY says *investigated and non-authoritative*, where an absent conclusion would only say *not investigated*.",
       "tranche": "TRANCHE_3_MEMORIES",
       "plan": {
         "added_columns": [
@@ -1139,6 +1494,32 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_versions_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "memory_versions_memory_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_id"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.memory_id -> memories.id -> memories.agent_id -> agents.agent_id -> agents.tenant_id",
@@ -1209,6 +1590,32 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "retrieval_feedback_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "retrieval_feedback_memory_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "memory_id"
+          ],
+          "referenced_table": "memories",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -1278,8 +1685,34 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "rmk_episodes_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "rmk_episodes_policy_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "policy_id"
+          ],
+          "referenced_table": "rmk_policies",
+          "referenced_columns": [
+            "id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
-        "role": "SECONDARY_TO_AGENT",
+        "role": "CONTEXT_ONLY",
         "evidence": "Read by `WHERE agent_id = $1 ORDER BY session_id`: the session is a grouping key *within* an agent's episodes, not an addressing key. The owner is the agent."
       },
       "canonical_path": {
@@ -1296,15 +1729,6 @@
           "kind": {
             "kind": "POLICY",
             "column": "policy_id"
-          },
-          "nullable": true
-        },
-        {
-          "label": "(row.agent_id, row.session_id) -> sessions(agent_id, session_id) -> agents.agent_id -> agents.id -> agents.tenant_id",
-          "kind": {
-            "kind": "SESSION",
-            "agent_column": "agent_id",
-            "session_column": "session_id"
           },
           "nullable": true
         }
@@ -1361,6 +1785,19 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "rmk_policies_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -1422,6 +1859,45 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "sessions_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "UNIQUE_INDEX",
+          "name": "idx_sessions_agent_session",
+          "columns": [
+            "agent_id",
+            "session_id"
+          ],
+          "require_unique": true,
+          "require_valid": true,
+          "require_ready": true,
+          "require_non_partial": true,
+          "require_no_expressions": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "sessions_agent_id_fkey",
+          "kind": "FOREIGN_KEY",
+          "local_columns": [
+            "agent_id"
+          ],
+          "referenced_table": "agents",
+          "referenced_columns": [
+            "agent_id"
+          ],
+          "require_validated": true
+        }
+      ],
       "session_semantics": null,
       "canonical_path": {
         "label": "row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id",
@@ -1489,6 +1965,31 @@
           }
         ]
       },
+      "required_current_schema_contract": [
+        {
+          "object": "CONSTRAINT",
+          "name": "working_memory_pkey",
+          "kind": "PRIMARY_KEY",
+          "local_columns": [
+            "id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        },
+        {
+          "object": "CONSTRAINT",
+          "name": "working_memory_agent_id_session_id_key",
+          "kind": "UNIQUE",
+          "local_columns": [
+            "agent_id",
+            "session_id"
+          ],
+          "referenced_table": null,
+          "referenced_columns": [],
+          "require_validated": true
+        }
+      ],
       "session_semantics": {
         "role": "CANONICAL",
         "evidence": "INSERT carries session_id; rows are deleted by `WHERE agent_id = $1 AND session_id = $2`, i.e. addressed *by* their session; UNIQUE (agent_id, session_id) is exactly the session's own unique key. The session is what identifies the row, so a missing one is a broken row rather than absent context."
@@ -1512,7 +2013,7 @@
           "nullable": false
         }
       ],
-      "consistency": "The only table whose session reference is NOT NULL, and whose own unique key `(agent_id, session_id)` is exactly the session's unique key. The denormalised agent must match the session's agent.",
+      "consistency": "The only table whose session reference is NOT NULL, and whose own unique key `(agent_id, session_id)` is exactly the session's unique key. The denormalised agent must match the session's agent. OPERATIONAL CAVEAT: `working_memory` and its `sessions` row are written by two consecutive statements, not one atomic unit - the upsert writes working memory first and the session second. A live audit can therefore observe the brief state between them and report a session orphan that is about to exist. The finding is deliberately left BLOCKING, because a persistent orphan is a real inconsistency and weakening it would hide that, so a migration-readiness scan must be run with extraction writers quiesced or drained, or re-run once activity settles.",
       "tranche": "TRANCHE_2_SESSIONS",
       "plan": {
         "added_columns": [

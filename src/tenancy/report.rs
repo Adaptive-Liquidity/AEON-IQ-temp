@@ -22,8 +22,8 @@ use serde::Serialize;
 
 use super::audit::{Finding, ReasonCode, Severity};
 use super::inventory::{
-    self, ExcludedObject, MigrationPlan, OwnershipPath, RowIdentity, SessionSemantics, TableClass,
-    Tranche,
+    self, ExcludedObject, MigrationPlan, OwnershipPath, RowIdentity, SchemaObjectContract,
+    SessionSemantics, TableClass, Tranche,
 };
 
 /// A registry entry as it appears in a report or artifact.
@@ -34,6 +34,14 @@ pub struct ClassifiedTable {
     /// How this table's example row identifier is built. Declared, never
     /// derived from the catalog.
     pub row_identity: RowIdentity,
+    /// The schema objects this table's ownership joins and row identity rely on.
+    ///
+    /// **DECLARED — runtime verification is not implemented in this
+    /// checkpoint.** These are the guarantees the ownership paths assume, not
+    /// facts checked against a live database. Reading them as verified would be
+    /// exactly backwards: they are the checklist *for* the verifier, which
+    /// lands in the next cycle.
+    pub required_current_schema_contract: &'static [SchemaObjectContract],
     /// What a session reference means here, and the evidence for it.
     pub session_semantics: Option<SessionSemantics>,
     pub canonical_path: Option<OwnershipPath>,
@@ -197,6 +205,7 @@ pub fn classified_tables() -> Vec<ClassifiedTable> {
             table: e.table,
             class: e.class,
             row_identity: e.row_identity,
+            required_current_schema_contract: e.schema_contract,
             session_semantics: e.session_semantics,
             canonical_path: e.canonical_path,
             secondary_paths: e.secondary_paths,
@@ -356,6 +365,23 @@ pub fn render_inventory_markdown() -> String {
     }
 
     let _ = writeln!(out);
+    let _ = writeln!(out, "## REQUIRED_CURRENT_SCHEMA_CONTRACT");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "**Status: DECLARED — runtime verification is not implemented in this checkpoint.**"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Each table declares the schema objects its ownership joins and row identity rely on \
+         **today** — not the constraints Step 4B will add, which live in the migration plan. \
+         Nothing listed here has been checked against a live database: these are registry \
+         declarations, not verified live-database facts. Until the verifier lands, a dropped \
+         or altered constraint would go unreported."
+    );
+    let _ = writeln!(out);
+
     let _ = writeln!(out, "## Session semantics");
     let _ = writeln!(out);
     let _ = writeln!(
@@ -417,6 +443,18 @@ pub fn render_inventory_markdown() -> String {
             .map(|c| format!("`{}` ({})", c.name, c.kind.as_str()))
             .collect();
         let _ = writeln!(out, "- **row identity**: {}", identity.join(", "));
+        let _ = writeln!(
+            out,
+            "- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification \
+             is not implemented in this checkpoint.*"
+        );
+        if entry.schema_contract.is_empty() {
+            let _ = writeln!(out, "  - *(none)*");
+        } else {
+            for object in entry.schema_contract {
+                let _ = writeln!(out, "  - {}", object.describe());
+            }
+        }
         if let Some(session) = entry.session_semantics {
             let _ = writeln!(
                 out,

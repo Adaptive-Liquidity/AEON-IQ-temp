@@ -1038,6 +1038,18 @@ async fn scan_rows(
     let table = entry.table;
     let inner = format!("SELECT {} FROM {table_sql} t{joins}", selects.join(", "));
 
+    // What "unmapped agent" means depends on whether the row *is* an agent. On
+    // the tenant root the canonical path is a tenant column, which resolves no
+    // agent at all — so the child-shaped predicate never fired there, and a
+    // root with a NULL tenant produced only NULL_OWNERSHIP_LINK. Tranche 1
+    // could then read READY while its planned SET NOT NULL could not possibly
+    // succeed.
+    let unmapped = if entry.class == TableClass::TenantRoot {
+        "c_tenant IS NULL"
+    } else {
+        "c_agent IS NOT NULL AND c_tenant IS NULL"
+    };
+
     // Aggregate rather than stream: a legacy database can hold millions of
     // unmapped rows, and the report wants a count and one example, not a list.
     let mut aggregates = vec![
@@ -1051,10 +1063,8 @@ async fn scan_rows(
         "min(ident) FILTER (WHERE c_malformed) AS id_malformed".to_string(),
         // Resolved to an agent whose tenant is NULL: the agent exists but step
         // 1 deliberately left it unreachable.
-        "count(*) FILTER (WHERE c_agent IS NOT NULL AND c_tenant IS NULL) AS n_unmapped"
-            .to_string(),
-        "min(ident) FILTER (WHERE c_agent IS NOT NULL AND c_tenant IS NULL) AS id_unmapped"
-            .to_string(),
+        format!("count(*) FILTER (WHERE {unmapped}) AS n_unmapped"),
+        format!("min(ident) FILTER (WHERE {unmapped}) AS id_unmapped"),
         // Nothing NULL, nothing orphaned, and still no tenant: the chain ran
         // out without an authoritative owner.
         "count(*) FILTER (WHERE NOT c_null AND NOT c_orphan AND NOT c_ambiguous \
