@@ -25,6 +25,14 @@
 //! set, `TenancySettings::from_env` yields no plan, no backfill runs, and the
 //! enablement gate returns immediately.
 
+// Step 4A: the read-only tenancy inventory and mismatch report. Diagnostic
+// only — it adds no route, alters no row, and activates nothing.
+pub mod audit;
+#[cfg(test)]
+mod audit_db_tests;
+pub mod inventory;
+pub mod report;
+
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
@@ -757,12 +765,12 @@ mod tests {
 mod db_tests {
     use super::*;
 
-    const MIGRATION_SQL: &str = include_str!("../migrations/0028_agent_tenancy_identity.sql");
-    const ROLLBACK_SQL: &str = include_str!("../rollback/0028_agent_tenancy_identity_down.sql");
+    const MIGRATION_SQL: &str = include_str!("../../migrations/0028_agent_tenancy_identity.sql");
+    const ROLLBACK_SQL: &str = include_str!("../../rollback/0028_agent_tenancy_identity_down.sql");
     const GRANTS_ROLLBACK_SQL: &str =
-        include_str!("../rollback/0030_credential_agent_grants_down.sql");
+        include_str!("../../rollback/0030_credential_agent_grants_down.sql");
     const GRANTS_HARDENING_ROLLBACK_SQL: &str =
-        include_str!("../rollback/0031_credential_agent_grants_hardening_down.sql");
+        include_str!("../../rollback/0031_credential_agent_grants_hardening_down.sql");
 
     /// Unwind to the 0027 baseline, in order.
     ///
