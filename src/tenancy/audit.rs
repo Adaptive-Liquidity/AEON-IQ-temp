@@ -46,7 +46,7 @@ use super::inventory::{
     self, DiscoveredSchema, IdentityKind, OwnershipPath, PathKind, RowIdentity, TableClass,
     TableEntry, Tranche,
 };
-use super::report::{TenancyAuditReport, TrancheReadiness};
+use super::report::{ContractStatus, TenancyAuditReport, TrancheReadiness};
 
 /// The transaction the audit runs in, shared with the test that proves a write
 /// inside it is rejected — so that proof cannot drift onto a different
@@ -92,6 +92,15 @@ impl std::error::Error for UnsafeIdentifier {}
 pub enum AuditError {
     Sql(sqlx::Error),
     UnsafeIdentifier(UnsafeIdentifier),
+    /// The audit failed *and* the rollback that followed it also failed.
+    ///
+    /// Both are kept. Reporting only the audit error would hide a connection
+    /// left in an unknown transaction state; reporting only the rollback error
+    /// would hide why the audit stopped in the first place.
+    AuditAndRollback {
+        audit: Box<AuditError>,
+        rollback: sqlx::Error,
+    },
 }
 
 impl std::fmt::Display for AuditError {
@@ -99,6 +108,11 @@ impl std::fmt::Display for AuditError {
         match self {
             Self::Sql(e) => write!(f, "{e}"),
             Self::UnsafeIdentifier(e) => write!(f, "{e}"),
+            Self::AuditAndRollback { audit, rollback } => write!(
+                f,
+                "audit failed ({audit}), and rolling back its transaction also failed \
+                 ({rollback}); the connection's transaction state is unknown"
+            ),
         }
     }
 }
@@ -234,6 +248,12 @@ pub enum ReasonCode {
     OrphanedAgentReference,
     UnmappedAgent,
     OrphanedSessionReference,
+    /// Currently **unreachable in this schema**, for a reason worth stating: every
+    /// memory reference is backed by a declared foreign key, so an orphan cannot
+    /// exist while the contract holds — and producing one means dropping that
+    /// key, which is contract drift, which withholds the count. The code stays
+    /// in the catalogue because a future memory reference without a declared FK
+    /// would emit it, and because Step 4B's gates key on the string.
     OrphanedMemoryReference,
     /// Part of the stable catalogue and currently **unemittable**: no table in
     /// the live schema carries a reference to `memory_versions.id`, so there is
@@ -668,11 +688,22 @@ fn verify_row_identity(
                 ));
                 ok = false;
             }
-            Some(live) if !live.data_type.contains(column.kind.expected_type()) => {
+            // Exact equality against `format_type`, never a substring test.
+            // `contains("text")` accepted `text[]`, `character varying` was
+            // near-missed only by luck, and any domain whose name merely
+            // contains `text` or `uuid` passed. An array reaching `concat_ws`
+            // yields a brace-wrapped literal that identifies no row, and a NULL
+            // element silently disappears from it.
+            Some(live)
+                if !column
+                    .kind
+                    .allowed_types()
+                    .contains(&live.data_type.as_str()) =>
+            {
                 drift(format!(
-                    "row identity declares `{}` as {} ({}), but the live column is `{}`",
+                    "row identity declares `{}` as exactly {} ({}), but the live column is `{}`",
                     column.name,
-                    column.kind.expected_type(),
+                    column.kind.allowed_types().join(" or "),
                     match column.kind {
                         IdentityKind::Surrogate => "surrogate, emitted as-is",
                         IdentityKind::CallerText => "caller text, pseudonymised",
@@ -730,6 +761,360 @@ async fn primary_keys(
     Ok(out)
 }
 
+// ── The live current-schema contract ────────────────────────────────────────
+
+/// One `pg_constraint` row, resolved to names.
+///
+/// Attribute numbers are resolved to names *here*, by the catalog query, so the
+/// comparison downstream is name-against-name. Those names are only ever
+/// compared with the registry's; none of them is interpolated into SQL.
+#[derive(Debug, Clone)]
+struct LiveConstraint {
+    contype: String,
+    local_columns: Vec<String>,
+    referenced_schema: Option<String>,
+    referenced_table: Option<String>,
+    referenced_columns: Vec<String>,
+    validated: bool,
+}
+
+/// One `pg_index` row.
+#[derive(Debug, Clone)]
+struct LiveIndex {
+    /// Key columns only, in `indkey` order. An expression column appears as
+    /// `(expression)`, which matches no declared column name and so fails the
+    /// comparison rather than being silently skipped.
+    key_columns: Vec<String>,
+    is_unique: bool,
+    is_valid: bool,
+    is_ready: bool,
+    is_partial: bool,
+    has_expressions: bool,
+    key_column_count: i16,
+}
+
+/// Every primary-key, unique and foreign-key constraint in the schema, keyed by
+/// `(table, name)`.
+async fn live_constraints(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+) -> Result<BTreeMap<(String, String), LiveConstraint>, sqlx::Error> {
+    // `conkey` / `confkey` are ordered attribute-number vectors and the order is
+    // part of the guarantee: a unique constraint on `(a, b)` and one on `(b, a)`
+    // are different objects, and a foreign key whose columns pair up in the
+    // wrong order points somewhere else entirely. `WITH ORDINALITY` preserves
+    // that order through the join to `pg_attribute`, which a plain `= ANY(...)`
+    // would discard.
+    let rows = sqlx::query(
+        "SELECT c.relname::text AS table_name, \
+                con.conname::text AS name, \
+                con.contype::text AS contype, \
+                con.convalidated AS validated, \
+                rn.nspname::text AS ref_schema, \
+                rc.relname::text AS ref_table, \
+                COALESCE((SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                            FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                            JOIN pg_attribute a \
+                              ON a.attrelid = con.conrelid AND a.attnum = k.attnum), \
+                         '{}') AS local_columns, \
+                COALESCE((SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                            FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord) \
+                            JOIN pg_attribute a \
+                              ON a.attrelid = con.confrelid AND a.attnum = k.attnum), \
+                         '{}') AS ref_columns \
+           FROM pg_constraint con \
+           JOIN pg_class c ON c.oid = con.conrelid \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+           LEFT JOIN pg_class rc ON rc.oid = con.confrelid \
+           LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+          WHERE n.nspname = $1 AND con.contype IN ('p', 'u', 'f')",
+    )
+    .bind(schema)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let table: String = row.try_get("table_name")?;
+        let name: String = row.try_get("name")?;
+        out.insert(
+            (table, name),
+            LiveConstraint {
+                contype: row.try_get("contype")?,
+                local_columns: row.try_get("local_columns")?,
+                referenced_schema: row.try_get("ref_schema")?,
+                referenced_table: row.try_get("ref_table")?,
+                referenced_columns: row.try_get("ref_columns")?,
+                validated: row.try_get("validated")?,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Every index in the schema, keyed by `(table, index name)`.
+async fn live_indexes(
+    conn: &mut sqlx::PgConnection,
+    schema: &str,
+) -> Result<BTreeMap<(String, String), LiveIndex>, sqlx::Error> {
+    // Only the first `indnkeyatts` entries of `indkey` are *key* columns; the
+    // rest are INCLUDE payload, which constrains nothing. Counting them as key
+    // columns would let `UNIQUE (a) INCLUDE (b)` satisfy a declared `(a, b)`.
+    let rows = sqlx::query(
+        "SELECT c.relname::text AS table_name, \
+                ic.relname::text AS name, \
+                i.indisunique AS is_unique, \
+                i.indisvalid AS is_valid, \
+                i.indisready AS is_ready, \
+                (i.indpred IS NOT NULL) AS is_partial, \
+                (i.indexprs IS NOT NULL) AS has_expressions, \
+                i.indnkeyatts AS key_column_count, \
+                COALESCE((SELECT array_agg(COALESCE(a.attname::text, '(expression)') \
+                                           ORDER BY k.ord) \
+                            FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) \
+                            LEFT JOIN pg_attribute a \
+                              ON a.attrelid = i.indrelid AND a.attnum = k.attnum \
+                           WHERE k.ord <= i.indnkeyatts), '{}') AS key_columns \
+           FROM pg_index i \
+           JOIN pg_class c ON c.oid = i.indrelid \
+           JOIN pg_class ic ON ic.oid = i.indexrelid \
+           JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = $1",
+    )
+    .bind(schema)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut out = BTreeMap::new();
+    for row in rows {
+        let table: String = row.try_get("table_name")?;
+        let name: String = row.try_get("name")?;
+        out.insert(
+            (table, name),
+            LiveIndex {
+                key_columns: row.try_get("key_columns")?,
+                is_unique: row.try_get("is_unique")?,
+                is_valid: row.try_get("is_valid")?,
+                is_ready: row.try_get("is_ready")?,
+                is_partial: row.try_get("is_partial")?,
+                has_expressions: row.try_get("has_expressions")?,
+                key_column_count: row.try_get("key_column_count")?,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// The live catalog, read once per run.
+struct LiveCatalog {
+    constraints: BTreeMap<(String, String), LiveConstraint>,
+    indexes: BTreeMap<(String, String), LiveIndex>,
+}
+
+/// Verify one table's declared current-schema contract against the catalog.
+///
+/// Returns `true` when every declared object is present **and shaped as
+/// declared**. A name match alone is never enough: an object may be renamed
+/// onto a different shape, or a constraint dropped and a same-named one added
+/// over different columns, and either would leave every join the scanner builds
+/// resting on a guarantee that no longer exists.
+fn verify_schema_contract(
+    entry: &TableEntry,
+    catalog: &LiveCatalog,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    let mut ok = true;
+
+    for object in entry.schema_contract {
+        // One lookup key for both shapes. The declared name is compared against
+        // the catalog and never interpolated, so it needs no identifier
+        // validation to be used this way.
+        let name = object.name();
+        let key = (entry.table.to_string(), name.to_string());
+
+        let mut drift = |diagnostic: String| {
+            findings.push(contract_finding(
+                ReasonCode::SchemaRelationshipDrift,
+                entry.table,
+                diagnostic,
+            ));
+        };
+
+        match object {
+            inventory::SchemaObjectContract::Constraint {
+                kind,
+                local_columns,
+                referenced_table,
+                referenced_columns,
+                require_validated,
+                ..
+            } => {
+                let Some(live) = catalog.constraints.get(&key) else {
+                    drift(format!(
+                        "required {} constraint `{name}` ({}) does not exist",
+                        kind.as_str(),
+                        local_columns.join(", ")
+                    ));
+                    ok = false;
+                    continue;
+                };
+
+                if live.contype != kind.contype() {
+                    drift(format!(
+                        "`{name}` is required to be {} (contype `{}`) but the live constraint has \
+                         contype `{}`",
+                        kind.as_str(),
+                        kind.contype(),
+                        live.contype
+                    ));
+                    ok = false;
+                }
+                if live.local_columns != *local_columns {
+                    drift(format!(
+                        "`{name}` is required over ({}) in that order, but the live constraint \
+                         covers ({})",
+                        local_columns.join(", "),
+                        live.local_columns.join(", ")
+                    ));
+                    ok = false;
+                }
+                match referenced_table {
+                    Some(expected) => {
+                        // A foreign key that points at a same-named table in
+                        // another schema satisfies every name comparison and
+                        // still references different rows.
+                        let live_schema = live.referenced_schema.as_deref();
+                        if live_schema != Some(inventory::APPLICATION_SCHEMA) {
+                            drift(format!(
+                                "`{name}` is required to reference schema `{}`, but the live \
+                                 constraint references {}",
+                                inventory::APPLICATION_SCHEMA,
+                                live_schema.unwrap_or("no table at all")
+                            ));
+                            ok = false;
+                        }
+                        if live.referenced_table.as_deref() != Some(*expected) {
+                            drift(format!(
+                                "`{name}` is required to reference `{expected}`, but the live \
+                                 constraint references {}",
+                                live.referenced_table
+                                    .as_deref()
+                                    .unwrap_or("no table at all")
+                            ));
+                            ok = false;
+                        }
+                        if live.referenced_columns != *referenced_columns {
+                            drift(format!(
+                                "`{name}` is required to reference ({}) in that order, but the \
+                                 live constraint references ({})",
+                                referenced_columns.join(", "),
+                                live.referenced_columns.join(", ")
+                            ));
+                            ok = false;
+                        }
+                    }
+                    None => {
+                        if live.referenced_table.is_some() {
+                            drift(format!(
+                                "`{name}` is required to reference nothing, but the live \
+                                 constraint is a foreign key"
+                            ));
+                            ok = false;
+                        }
+                    }
+                }
+                // A `NOT VALID` foreign key constrains new rows only. The
+                // scanner treats these joins as authoritative over *existing*
+                // rows, which is exactly what NOT VALID does not promise.
+                if *require_validated && !live.validated {
+                    drift(format!(
+                        "`{name}` is required to be validated, but the live constraint is NOT VALID"
+                    ));
+                    ok = false;
+                }
+            }
+
+            inventory::SchemaObjectContract::UniqueIndex {
+                columns,
+                require_unique,
+                require_valid,
+                require_ready,
+                require_non_partial,
+                require_no_expressions,
+                ..
+            } => {
+                let Some(live) = catalog.indexes.get(&key) else {
+                    drift(format!(
+                        "required index `{name}` ({}) does not exist",
+                        columns.join(", ")
+                    ));
+                    ok = false;
+                    continue;
+                };
+
+                if live.key_columns != *columns {
+                    drift(format!(
+                        "index `{name}` is required over ({}) in that order, but the live index \
+                         keys on ({})",
+                        columns.join(", "),
+                        live.key_columns.join(", ")
+                    ));
+                    ok = false;
+                }
+                if live.key_column_count as usize != columns.len() {
+                    drift(format!(
+                        "index `{name}` is required to have {} key column(s), but the live index \
+                         has {}",
+                        columns.len(),
+                        live.key_column_count
+                    ));
+                    ok = false;
+                }
+                if *require_unique && !live.is_unique {
+                    drift(format!(
+                        "index `{name}` is required to be UNIQUE, but the live index is not"
+                    ));
+                    ok = false;
+                }
+                // An invalid or not-ready index is a failed or in-progress
+                // CONCURRENTLY build. The planner will not use it and it
+                // enforces nothing, however complete it looks in `\d`.
+                if *require_valid && !live.is_valid {
+                    drift(format!(
+                        "index `{name}` is required to be valid, but the live index is INVALID"
+                    ));
+                    ok = false;
+                }
+                if *require_ready && !live.is_ready {
+                    drift(format!(
+                        "index `{name}` is required to be ready, but the live index is not ready"
+                    ));
+                    ok = false;
+                }
+                // A partial unique index guarantees uniqueness only inside its
+                // predicate, so it cannot back a join that assumes at most one
+                // match for every row.
+                if *require_non_partial && live.is_partial {
+                    drift(format!(
+                        "index `{name}` is required to be non-partial, but the live index has a \
+                         WHERE predicate and so constrains only the rows matching it"
+                    ));
+                    ok = false;
+                }
+                if *require_no_expressions && live.has_expressions {
+                    drift(format!(
+                        "index `{name}` is required to key on bare columns, but the live index is \
+                         an expression index and so does not constrain the columns themselves"
+                    ));
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    ok
+}
+
 // ── The audit ───────────────────────────────────────────────────────────────
 
 /// Run the full audit and return the report.
@@ -747,16 +1132,31 @@ pub async fn run(
     pool: &PgPool,
     generated_at: Option<String>,
 ) -> Result<TenancyAuditReport, AuditError> {
-    let mut conn = pool.acquire().await?;
+    // A managed transaction rather than `acquire()` plus a raw `BEGIN`: sqlx
+    // then owns the lifecycle, so a connection can never be returned to the
+    // pool still inside this transaction — which is what an early `?` between a
+    // manual BEGIN and its COMMIT would do, handing the next borrower a
+    // silently read-only session.
+    let mut tx = pool.begin_with(AUDIT_TRANSACTION).await?;
 
-    sqlx::raw_sql(AUDIT_TRANSACTION).execute(&mut *conn).await?;
-    let outcome = audit_within_snapshot(&mut conn, generated_at).await;
-
-    // COMMIT and ROLLBACK are equivalent for a read-only transaction; COMMIT is
-    // used so that ending the transaction is never mistaken for the audit
-    // having needed to undo something.
-    let _ = sqlx::raw_sql("COMMIT").execute(&mut *conn).await;
-    outcome
+    match audit_within_snapshot(&mut tx, generated_at).await {
+        Ok(report) => {
+            // COMMIT and ROLLBACK are equivalent for a read-only transaction;
+            // COMMIT is used so that ending the transaction is never mistaken
+            // for the audit having needed to undo something. Its failure is
+            // propagated rather than swallowed: a COMMIT that fails means the
+            // snapshot the report describes was not held to the end.
+            tx.commit().await?;
+            Ok(report)
+        }
+        Err(audit) => match tx.rollback().await {
+            Ok(()) => Err(audit),
+            Err(rollback) => Err(AuditError::AuditAndRollback {
+                audit: Box::new(audit),
+                rollback,
+            }),
+        },
+    }
 }
 
 async fn audit_within_snapshot(
@@ -766,34 +1166,87 @@ async fn audit_within_snapshot(
     let schema = inventory::APPLICATION_SCHEMA;
     let discovered = inventory::discover(&mut *conn, schema).await?;
     let keys = primary_keys(&mut *conn, schema).await?;
+    let catalog = LiveCatalog {
+        constraints: live_constraints(&mut *conn, schema).await?,
+        indexes: live_indexes(&mut *conn, schema).await?,
+    };
 
     let mut findings = Vec::new();
     check_inventory_contract(&discovered, &mut findings);
 
+    let mut statuses: BTreeMap<&'static str, ContractStatus> = BTreeMap::new();
+
     for entry in inventory::REGISTRY {
         let Some(table) = discovered.table(entry.table) else {
-            continue; // already reported as INVENTORY_TABLE_MISSING
+            // Already reported as INVENTORY_TABLE_MISSING. Nothing about this
+            // table's contract was looked at, so it is NOT_EVALUATED rather
+            // than absent — absence would be indistinguishable from a table
+            // nobody asked about.
+            statuses.insert(entry.table, ContractStatus::NotEvaluated);
+            continue;
         };
-        // Any catalog disagreement — a missing column, a nullability change, a
-        // primary key that is not what the registry declares — means the
-        // scanner must not build this table's query. A query written against a
-        // schema that no longer exists either errors or, worse, silently
-        // reports about the wrong columns.
-        let relationships_hold = check_schema_relationships(entry, table, &mut findings);
 
+        // ── Gate 1: fatal structural drift ──
+        //
+        // A missing column, a wrong exact type, a primary key that is not what
+        // the registry declares, or an identifier this module would refuse to
+        // quote. Any of these means the scanner must not build this table's
+        // query at all: a query written against a schema that does not exist
+        // either errors or, worse, silently reports about the wrong columns.
+        let relationships_hold = check_schema_relationships(entry, table, &mut findings);
         let empty = Vec::new();
         let catalog_key = keys.get(entry.table).unwrap_or(&empty);
         let identity_holds = verify_row_identity(entry, table, catalog_key, &mut findings);
+        let identifiers_safe = match precheck_identifiers(entry) {
+            Ok(()) => true,
+            Err(unsafe_id) => {
+                // Reaching this is a registry bug, but it is reported as this
+                // table's drift rather than aborting the run: the other
+                // twenty-one tables' findings are still worth having, and a
+                // NOT_EVALUATED status says plainly that this one was skipped.
+                findings.push(contract_finding(
+                    ReasonCode::SchemaRelationshipDrift,
+                    entry.table,
+                    format!("{unsafe_id}; no query was constructed for this table"),
+                ));
+                false
+            }
+        };
+
+        if !(relationships_hold && identity_holds && identifiers_safe) {
+            statuses.insert(entry.table, ContractStatus::NotEvaluated);
+            continue;
+        }
+
+        // ── Gate 2: uniqueness / foreign-key contract drift ──
+        //
+        // Columns and row identity are sound, so queries *can* be built safely,
+        // but a uniqueness or foreign-key guarantee the ownership joins rest on
+        // is absent or altered. Ordinary conclusions would be authoritative-
+        // looking statements resting on a guarantee that no longer holds, so
+        // they are suppressed and only the ambiguity diagnostic runs — which is
+        // precisely the check that shows what the missing uniqueness costs.
+        let contract_holds = verify_schema_contract(entry, &catalog, &mut findings);
 
         if entry.class == TableClass::SystemGlobal {
             check_global_scope(entry, table, &mut findings);
-        } else if identity_holds && relationships_hold {
+        } else if contract_holds {
+            // ── Gate 3: clean ──
             scan_rows(&mut *conn, entry, &mut findings).await?;
             scan_future_uniqueness(&mut *conn, entry, &mut findings).await?;
+            scan_ambiguity(&mut *conn, entry, &mut findings).await?;
+        } else {
+            scan_ambiguity(&mut *conn, entry, &mut findings).await?;
         }
-        // A drifted identity means no scanner query is constructed at all for
-        // this table. The drift finding already blocks its tranche, so the
-        // absence of row findings cannot be mistaken for cleanliness.
+
+        statuses.insert(
+            entry.table,
+            if contract_holds {
+                ContractStatus::Satisfied
+            } else {
+                ContractStatus::Drifted
+            },
+        );
     }
 
     findings.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
@@ -815,7 +1268,13 @@ async fn audit_within_snapshot(
             .map(|t| t.name.clone())
             .collect(),
         excluded_objects: discovered.excluded.clone(),
-        classified_tables: super::report::classified_tables(),
+        classified_tables: super::report::classified_tables()
+            .into_iter()
+            .map(|mut t| {
+                t.contract_status = statuses.get(t.table).copied();
+                t
+            })
+            .collect(),
         blocking_count,
         advisory_count,
         findings,
@@ -974,6 +1433,142 @@ fn check_global_scope(
             ownership_path: None,
         });
     }
+}
+
+/// Validate every identifier this table's queries would interpolate, before any
+/// query string exists.
+///
+/// The scanner's identifier boundary is enforced at the point of use, which
+/// means a rejection surfaces halfway through building a query. Running the
+/// same validation up front turns that into a per-table gate: the table is
+/// reported as fatal structural drift and skipped, and the rest of the audit
+/// still runs.
+///
+/// Contract object *names* are deliberately not checked here. They are compared
+/// against the catalog and never interpolated, so they cannot reach a query
+/// string whatever they contain.
+fn precheck_identifiers(entry: &TableEntry) -> Result<(), UnsafeIdentifier> {
+    SqlIdentifier::new(entry.table)?;
+    for column in entry.row_identity.columns {
+        SqlIdentifier::new(column.name)?;
+    }
+    if let Some(canonical) = entry.canonical_path {
+        path_sql(&canonical, 0)?;
+    }
+    for (i, secondary) in entry.secondary_paths.iter().enumerate() {
+        path_sql(secondary, i + 1)?;
+    }
+    for column in entry.plan.future_unique_columns.unwrap_or(&[]) {
+        SqlIdentifier::new(column)?;
+    }
+    Ok(())
+}
+
+/// Does one source reference resolve to more than one owner?
+///
+/// The defensive counterpart to [`verify_schema_contract`]: the contract says a
+/// legacy identifier *should* resolve uniquely, and this measures whether it
+/// actually does. That is why it is the one scan still permitted when the
+/// uniqueness contract has drifted — it is the check whose whole subject is the
+/// consequence of that drift.
+///
+/// Grouping is by the path's declared **source** columns, not by the row's
+/// primary key: the question is whether one reference reaches two owners, and
+/// each row trivially has one primary key. For a session path the source is the
+/// `(agent, session)` pair, because `sessions` is unique on the pair and
+/// grouping by `session_id` alone would manufacture collisions between
+/// different agents' sessions.
+async fn scan_ambiguity(
+    conn: &mut sqlx::PgConnection,
+    entry: &TableEntry,
+    findings: &mut Vec<Finding>,
+) -> Result<(), AuditError> {
+    let Some(canonical) = entry.canonical_path else {
+        return Ok(());
+    };
+    // A tenant column resolves from the row itself, so there is no reference
+    // that could reach two owners.
+    if matches!(canonical.kind, PathKind::TenantColumn { .. }) {
+        return Ok(());
+    }
+
+    let mut source_columns = vec![canonical.kind.root_column()];
+    if let PathKind::Session { agent_column, .. } = canonical.kind {
+        source_columns.push(agent_column);
+    }
+
+    let table_sql = parent(entry.table)?;
+    let c = path_sql(&canonical, 0)?;
+
+    let mut group_exprs = Vec::with_capacity(source_columns.len());
+    for column in &source_columns {
+        group_exprs.push(SqlIdentifier::new(column)?.on("t"));
+    }
+    let raw_key = format!("concat_ws('|', {})", group_exprs.join(", "));
+
+    // The grouped key is the caller's own string on a legacy path, so it is
+    // pseudonymised exactly as a row identifier would be — same domain, same
+    // framing — rather than copied into the report.
+    let key_expr = if canonical.kind.root_is_caller_text() {
+        let prefix = sql_literal(&format!("{}{}", frame(ROW_ID_DOMAIN), frame(entry.table)));
+        format!(
+            "encode(sha256(convert_to({prefix} || octet_length({raw_key})::text || ':' \
+             || {raw_key}, 'UTF8')), 'hex')"
+        )
+    } else {
+        raw_key
+    };
+
+    // Rows whose reference is NULL are excluded: a NULL reference resolves to
+    // nothing, and grouping several of them together would report the absence
+    // of a reference as an ambiguous one.
+    let sql = format!(
+        "SELECT count(*) FILTER (WHERE n_agent > 1 AND n_tenant <= 1)::bigint AS n_agents, \
+                min(k) FILTER (WHERE n_agent > 1 AND n_tenant <= 1) AS id_agents, \
+                count(*) FILTER (WHERE n_tenant > 1)::bigint AS n_tenants, \
+                min(k) FILTER (WHERE n_tenant > 1) AS id_tenants \
+           FROM (SELECT ({key_expr}) AS k, \
+                        count(DISTINCT ({})) AS n_agent, \
+                        count(DISTINCT ({})) AS n_tenant \
+                   FROM {table_sql} t{} \
+                  WHERE NOT ({}) \
+                  GROUP BY 1) g",
+        c.agent_uuid, c.tenant, c.joins, c.root_null
+    );
+
+    let row = sqlx::query(AssertSqlSafe(sql))
+        .fetch_one(&mut *conn)
+        .await?;
+    let path_label = canonical.label.to_string();
+
+    for (n, id, diagnostic) in [
+        (
+            "n_agents",
+            "id_agents",
+            "one legacy reference resolves to more than one agent within a single tenant; the \
+             row's owner cannot be chosen from authoritative data",
+        ),
+        (
+            "n_tenants",
+            "id_tenants",
+            "one legacy reference resolves to more than one tenant; assigning either would move \
+             rows across a tenant boundary",
+        ),
+    ] {
+        let count: i64 = row.try_get(n).unwrap_or(0);
+        if count > 0 {
+            findings.push(Finding {
+                severity: ReasonCode::AmbiguousLegacyIdentifier.severity(),
+                reason_code: ReasonCode::AmbiguousLegacyIdentifier,
+                table_name: entry.table.to_string(),
+                row_identifier: row.try_get(id).ok().flatten(),
+                count,
+                diagnostic: format!("{diagnostic} (grouped by {})", source_columns.join(", ")),
+                ownership_path: Some(path_label.clone()),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The row-level scan for one table: one aggregate query, inside the snapshot.
@@ -1292,12 +1887,19 @@ async fn scan_future_uniqueness(
         cols.push(SqlIdentifier::new(column)?.on("t"));
     }
     let group_by: Vec<String> = (1..=cols.len() + 1).map(|i| i.to_string()).collect();
+    // Rows whose canonical tenant is unresolved are excluded. `GROUP BY` treats
+    // all NULLs as one group, so including them collided every unowned row in
+    // the table with every other and reported a future-uniqueness violation
+    // that no future index would ever see: the tenant column those rows end up
+    // with is not NULL, it is *not yet known*. Their real blocker is
+    // LEGACY_UNMAPPED, which is already reported against the same rows.
     let sql = format!(
         "SELECT count(*)::bigint AS n FROM (SELECT ({}) AS tenant, {} FROM {table_sql} t{} \
-          GROUP BY {} HAVING count(*) > 1) g",
+          WHERE ({}) IS NOT NULL GROUP BY {} HAVING count(*) > 1) g",
         c.tenant,
         cols.join(", "),
         c.joins,
+        c.tenant,
         group_by.join(", "),
     );
 
@@ -1327,6 +1929,32 @@ async fn scan_future_uniqueness(
 /// A tranche is ready only when every blocking code its tables require is
 /// absent. Advisory findings are never permission.
 fn assess_tranches(findings: &[Finding]) -> Vec<TrancheReadiness> {
+    // These say the *inventory itself* is untrustworthy, so no tranche can be
+    // reasoned about — including tranches whose own tables are all clean.
+    //
+    // Scoping them per-table hid the worst case entirely: UNCLASSIFIED_TABLE
+    // fires on a table with no registry entry, so it belongs to no tranche, so
+    // it blocked nothing. A brand-new table with no tenancy decision could be
+    // added and every tranche would still read READY.
+    let global: Vec<String> = {
+        let mut v: Vec<String> = findings
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.reason_code,
+                    ReasonCode::UnclassifiedTable
+                        | ReasonCode::InventoryTableMissing
+                        | ReasonCode::MultipleClassifications
+                        | ReasonCode::MissingCanonicalOwnershipPath
+                ) && f.severity == Severity::Blocking
+            })
+            .map(|f| format!("{}: {}", f.table_name, f.reason_code))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
     Tranche::ALL
         .iter()
         .map(|tranche| {
@@ -1335,7 +1963,7 @@ fn assess_tranches(findings: &[Finding]) -> Vec<TrancheReadiness> {
                 .filter(|e| e.tranche == *tranche)
                 .collect();
 
-            let mut blocking: Vec<String> = Vec::new();
+            let mut blocking: Vec<String> = global.clone();
             for entry in &tables {
                 for finding in findings
                     .iter()

@@ -1,6 +1,6 @@
 {
   "schema_version": "step4a.1",
-  "inventory_digest": "sha256:283fd55811aefba6e717cbc91f23bd2fa9eb5beeb956a1bd53266b7d0226542b",
+  "inventory_digest": "sha256:f051a2f24b799d41a201d81b904eb569593c8a1b512de3b9d9b4fe3217c5e840",
   "reason_codes": [
     {
       "code": "UNCLASSIFIED_TABLE",
@@ -670,7 +670,7 @@
         ]
       },
       "global_scope_evidence": null,
-      "rationale": "`session_id` is NULL-able, so the session cannot be the canonical path; the NOT NULL `agent_id` is. The session remains a consistency check."
+      "rationale": "The NOT NULL `agent_id` is the canonical path. `session_id` is CONTEXT_ONLY: it is not an ownership path and it is not a consistency path, because a row may legitimately outlive or precede its `sessions` row."
     },
     {
       "table": "credential_agent_grants",

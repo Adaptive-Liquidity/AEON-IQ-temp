@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::audit::{self, ReasonCode, Severity, AUDIT_TRANSACTION};
 use super::inventory::{self, TableClass, Tranche};
-use super::report::{self, TenancyAuditReport};
+use super::report::{self, ContractStatus, TenancyAuditReport};
 
 const TENANT: &str = "11111111-1111-1111-1111-111111111111";
 const OTHER_TENANT: &str = "22222222-2222-2222-2222-222222222222";
@@ -513,10 +513,17 @@ async fn a_context_only_session_never_reports_an_orphan(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn an_orphaned_memory_reference_is_reported(pool: PgPool) {
+async fn an_orphaned_memory_reference_drifts_before_it_can_be_counted(pool: PgPool) {
+    // Every memory reference in this schema is backed by a declared foreign
+    // key, so an orphan cannot exist while the contract holds — producing one
+    // requires dropping the very constraint the registry requires.
+    //
+    // That makes this the boundary case for the three-way gate: the drop is
+    // contract drift, so the table is DRIFTED and its ordinary ownership
+    // conclusions are withheld. The orphan rows are *not* individually counted.
+    // They are not lost either — the drift blocks the tranche, which is the
+    // decision those counts would have fed.
     seed_clean(&pool, "agent-one", TENANT).await;
-    // `memory_conflicts.memory_a` is nullable and its FK is droppable, which is
-    // how a legacy dump would arrive.
     sqlx::query(
         "ALTER TABLE public.memory_conflicts DROP CONSTRAINT memory_conflicts_memory_a_fkey",
     )
@@ -532,14 +539,35 @@ async fn an_orphaned_memory_reference_is_reported(pool: PgPool) {
     .unwrap();
 
     let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "memory_conflicts"),
+        Some(ContractStatus::Drifted),
+        "{:?}",
+        diagnostics_for(&report, "memory_conflicts")
+    );
+    assert!(drift_mentions(
+        &report,
+        "memory_conflicts",
+        "memory_conflicts_memory_a_fkey"
+    ));
     assert!(
-        has(
+        !has(
             &report,
             "memory_conflicts",
             ReasonCode::OrphanedMemoryReference
         ),
-        "{:?}",
+        "an orphan count computed without the FK that guarantees the parent is an ordinary \
+         authoritative conclusion, and must be withheld: {:?}",
         codes_for(&report, "memory_conflicts")
+    );
+    assert!(
+        !report
+            .tranche_readiness
+            .iter()
+            .find(|t| t.tranche == Tranche::LineageAndArchival)
+            .unwrap()
+            .ready,
+        "the withheld counts must not read as cleanliness"
     );
 }
 
@@ -830,18 +858,15 @@ async fn an_unjustified_global_classification_would_block(pool: PgPool) {
 
 #[sqlx::test(migrations = "./migrations")]
 async fn a_write_inside_the_audit_transaction_is_rejected(pool: PgPool) {
-    // The same statement the audit opens with — shared as a constant so this
-    // cannot drift onto a different transaction.
-    let mut conn = pool.acquire().await.unwrap();
-    sqlx::raw_sql(AUDIT_TRANSACTION)
-        .execute(&mut *conn)
-        .await
-        .unwrap();
+    // Opened exactly the way the audit opens it — `begin_with` on the shared
+    // constant — so this cannot drift onto a different transaction or a
+    // different mechanism than the one production uses.
+    let mut tx = pool.begin_with(AUDIT_TRANSACTION).await.unwrap();
 
     let error = sqlx::query(
         "INSERT INTO agents (agent_id, external_agent_id) VALUES ('sneaky', 'ext-sneaky')",
     )
-    .execute(&mut *conn)
+    .execute(&mut *tx)
     .await
     .expect_err("PostgreSQL must refuse a write in a READ ONLY transaction");
     let rendered = format!("{error:?}");
@@ -849,7 +874,37 @@ async fn a_write_inside_the_audit_transaction_is_rejected(pool: PgPool) {
         rendered.contains("read-only") || rendered.contains("25006"),
         "{rendered}"
     );
-    sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+    tx.rollback().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_audit_returns_its_connection_usable(pool: PgPool) {
+    // The managed transaction's point: whatever the audit does, the connection
+    // goes back to the pool with no transaction open and no READ ONLY still in
+    // force. A manual BEGIN/COMMIT leaks that state on any early return, and
+    // the next borrower would silently fail its writes.
+    seed_clean(&pool, "agent-one", TENANT).await;
+    audit(&pool).await;
+
+    // A write on a pooled connection afterwards proves both halves at once.
+    sqlx::query("INSERT INTO agents (agent_id, external_agent_id) VALUES ('after', 'ext-after')")
+        .execute(&pool)
+        .await
+        .expect("the pool must hand back a writable, transaction-free connection");
+
+    let in_transaction: bool = sqlx::query("SELECT pg_current_xact_id_if_assigned() IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !in_transaction,
+        "no audit transaction may still be open on a pooled connection"
+    );
+
+    // And the audit still works on a pool that has been used this way.
+    let report = audit(&pool).await;
+    assert_eq!(report.schema_version, audit::REPORT_SCHEMA_VERSION);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1100,19 +1155,63 @@ async fn a_caller_controlled_text_key_is_pseudonymised(pool: PgPool) {
     .unwrap();
 
     let report = audit(&pool).await;
-    let identifier = report
+
+    // Every finding for the table, not just the first. Checking one leaves the
+    // others unexamined, and the ones a future change adds would be exactly the
+    // unexamined ones — a second finding emitting the raw key would have passed
+    // a first-only assertion unchanged.
+    let findings: Vec<_> = report
         .findings
         .iter()
-        .find(|f| f.table_name == "amp_controller_state")
-        .and_then(|f| f.row_identifier.clone())
-        .expect("an orphaned controller row must be reported");
+        .filter(|f| f.table_name == "amp_controller_state")
+        .collect();
+    assert!(
+        !findings.is_empty(),
+        "an orphaned controller row must be reported"
+    );
 
-    assert!(!identifier.contains(AGENT_ID), "{identifier}");
-    assert_eq!(identifier.len(), 64, "a full SHA-256 digest: {identifier}");
-    assert_eq!(
-        identifier,
-        audit::row_pseudonym("amp_controller_state", AGENT_ID),
-        "the emitted pseudonym must be the framed digest, not an ad-hoc hash"
+    let expected = audit::row_pseudonym("amp_controller_state", AGENT_ID);
+    let mut seen_identifier = false;
+    for finding in &findings {
+        let Some(identifier) = &finding.row_identifier else {
+            continue;
+        };
+        seen_identifier = true;
+        assert!(
+            !identifier.contains(AGENT_ID),
+            "{} leaked the raw key: {identifier}",
+            finding.reason_code
+        );
+        assert_eq!(
+            identifier.len(),
+            64,
+            "{} must emit a full SHA-256 digest: {identifier}",
+            finding.reason_code
+        );
+        assert_eq!(
+            *identifier, expected,
+            "{} must emit the framed digest, not an ad-hoc hash",
+            finding.reason_code
+        );
+    }
+    assert!(
+        seen_identifier,
+        "at least one finding must carry an example identifier, or this proves nothing"
+    );
+
+    // …and neither rendering may carry the raw key anywhere else either — a
+    // diagnostic string or a path label would leak it just as effectively as a
+    // row identifier.
+    let json = report.to_json().unwrap();
+    let text = report.to_string();
+    assert!(!json.contains(AGENT_ID), "machine JSON leaked the raw key");
+    assert!(
+        !text.contains(AGENT_ID),
+        "operator rendering leaked the raw key"
+    );
+    assert!(
+        json.contains(&expected),
+        "the pseudonym must actually reach the machine report"
     );
 }
 
@@ -1188,4 +1287,687 @@ async fn the_report_carries_the_schema_version_and_digest(pool: PgPool) {
     // Both renderings describe the same object.
     assert!(report.to_string().contains(&report.inventory_digest));
     assert!(report.to_json().unwrap().contains(&report.inventory_digest));
+}
+
+// ── Live current-schema contract verification ───────────────────────────────
+//
+// Every test here breaks exactly one declared guarantee and requires the audit
+// to notice. The control — an untouched migrated schema reporting SATISFIED for
+// every table — is what stops the verifier from passing by rejecting
+// everything.
+
+fn status_of(report: &TenancyAuditReport, table: &str) -> Option<ContractStatus> {
+    report
+        .classified_tables
+        .iter()
+        .find(|t| t.table == table)
+        .expect("table is in the registry")
+        .contract_status
+}
+
+/// Did the audit report drift naming this object?
+fn drift_mentions(report: &TenancyAuditReport, table: &str, needle: &str) -> bool {
+    report.findings.iter().any(|f| {
+        f.table_name == table
+            && f.reason_code == ReasonCode::SchemaRelationshipDrift
+            && f.diagnostic.contains(needle)
+    })
+}
+
+/// Every diagnostic for one table, for assertion messages.
+fn diagnostics_for(report: &TenancyAuditReport, table: &str) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.table_name == table)
+        .map(|f| f.diagnostic.clone())
+        .collect()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn the_unchanged_migrated_schema_satisfies_every_declared_contract(pool: PgPool) {
+    // The control case. Without it, a verifier that rejected every object would
+    // pass all the destructive tests below and prove nothing at all.
+    let report = audit(&pool).await;
+
+    for table in &report.classified_tables {
+        assert_eq!(
+            table.contract_status,
+            Some(ContractStatus::Satisfied),
+            "`{}` must satisfy its declared contract on an untouched schema; findings: {:?}",
+            table.table,
+            diagnostics_for(&report, table.table)
+        );
+    }
+
+    // …and none of that status came from an empty declaration.
+    let declared: usize = report
+        .classified_tables
+        .iter()
+        .map(|t| t.required_current_schema_contract.len())
+        .sum();
+    assert!(
+        declared >= inventory::REGISTRY.len(),
+        "every table must declare at least one object, or SATISFIED is vacuous: {declared}"
+    );
+
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| f.reason_code == ReasonCode::SchemaRelationshipDrift),
+        "a clean schema must produce no drift"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_dropped_primary_key_is_fatal_not_merely_drifted(pool: PgPool) {
+    // The primary key is also the declared row identity, so losing it is fatal
+    // structural drift rather than contract drift: no query may be built at
+    // all, and the status must say NOT_EVALUATED rather than DRIFTED.
+    sqlx::query("ALTER TABLE public.memory_graph DROP CONSTRAINT memory_graph_pkey")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "memory_graph"),
+        Some(ContractStatus::NotEvaluated),
+        "{:?}",
+        codes_for(&report, "memory_graph")
+    );
+    assert!(has(
+        &report,
+        "memory_graph",
+        ReasonCode::SchemaRelationshipDrift
+    ));
+    // Everything else stayed evaluable.
+    assert_eq!(
+        status_of(&report, "memories"),
+        Some(ContractStatus::Satisfied)
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_dropped_unique_constraint_is_reported(pool: PgPool) {
+    sqlx::query("ALTER TABLE public.agents DROP CONSTRAINT agents_tenant_id_external_agent_id_key")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(status_of(&report, "agents"), Some(ContractStatus::Drifted));
+    assert!(
+        drift_mentions(&report, "agents", "does not exist"),
+        "{:?}",
+        diagnostics_for(&report, "agents")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_dropped_standalone_unique_index_is_reported(pool: PgPool) {
+    // `idx_sessions_agent_session` has no `pg_constraint` row at all — it is a
+    // bare `CREATE UNIQUE INDEX`. A verifier that consulted only
+    // `pg_constraint` would report it missing on a healthy database *and* miss
+    // it actually being dropped here.
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(
+        drift_mentions(&report, "sessions", "idx_sessions_agent_session"),
+        "{:?}",
+        diagnostics_for(&report, "sessions")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_dropped_foreign_key_is_reported(pool: PgPool) {
+    sqlx::query(
+        "ALTER TABLE public.archival_batches DROP CONSTRAINT archival_batches_agent_id_fkey",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "archival_batches"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(drift_mentions(
+        &report,
+        "archival_batches",
+        "archival_batches_agent_id_fkey"
+    ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn reordered_constraint_columns_are_reported(pool: PgPool) {
+    // Same name, same columns, different order. Every name-based check passes;
+    // the object is not the one that was declared.
+    sqlx::query("ALTER TABLE public.agents DROP CONSTRAINT agents_tenant_id_external_agent_id_key")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.agents ADD CONSTRAINT agents_tenant_id_external_agent_id_key \
+         UNIQUE (external_agent_id, tenant_id)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(status_of(&report, "agents"), Some(ContractStatus::Drifted));
+    assert!(
+        drift_mentions(&report, "agents", "in that order"),
+        "{:?}",
+        diagnostics_for(&report, "agents")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_foreign_key_pointing_at_the_wrong_columns_is_reported(pool: PgPool) {
+    // The FK still exists, still has its declared name, still covers the
+    // declared local column — and references a different column of the same
+    // parent, so it guarantees something else entirely.
+    sqlx::query(
+        "ALTER TABLE public.agents ADD CONSTRAINT agents_external_only_key \
+         UNIQUE (external_agent_id)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.archival_batches DROP CONSTRAINT archival_batches_agent_id_fkey",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.archival_batches ADD CONSTRAINT archival_batches_agent_id_fkey \
+         FOREIGN KEY (agent_id) REFERENCES public.agents (external_agent_id)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "archival_batches"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(
+        drift_mentions(&report, "archival_batches", "is required to reference ("),
+        "{:?}",
+        diagnostics_for(&report, "archival_batches")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_not_valid_foreign_key_is_reported(pool: PgPool) {
+    // NOT VALID constrains new rows only. The scanner treats this join as
+    // authoritative over rows that already exist, which is exactly what
+    // NOT VALID does not promise.
+    sqlx::query(
+        "ALTER TABLE public.archival_batches DROP CONSTRAINT archival_batches_agent_id_fkey",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "ALTER TABLE public.archival_batches ADD CONSTRAINT archival_batches_agent_id_fkey \
+         FOREIGN KEY (agent_id) REFERENCES public.agents (agent_id) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "archival_batches"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(drift_mentions(&report, "archival_batches", "NOT VALID"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_partial_unique_index_does_not_satisfy_the_contract(pool: PgPool) {
+    // Uniqueness only inside the predicate. Rows outside it are unconstrained,
+    // so a join assuming at most one match is not backed by this.
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE UNIQUE INDEX idx_sessions_agent_session ON public.sessions (agent_id, session_id) \
+         WHERE agent_id <> 'excluded'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(drift_mentions(&report, "sessions", "non-partial"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_expression_index_does_not_satisfy_the_contract(pool: PgPool) {
+    // `lower(agent_id)` being unique says nothing about `agent_id` being
+    // unique. The catalog reports the key column as an expression, which
+    // matches no declared column name.
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE UNIQUE INDEX idx_sessions_agent_session \
+         ON public.sessions (lower(agent_id), session_id)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(drift_mentions(&report, "sessions", "expression index"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_non_unique_replacement_index_does_not_satisfy_the_contract(pool: PgPool) {
+    // Same name, same columns, same order — and no uniqueness guarantee.
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE INDEX idx_sessions_agent_session ON public.sessions (agent_id, session_id)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(drift_mentions(&report, "sessions", "required to be UNIQUE"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_invalid_index_does_not_satisfy_the_contract(pool: PgPool) {
+    // Built the way an invalid index actually arises: a CONCURRENTLY build that
+    // fails on existing duplicates leaves the index in place, INVALID. It looks
+    // complete, enforces nothing, and the planner will not use it.
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO agents (agent_id, tenant_id, external_agent_id) \
+         VALUES ('dupe', $1::uuid, 'ext-dupe')",
+    )
+    .bind(TENANT)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO sessions (session_id, agent_id) VALUES ('same', 'dupe')")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX CONCURRENTLY idx_sessions_agent_session \
+         ON public.sessions (agent_id, session_id)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("the duplicate rows must make the concurrent build fail");
+
+    let invalid: bool = sqlx::query(
+        "SELECT NOT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+          WHERE c.relname = 'idx_sessions_agent_session'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get(0);
+    assert!(
+        invalid,
+        "precondition: the failed build left an INVALID index"
+    );
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    assert!(
+        drift_mentions(&report, "sessions", "INVALID"),
+        "{:?}",
+        diagnostics_for(&report, "sessions")
+    );
+}
+
+// ── The three-way gate ──────────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn contract_drift_suppresses_ordinary_ownership_conclusions(pool: PgPool) {
+    // An unmapped agent would normally make `sessions` report UNMAPPED_AGENT.
+    // With the uniqueness contract broken, that conclusion rests on a guarantee
+    // that no longer holds, so it must be withheld — and the drift must block
+    // the tranche, so withholding it cannot be read as the table being clean.
+    sqlx::query("INSERT INTO agents (agent_id, external_agent_id) VALUES ('unmapped', 'ext-u')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sessions (session_id, agent_id) VALUES ('s-1', 'unmapped')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let before = audit(&pool).await;
+    assert!(
+        has(&before, "sessions", ReasonCode::UnmappedAgent),
+        "precondition: the conclusion is reachable while the contract holds"
+    );
+    assert_eq!(
+        status_of(&before, "sessions"),
+        Some(ContractStatus::Satisfied)
+    );
+
+    sqlx::query("DROP INDEX public.idx_sessions_agent_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let after = audit(&pool).await;
+    assert_eq!(status_of(&after, "sessions"), Some(ContractStatus::Drifted));
+    assert!(
+        !has(&after, "sessions", ReasonCode::UnmappedAgent),
+        "authoritative conclusions must be suppressed under contract drift: {:?}",
+        codes_for(&after, "sessions")
+    );
+    assert!(has(&after, "sessions", ReasonCode::SchemaRelationshipDrift));
+    assert!(
+        !after
+            .tranche_readiness
+            .iter()
+            .find(|t| t.tranche == Tranche::Sessions)
+            .unwrap()
+            .ready,
+        "drift must block the tranche, so the missing findings cannot read as clean"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn fatal_identity_drift_runs_no_ambiguity_query(pool: PgPool) {
+    // Under fatal drift the row identity is not usable, so the ambiguity query
+    // — which groups by a path rooted on the same table — must not be
+    // constructed either. NOT_EVALUATED is the whole point: "not looked at"
+    // must never render as "fine".
+    sqlx::query("ALTER TABLE public.memory_graph DROP CONSTRAINT memory_graph_pkey")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.memory_graph ADD PRIMARY KEY (agent_id, subject, predicate)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert_eq!(
+        status_of(&report, "memory_graph"),
+        Some(ContractStatus::NotEvaluated)
+    );
+    assert!(
+        !has(
+            &report,
+            "memory_graph",
+            ReasonCode::AmbiguousLegacyIdentifier
+        ),
+        "no ambiguity query may run against an invalid identity: {:?}",
+        codes_for(&report, "memory_graph")
+    );
+    assert!(report.is_blocked());
+}
+
+// ── Ambiguity detection ─────────────────────────────────────────────────────
+
+/// Remove the global uniqueness of `agents.agent_id` so one legacy identifier
+/// can resolve to more than one agent. `CASCADE` also drops the foreign keys
+/// that depend on it, which is precisely the state this check exists for.
+async fn unmake_agent_id_unique(pool: &PgPool) {
+    sqlx::query("ALTER TABLE public.agents DROP CONSTRAINT agents_agent_id_key CASCADE")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Two agents sharing one legacy identifier.
+async fn seed_shared_identifier(pool: &PgPool, tenants: [&str; 2]) {
+    unmake_agent_id_unique(pool).await;
+    for (i, tenant) in tenants.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO agents (agent_id, tenant_id, external_agent_id) \
+             VALUES ('shared', $1::uuid, $2)",
+        )
+        .bind(tenant)
+        .bind(format!("ext-{i}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn one_reference_resolving_to_two_agents_in_one_tenant_is_ambiguous(pool: PgPool) {
+    seed_shared_identifier(&pool, [TENANT, TENANT]).await;
+    sqlx::query(
+        "INSERT INTO memories (agent_id, content, memory_type) VALUES ('shared', 'x', 'fact')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| {
+            f.table_name == "memories"
+                && f.reason_code == ReasonCode::AmbiguousLegacyIdentifier
+                && f.diagnostic.contains("more than one agent")
+        })
+        .unwrap_or_else(|| panic!("{:?}", diagnostics_for(&report, "memories")));
+
+    // The grouped key is the caller's own string, so it is pseudonymised
+    // exactly as a row identifier would be — same domain, same framing.
+    let identifier = finding
+        .row_identifier
+        .as_ref()
+        .expect("an example group must be emitted");
+    assert_eq!(identifier.len(), 64, "{identifier}");
+    assert_eq!(*identifier, audit::row_pseudonym("memories", "shared"));
+    assert!(report.is_blocked());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn one_reference_resolving_across_tenants_is_ambiguous(pool: PgPool) {
+    seed_shared_identifier(&pool, [TENANT, OTHER_TENANT]).await;
+    sqlx::query(
+        "INSERT INTO memories (agent_id, content, memory_type) VALUES ('shared', 'x', 'fact')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    assert!(
+        report.findings.iter().any(|f| {
+            f.table_name == "memories"
+                && f.reason_code == ReasonCode::AmbiguousLegacyIdentifier
+                && f.diagnostic.contains("more than one tenant")
+        }),
+        "{:?}",
+        diagnostics_for(&report, "memories")
+    );
+    assert!(report.is_blocked());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ambiguity_is_still_measured_under_uniqueness_drift(pool: PgPool) {
+    // The one scan that survives contract drift, because its whole subject is
+    // what the missing uniqueness actually costs.
+    seed_shared_identifier(&pool, [TENANT, TENANT]).await;
+    sqlx::query("INSERT INTO sessions (session_id, agent_id) VALUES ('s-1', 'shared')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    // `sessions` lost the foreign key that depended on the dropped unique
+    // constraint, so its contract has drifted…
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Drifted)
+    );
+    // …and the ambiguity diagnostic still ran.
+    assert!(
+        has(&report, "sessions", ReasonCode::AmbiguousLegacyIdentifier),
+        "{:?}",
+        codes_for(&report, "sessions")
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_unique_legacy_reference_is_never_called_ambiguous(pool: PgPool) {
+    // The control: many rows sharing one reference that resolves to exactly one
+    // agent is normal, not ambiguous.
+    seed_clean(&pool, "agent-one", TENANT).await;
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO memories (agent_id, content, memory_type) \
+             VALUES ('agent-one', $1, 'fact')",
+        )
+        .bind(format!("m{i}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let report = audit(&pool).await;
+    assert!(
+        !has(&report, "memories", ReasonCode::AmbiguousLegacyIdentifier),
+        "{:?}",
+        codes_for(&report, "memories")
+    );
+    assert_eq!(
+        status_of(&report, "memories"),
+        Some(ContractStatus::Satisfied)
+    );
+}
+
+// ── Global readiness blockers ───────────────────────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unclassified_table_blocks_every_tranche(pool: PgPool) {
+    // It belongs to no tranche, so scoping the block per-table hid it entirely:
+    // a brand-new table with no tenancy decision left every tranche READY.
+    sqlx::query("CREATE TABLE public.brand_new_thing (id uuid PRIMARY KEY, agent_id text)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert!(has(
+        &report,
+        "brand_new_thing",
+        ReasonCode::UnclassifiedTable
+    ));
+    for tranche in &report.tranche_readiness {
+        assert!(
+            !tranche.ready,
+            "{} must be blocked by an unclassified table",
+            tranche.tranche.as_str()
+        );
+        assert!(tranche
+            .blocking_reasons
+            .iter()
+            .any(|r| r.contains("brand_new_thing")));
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn a_missing_registered_table_blocks_every_tranche(pool: PgPool) {
+    sqlx::query("DROP TABLE public.memory_conflicts CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = audit(&pool).await;
+    assert!(has(
+        &report,
+        "memory_conflicts",
+        ReasonCode::InventoryTableMissing
+    ));
+    assert_eq!(
+        status_of(&report, "memory_conflicts"),
+        Some(ContractStatus::NotEvaluated),
+        "a table that is gone was never evaluated"
+    );
+    for tranche in &report.tranche_readiness {
+        assert!(!tranche.ready, "{}", tranche.tranche.as_str());
+    }
+}
+
+// ── Future uniqueness ───────────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn unresolved_tenants_do_not_manufacture_a_uniqueness_collision(pool: PgPool) {
+    // `GROUP BY` folds all NULLs into one group, so including unresolved rows
+    // collided every unowned row with every other and reported a violation no
+    // future index would ever see. Their real blocker is UNMAPPED_AGENT, which
+    // is reported against the same rows.
+    sqlx::query("INSERT INTO agents (agent_id, external_agent_id) VALUES ('no-tenant', 'ext-nt')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for i in 0..3 {
+        sqlx::query("INSERT INTO sessions (session_id, agent_id) VALUES ($1, 'no-tenant')")
+            .bind(format!("s-{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let report = audit(&pool).await;
+    assert!(
+        !has(
+            &report,
+            "sessions",
+            ReasonCode::FutureTenantUniquenessCollision
+        ),
+        "unresolved tenants must be excluded from the grouping: {:?}",
+        diagnostics_for(&report, "sessions")
+    );
+    // The rows are still blocked — by the code that actually describes them.
+    assert!(has(&report, "sessions", ReasonCode::UnmappedAgent));
 }

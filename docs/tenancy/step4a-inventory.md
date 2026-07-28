@@ -3,7 +3,7 @@
 Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry is the source of truth and a test regenerates this file and compares it.
 
 - schema version: `step4a.1`
-- inventory digest: `sha256:283fd55811aefba6e717cbc91f23bd2fa9eb5beeb956a1bd53266b7d0226542b`
+- inventory digest: `sha256:f051a2f24b799d41a201d81b904eb569593c8a1b512de3b9d9b4fe3217c5e840`
 - tables classified: 22
 
 ## Classification summary
@@ -19,9 +19,13 @@ Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry 
 
 ## REQUIRED_CURRENT_SCHEMA_CONTRACT
 
-**Status: DECLARED — runtime verification is not implemented in this checkpoint.**
+**RUNTIME CONTRACT VERIFICATION: IMPLEMENTED**
 
-Each table declares the schema objects its ownership joins and row identity rely on **today** — not the constraints Step 4B will add, which live in the migration plan. Nothing listed here has been checked against a live database: these are registry declarations, not verified live-database facts. Until the verifier lands, a dropped or altered constraint would go unreported.
+Each audit execution verifies these declared requirements against its live PostgreSQL catalog.
+
+Each table declares the schema objects its ownership joins and row identity rely on **today** — not the constraints Step 4B will add, which live in the migration plan. Constraints are matched on `contype`, ordered `conkey` attribute names, referenced schema and table, ordered `confkey` attribute names and `convalidated`; indexes on ordered key columns, `indisunique`, `indisvalid`, `indisready`, absence of `indpred` and `indexprs`, and key-column count. A name alone never satisfies a requirement.
+
+This file is a **static** rendering of the registry. It records what every deployment is required to have, and it is not evidence that any particular deployment has it — only a run against that database can say so, and only for that database. Each run reports `SATISFIED`, `DRIFTED` or `NOT_EVALUATED` per table in its machine report.
 
 ## Session semantics
 
@@ -87,7 +91,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `FINAL_CONSTRAINT_TIGHTENING`
 - **rationale**: System bookkeeping. Carries a tenant-shaped column, which is exactly why it needs stated evidence rather than an assumption.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `agent_tenancy_migrations_pkey` PRIMARY KEY (id), validated
 - **canonical path**: *(none — SYSTEM_GLOBAL)*
 - **global-scope evidence**: Ledger of tenancy *migration runs*, written only by the step-1 backfill and read only by `assert_multi_tenant_preconditions`. It is on no request path. Its `legacy_tenant_id` is an input parameter of the run that produced the row, not ownership of the row: migration 0028 constrains it with `(mode = 'single_tenant') = (legacy_tenant_id IS NOT NULL)`, so in `mapped` mode it is NULL by construction. Giving these rows a tenant would misrepresent an operator action as tenant data.
@@ -108,7 +112,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: The tenant root: it holds `tenant_id` itself and is what every other ownership path resolves to.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `agents_pkey` PRIMARY KEY (id), validated
   - `agents_agent_id_key` UNIQUE (agent_id), validated
   - `agents_tenant_id_external_agent_id_key` UNIQUE (tenant_id, external_agent_id), validated
@@ -134,7 +138,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_5_TENANT_GLOBAL_OPERATIONS`
 - **rationale**: Reads as global controller state, but its primary key *is* `agent_id` and `rmk_worker` writes one row per agent. It is per-agent state — the name is the only thing about it that suggests otherwise, which is why the classification is taken from the key and the writers instead.
 - **row identity**: `agent_id` (caller text, pseudonymised)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `amp_controller_state_pkey` PRIMARY KEY (agent_id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **added columns**: `agent_uuid UUID`, `tenant_id UUID`
@@ -155,7 +159,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: Has a real FK to `agents(agent_id)`, so its owner is already enforced. Must precede `memories`, which references it.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `archival_batches_pkey` PRIMARY KEY (id), validated
   - `archival_batches_agent_id_fkey` FOREIGN KEY (agent_id) REFERENCES agents(agent_id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
@@ -177,7 +181,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: Agent-scoped when an agent is known. LEGACY_UNMAPPED exists as a row-level code precisely for tables like this one, which hold both assignable and unassignable rows.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `audit_logs_pkey` PRIMARY KEY (id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **consistency**: `agent_id` is NULL-able here and nowhere else among the direct children. A NULL is not schema drift — some events genuinely have no agent — but it is unassignable, so those rows are reported LEGACY_UNMAPPED and the table cannot take a NOT NULL tenant until their disposition is decided.
@@ -199,7 +203,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_4_LINEAGE_AND_ARCHIVAL`
 - **rationale**: No agent column exists. Both `memory_a` and `memory_b` are NOT NULL FKs to `memories`, so ownership is entirely lineage-derived.
 - **row identity**: `memory_a` (surrogate, emitted as-is), `memory_b` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `co_access_edges_pkey` PRIMARY KEY (memory_a, memory_b), validated
   - `co_access_edges_memory_a_fkey` FOREIGN KEY (memory_a) REFERENCES memories(id), validated
   - `co_access_edges_memory_b_fkey` FOREIGN KEY (memory_b) REFERENCES memories(id), validated
@@ -223,9 +227,9 @@ constraints — not from whether the column happens to be NULL-able.
 
 - **class**: `DIRECT_AGENT_CHILD`
 - **tranche**: `TRANCHE_3_MEMORIES`
-- **rationale**: `session_id` is NULL-able, so the session cannot be the canonical path; the NOT NULL `agent_id` is. The session remains a consistency check.
+- **rationale**: The NOT NULL `agent_id` is the canonical path. `session_id` is CONTEXT_ONLY: it is not an ownership path and it is not a consistency path, because a row may legitimately outlive or precede its `sessions` row.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `cognitive_hypervisor_timeline_pkey` PRIMARY KEY (id), validated
 - **session role**: `CONTEXT_ONLY` — Read by `WHERE agent_id = $1` and `WHERE id = $1`; the hash chain is per-agent. No query selects by session.
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
@@ -248,7 +252,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: The only table already keyed on the internal UUID. Its tenant is materialised but derived — the composite FK to `agents(tenant_id, id)` is what makes it authoritative — so it is a direct agent child, not a root.
 - **row identity**: `credential_id` (surrogate, emitted as-is), `agent_uuid` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `credential_agent_grants_pkey` PRIMARY KEY (credential_id, agent_uuid), validated
   - `credential_agent_grants_agent_fkey` FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id), validated
   - `credential_agent_grants_credential_fkey` FOREIGN KEY (credential_id, tenant_id) REFERENCES credentials(id, tenant_id), validated
@@ -273,7 +277,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: TENANT_GLOBAL rather than TENANT_ROOT: it carries an authoritative tenant but is not the terminus other tables resolve to, and it is deliberately not bound to any one agent. TENANT_ROOT is reserved for `agents` and any future pure `tenants` table.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `credentials_pkey` PRIMARY KEY (id), validated
   - `credentials_id_tenant_id_key` UNIQUE (id, tenant_id), validated
 - **canonical path**: `row.tenant_id (authoritative, NOT NULL)`
@@ -295,7 +299,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: Per-agent extraction output, keyed by the legacy identifier.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `entities_pkey` PRIMARY KEY (id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **added columns**: `agent_uuid UUID`, `tenant_id UUID`
@@ -317,7 +321,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_3_MEMORIES`
 - **rationale**: A work queue whose rows are owned by the agent that enqueued them; the session is optional context.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `extraction_jobs_pkey` PRIMARY KEY (id), validated
 - **session role**: `CONTEXT_ONLY` — The worker claims jobs with an unfiltered queue scan over `extraction_jobs`, never by session; session_id is payload context carried through to the extracted memories.
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
@@ -340,7 +344,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_3_MEMORIES`
 - **rationale**: Root of the memory lineage, but its own owner is the agent: `session_id` is NULL-able and `archival_batch_id` is NULL-able, so neither can be canonical.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memories_pkey` PRIMARY KEY (id), validated
   - `memories_archival_batch_id_fkey` FOREIGN KEY (archival_batch_id) REFERENCES archival_batches(id), validated
 - **session role**: `CONTEXT_ONLY` — Every read predicate is `WHERE agent_id = ...` or `WHERE id = ...`; no query selects memories by session. Deletion is by agent or by id. The session records where a memory came from, not who owns it.
@@ -367,7 +371,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_4_LINEAGE_AND_ARCHIVAL`
 - **rationale**: Relates two memories, but its NOT NULL `agent_id` is the only reliable link; the memory references are nullable and therefore secondary.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memory_conflicts_pkey` PRIMARY KEY (id), validated
   - `memory_conflicts_memory_a_fkey` FOREIGN KEY (memory_a) REFERENCES memories(id), validated
   - `memory_conflicts_memory_b_fkey` FOREIGN KEY (memory_b) REFERENCES memories(id), validated
@@ -394,7 +398,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_4_LINEAGE_AND_ARCHIVAL`
 - **rationale**: Primary key is `(memory_id, entity_id)`; both are NOT NULL FKs. The memory is canonical because it is also what the tenant column will be keyed to.
 - **row identity**: `memory_id` (surrogate, emitted as-is), `entity_id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memory_entity_links_pkey` PRIMARY KEY (memory_id, entity_id), validated
   - `memory_entity_links_memory_id_fkey` FOREIGN KEY (memory_id) REFERENCES memories(id), validated
   - `memory_entity_links_entity_id_fkey` FOREIGN KEY (entity_id) REFERENCES entities(id), validated
@@ -421,7 +425,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: Subject/predicate/object triples scoped to one agent. Despite the name it holds no FK to `memories`, so it is not lineage.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memory_graph_pkey` PRIMARY KEY (id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **added columns**: `agent_uuid UUID`, `tenant_id UUID`
@@ -442,7 +446,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_3_MEMORIES`
 - **rationale**: Per-agent retrieval telemetry. Its `candidate_memory_ids` arrays are not foreign keys and are deliberately not treated as an ownership path.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memory_retrieval_logs_pkey` PRIMARY KEY (id), validated
 - **session role**: `CONTEXT_ONLY` — Two insert paths exist and one omits session_id entirely (`INSERT INTO memory_retrieval_logs (agent_id, query_hash, injected_memory_ids)`), so a log line is well-formed without a session. No read predicate uses it.
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
@@ -465,7 +469,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_4_LINEAGE_AND_ARCHIVAL`
 - **rationale**: `memory_id` is a NOT NULL FK to `memories`; the version's tenant is the memory's tenant by definition.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `memory_versions_pkey` PRIMARY KEY (id), validated
   - `memory_versions_memory_id_fkey` FOREIGN KEY (memory_id) REFERENCES memories(id), validated
 - **canonical path**: `row.memory_id -> memories.id -> memories.agent_id -> agents.agent_id -> agents.tenant_id`
@@ -491,7 +495,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_4_LINEAGE_AND_ARCHIVAL`
 - **rationale**: Owned by the agent that gave the feedback; the memory reference survives the memory's deletion as NULL, which is exactly why it is secondary.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `retrieval_feedback_pkey` PRIMARY KEY (id), validated
   - `retrieval_feedback_memory_id_fkey` FOREIGN KEY (memory_id) REFERENCES memories(id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
@@ -516,7 +520,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_5_TENANT_GLOBAL_OPERATIONS`
 - **rationale**: Reinforcement episodes recorded per agent; the policy is a secondary link that may be NULL after a policy is deleted.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `rmk_episodes_pkey` PRIMARY KEY (id), validated
   - `rmk_episodes_policy_id_fkey` FOREIGN KEY (policy_id) REFERENCES rmk_policies(id), validated
 - **session role**: `CONTEXT_ONLY` — Read by `WHERE agent_id = $1 ORDER BY session_id`: the session is a grouping key *within* an agent's episodes, not an addressing key. The owner is the agent.
@@ -542,7 +546,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
 - **rationale**: One policy set per agent; must precede `rmk_episodes`, which references it.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `rmk_policies_pkey` PRIMARY KEY (id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **added columns**: `agent_uuid UUID`, `tenant_id UUID`
@@ -564,7 +568,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_2_SESSIONS`
 - **rationale**: Owned by its agent through a real FK to `agents(agent_id)`. Everything session-scoped resolves through `(agent_id, session_id)`, which is the only unique key on this table besides its surrogate primary key.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `sessions_pkey` PRIMARY KEY (id), validated
   - `idx_sessions_agent_session` INDEX (agent_id, session_id) - unique, valid, ready, non-partial, no expressions
   - `sessions_agent_id_fkey` FOREIGN KEY (agent_id) REFERENCES agents(agent_id), validated
@@ -589,7 +593,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **tranche**: `TRANCHE_2_SESSIONS`
 - **rationale**: The one genuine session child: `session_id` is NOT NULL and the row is meaningless without its session.
 - **row identity**: `id` (surrogate, emitted as-is)
-- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification is not implemented in this checkpoint.*
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `working_memory_pkey` PRIMARY KEY (id), validated
   - `working_memory_agent_id_session_id_key` UNIQUE (agent_id, session_id), validated
 - **session role**: `CANONICAL` — INSERT carries session_id; rows are deleted by `WHERE agent_id = $1 AND session_id = $2`, i.e. addressed *by* their session; UNIQUE (agent_id, session_id) is exactly the session's own unique key. The session is what identifies the row, so a missing one is a broken row rather than absent context.

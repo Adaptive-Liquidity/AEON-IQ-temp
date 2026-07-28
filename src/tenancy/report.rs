@@ -26,6 +26,43 @@ use super::inventory::{
     SessionSemantics, TableClass, Tranche,
 };
 
+/// What one audit run concluded about one table's declared current-schema
+/// contract.
+///
+/// Per **run**, never per registry entry: the registry states a requirement,
+/// and only a run against a particular database can say whether that database
+/// meets it. A static artifact therefore carries no status at all rather than a
+/// default one — an unconditional `SATISFIED` in a checked-in file would assert
+/// something about every deployment, which no file can know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContractStatus {
+    /// Structural prerequisites hold and every declared object matches.
+    Satisfied,
+    /// Verification ran, and one or more required objects differ.
+    Drifted,
+    /// Fatal table/column/type/identifier drift made safe evaluation
+    /// impossible, so the contract was never checked. Deliberately distinct
+    /// from `SATISFIED`: "not looked at" must never read as "fine".
+    NotEvaluated,
+}
+
+impl ContractStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Satisfied => "SATISFIED",
+            Self::Drifted => "DRIFTED",
+            Self::NotEvaluated => "NOT_EVALUATED",
+        }
+    }
+}
+
+impl std::fmt::Display for ContractStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A registry entry as it appears in a report or artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ClassifiedTable {
@@ -34,14 +71,21 @@ pub struct ClassifiedTable {
     /// How this table's example row identifier is built. Declared, never
     /// derived from the catalog.
     pub row_identity: RowIdentity,
-    /// The schema objects this table's ownership joins and row identity rely on.
+    /// The schema objects this table's ownership joins and row identity are
+    /// *required* to rely on.
     ///
-    /// **DECLARED — runtime verification is not implemented in this
-    /// checkpoint.** These are the guarantees the ownership paths assume, not
-    /// facts checked against a live database. Reading them as verified would be
-    /// exactly backwards: they are the checklist *for* the verifier, which
-    /// lands in the next cycle.
+    /// A requirement, not an observation. Every audit run verifies each object
+    /// against the live catalog of the database it is pointed at; the outcome
+    /// for that run is [`ClassifiedTable::contract_status`]. This list on its
+    /// own says nothing about any particular deployment.
     pub required_current_schema_contract: &'static [SchemaObjectContract],
+    /// What *this run* found when it verified the contract above.
+    ///
+    /// `None` in the static artifact, where no run happened — serialized as an
+    /// absent field rather than a null or a default, so a checked-in file
+    /// cannot be misread as claiming a verification it never performed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_status: Option<ContractStatus>,
     /// What a session reference means here, and the evidence for it.
     pub session_semantics: Option<SessionSemantics>,
     pub canonical_path: Option<OwnershipPath>,
@@ -171,6 +215,20 @@ impl std::fmt::Display for TenancyAuditReport {
         }
 
         writeln!(f)?;
+        writeln!(f, "## Current-schema contract (this run)")?;
+        writeln!(f)?;
+        for table in &self.classified_tables {
+            // Absent status means this rendering did not come from an audit
+            // run. Printing SATISFIED here would be the exact overclaim the
+            // three-state enum exists to prevent.
+            let status = match table.contract_status {
+                Some(status) => status.as_str(),
+                None => "(no run)",
+            };
+            writeln!(f, "  {:<34} {status}", table.table)?;
+        }
+
+        writeln!(f)?;
         writeln!(f, "## Tranche readiness")?;
         writeln!(f)?;
         for tranche in &self.tranche_readiness {
@@ -206,6 +264,9 @@ pub fn classified_tables() -> Vec<ClassifiedTable> {
             class: e.class,
             row_identity: e.row_identity,
             required_current_schema_contract: e.schema_contract,
+            // Static rendering: no run, so no status. The audit replaces this
+            // with the outcome it measured.
+            contract_status: None,
             session_semantics: e.session_semantics,
             canonical_path: e.canonical_path,
             secondary_paths: e.secondary_paths,
@@ -367,18 +428,30 @@ pub fn render_inventory_markdown() -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "## REQUIRED_CURRENT_SCHEMA_CONTRACT");
     let _ = writeln!(out);
+    let _ = writeln!(out, "**RUNTIME CONTRACT VERIFICATION: IMPLEMENTED**");
+    let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "**Status: DECLARED — runtime verification is not implemented in this checkpoint.**"
+        "Each audit execution verifies these declared requirements against its live PostgreSQL \
+         catalog."
     );
     let _ = writeln!(out);
     let _ = writeln!(
         out,
         "Each table declares the schema objects its ownership joins and row identity rely on \
          **today** — not the constraints Step 4B will add, which live in the migration plan. \
-         Nothing listed here has been checked against a live database: these are registry \
-         declarations, not verified live-database facts. Until the verifier lands, a dropped \
-         or altered constraint would go unreported."
+         Constraints are matched on `contype`, ordered `conkey` attribute names, referenced \
+         schema and table, ordered `confkey` attribute names and `convalidated`; indexes on \
+         ordered key columns, `indisunique`, `indisvalid`, `indisready`, absence of `indpred` \
+         and `indexprs`, and key-column count. A name alone never satisfies a requirement."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "This file is a **static** rendering of the registry. It records what every deployment \
+         is required to have, and it is not evidence that any particular deployment has it — \
+         only a run against that database can say so, and only for that database. Each run \
+         reports `SATISFIED`, `DRIFTED` or `NOT_EVALUATED` per table in its machine report."
     );
     let _ = writeln!(out);
 
@@ -445,8 +518,8 @@ pub fn render_inventory_markdown() -> String {
         let _ = writeln!(out, "- **row identity**: {}", identity.join(", "));
         let _ = writeln!(
             out,
-            "- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *Status: DECLARED; runtime verification \
-             is not implemented in this checkpoint.*"
+            "- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every \
+             audit run; per-run status is in the machine report, not here.*"
         );
         if entry.schema_contract.is_empty() {
             let _ = writeln!(out, "  - *(none)*");

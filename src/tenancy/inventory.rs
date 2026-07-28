@@ -179,6 +179,23 @@ impl PathKind {
             Self::Session { session_column, .. } => session_column,
         }
     }
+
+    /// Whether this path's source reference contains caller-supplied text.
+    ///
+    /// Drives pseudonymisation of the ambiguity finding's example identifier:
+    /// a legacy `agent_id` or `session_id` is a caller string and must not be
+    /// copied into the artifact, while a UUID reference is already opaque.
+    pub const fn root_is_caller_text(&self) -> bool {
+        match self {
+            Self::AgentText { .. } | Self::Session { .. } => true,
+            Self::TenantColumn { .. }
+            | Self::AgentUuid { .. }
+            | Self::Memory { .. }
+            | Self::Entity { .. }
+            | Self::ArchivalBatch { .. }
+            | Self::Policy { .. } => false,
+        }
+    }
 }
 
 /// One route from a row to its authoritative tenant.
@@ -234,9 +251,16 @@ pub struct MigrationPlan {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct TableEntry {
     pub table: &'static str,
-    /// The schema objects on this table that the *current* scanner relies on:
-    /// the keys its row identity uses, and the keys or foreign keys its
-    /// ownership joins assume. Verified against the catalog, never assumed.
+    /// The schema objects this table is *required* to carry for the current
+    /// scanner to be sound: the keys its row identity uses, and the keys or
+    /// foreign keys its ownership joins assume.
+    ///
+    /// These are requirements, not observations. Each Step 4A audit run
+    /// verifies every entry against the live PostgreSQL catalog of the database
+    /// it is pointed at, and emits `SCHEMA_RELATIONSHIP_DRIFT` per mismatch. A
+    /// declaration in this registry is therefore never, by itself, proof that
+    /// any particular deployment satisfies it — only a run against that
+    /// deployment can say so, and only for that deployment.
     pub schema_contract: &'static [SchemaObjectContract],
     /// How this table's example row identifier is built. Static, so no catalog
     /// value ever reaches query construction.
@@ -296,11 +320,19 @@ impl IdentityKind {
         }
     }
 
-    /// The catalog type this column must have for the declaration to hold.
-    pub const fn expected_type(self) -> &'static str {
+    /// The exact `format_type` spellings this column may have.
+    ///
+    /// Compared by **equality**, never by substring. A substring test accepted
+    /// every one of these as "text" or "uuid": `text[]`, `uuid[]`, `character
+    /// varying(64)` (contains neither, but `varchar` domains named `*_text` do),
+    /// and any domain whose name merely contains `text` or `uuid`. An array
+    /// column in particular would make `concat_ws` produce a brace-wrapped
+    /// literal that identifies no row, and a `NULL` element would silently
+    /// vanish from the pseudonym.
+    pub const fn allowed_types(self) -> &'static [&'static str] {
         match self {
-            Self::Surrogate => "uuid",
-            Self::CallerText => "text",
+            Self::Surrogate => &["uuid"],
+            Self::CallerText => &["text"],
         }
     }
 }
@@ -386,12 +418,7 @@ pub enum ConstraintKind {
 }
 
 impl ConstraintKind {
-    /// The `pg_constraint.contype` character.
-    ///
-    /// Unused in this checkpoint: it is the value the current-schema verifier
-    /// will compare against, declared beside the enum so the mapping does not
-    /// have to be re-derived at the call site when that lands.
-    #[allow(dead_code)]
+    /// The `pg_constraint.contype` character the live constraint must report.
     pub const fn contype(self) -> &'static str {
         match self {
             Self::PrimaryKey => "p",
@@ -455,10 +482,11 @@ pub enum SchemaObjectContract {
 }
 
 impl SchemaObjectContract {
-    /// Unused in this checkpoint: the verifier will look each object up by
-    /// name in `pg_constraint` / `pg_index`. `describe` destructures the field
-    /// directly, so nothing else needs the accessor yet.
-    #[allow(dead_code)]
+    /// The object's name, used to look it up in `pg_constraint` / `pg_index`.
+    ///
+    /// A declared name is only ever *compared* against the catalog — it is
+    /// never interpolated into generated SQL, so it needs no identifier
+    /// validation and cannot reach a query string.
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Constraint { name, .. } | Self::UniqueIndex { name, .. } => name,
@@ -996,8 +1024,9 @@ pub const REGISTRY: &[TableEntry] = &[
             &["POST /hypervisor/events", "GET /hypervisor/timeline"],
         ),
         global_scope_evidence: None,
-        rationale: "`session_id` is NULL-able, so the session cannot be the canonical path; the \
-                    NOT NULL `agent_id` is. The session remains a consistency check.",
+        rationale: "The NOT NULL `agent_id` is the canonical path. `session_id` is CONTEXT_ONLY: \
+                    it is not an ownership path and it is not a consistency path, because a row \
+                    may legitimately outlive or precede its `sessions` row.",
     },
     TableEntry {
         table: "credential_agent_grants",
