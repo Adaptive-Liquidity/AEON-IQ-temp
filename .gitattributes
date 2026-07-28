@@ -6,3 +6,10 @@
 # would renormalise the existing benchmark scripts and show them as modified in
 # working copies that currently have CRLF checked out.
 /.github/scripts/*.sh text eol=lf
+
+# The Step 4A/4B tenancy artifacts are compared byte-for-byte against generated
+# output. On Windows, core.autocrlf=true rewrites them to CRLF on checkout while
+# the generator emits LF, so a fresh clone fails a test that CI passes. Pinning
+# them to LF makes the comparison mean the same thing on every platform.
+/docs/tenancy/*.json text eol=lf
+/docs/tenancy/*.md   text eol=lf

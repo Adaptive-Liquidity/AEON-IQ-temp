@@ -25,6 +25,7 @@ use super::inventory::{
     self, ExcludedObject, MigrationPlan, OwnershipPath, RowIdentity, SchemaObjectContract,
     SessionSemantics, TableClass, Tranche,
 };
+use super::plan;
 
 /// What one audit run concluded about one table's declared current-schema
 /// contract.
@@ -298,6 +299,98 @@ pub struct CanonicalInventoryPayload {
     pub schema_version: &'static str,
     pub reason_codes: Vec<ReasonCodeDoc>,
     pub tables: Vec<ClassifiedTable>,
+    /// The Step 4B contract, covered by the digest so that changing the plan
+    /// changes the digest. A consumer that keyed on the digest to detect
+    /// "the tenancy decisions moved" would otherwise miss the entire migration
+    /// plan moving underneath it.
+    pub step_4b_contract: Step4bContract,
+}
+
+/// The typed Step 4B plan, as it appears in the artifacts.
+#[derive(Debug, Clone, Serialize)]
+pub struct Step4bContract {
+    /// PREPARE / BACKFILL / FINALIZE, and what stops them running out of order.
+    pub stages: Vec<&'static str>,
+    pub finalize_guard: &'static str,
+    pub concurrent_build_mechanism: &'static str,
+    /// Which lock each planned operation actually takes.
+    pub lock_profiles: Vec<LockProfileDoc>,
+    pub transitional_write_rationale: &'static str,
+    pub transitional_write_guarantee: &'static str,
+    pub planned_objects: Vec<PlannedObjectDoc>,
+    pub backfill_authority: Vec<plan::BackfillAuthority>,
+    /// Required-zero codes that cannot currently fire, and why.
+    pub structurally_unreachable: Vec<plan::UnreachableCode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LockProfileDoc {
+    pub operation: &'static str,
+    pub locks: &'static str,
+}
+
+/// One planned object, rendered from its typed form.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedObjectDoc {
+    pub table: &'static str,
+    pub name: &'static str,
+    pub creating_tranche: Tranche,
+    pub validating_tranche: Tranche,
+    pub local_columns: &'static [&'static str],
+    pub referenced_table: Option<&'static str>,
+    pub referenced_columns: &'static [&'static str],
+    pub unique: bool,
+    pub not_valid_permitted: bool,
+    pub concurrent_build_required: bool,
+    pub creation_lock: plan::LockProfile,
+    pub validation_lock: Option<plan::LockProfile>,
+    pub nullability: Option<plan::Nullability>,
+    pub rendered: String,
+}
+
+/// The Step 4B contract, assembled from the typed plan.
+pub fn step_4b_contract() -> Step4bContract {
+    Step4bContract {
+        stages: plan::Stage::ALL.iter().map(|s| s.as_str()).collect(),
+        finalize_guard: plan::FINALIZE_GUARD,
+        concurrent_build_mechanism: plan::CONCURRENT_BUILD_MECHANISM,
+        lock_profiles: plan::LockProfile::ALL
+            .iter()
+            .map(|l| LockProfileDoc {
+                operation: l.as_str(),
+                locks: l.locks(),
+            })
+            .collect(),
+        transitional_write_rationale: plan::TRANSITIONAL_WRITE_RATIONALE,
+        transitional_write_guarantee: plan::TRANSITIONAL_WRITE_GUARANTEE,
+        planned_objects: plan::PLANNED_OBJECTS
+            .iter()
+            .map(|o| {
+                let (referenced_table, referenced_columns) = match o.referenced() {
+                    Some((t, c)) => (Some(t), c),
+                    None => (None, &[] as &[&str]),
+                };
+                PlannedObjectDoc {
+                    table: o.table(),
+                    name: o.name(),
+                    creating_tranche: o.creating_tranche(),
+                    validating_tranche: o.validating_tranche(),
+                    local_columns: o.local_columns(),
+                    referenced_table,
+                    referenced_columns,
+                    unique: o.is_unique(),
+                    not_valid_permitted: o.not_valid_permitted(),
+                    concurrent_build_required: o.concurrent_build_required(),
+                    creation_lock: o.creation_lock(),
+                    validation_lock: o.validation_lock(),
+                    nullability: o.nullability(),
+                    rendered: o.describe(),
+                }
+            })
+            .collect(),
+        backfill_authority: plan::BACKFILL_AUTHORITY.to_vec(),
+        structurally_unreachable: plan::UNREACHABLE_REQUIRED_ZERO.to_vec(),
+    }
 }
 
 /// The payload, in the one order everything is rendered in.
@@ -317,6 +410,7 @@ pub fn canonical_inventory_payload() -> CanonicalInventoryPayload {
             })
             .collect(),
         tables: classified_tables(),
+        step_4b_contract: step_4b_contract(),
     }
 }
 
@@ -354,6 +448,7 @@ pub fn render_inventory_json() -> Result<String, serde_json::Error> {
         inventory_digest: String,
         reason_codes: Vec<ReasonCodeDoc>,
         tables: Vec<ClassifiedTable>,
+        step_4b_contract: Step4bContract,
     }
 
     let payload = canonical_inventory_payload();
@@ -363,6 +458,7 @@ pub fn render_inventory_json() -> Result<String, serde_json::Error> {
         inventory_digest: inventory_digest(),
         reason_codes: payload.reason_codes,
         tables: payload.tables,
+        step_4b_contract: payload.step_4b_contract,
     };
     serde_json::to_string_pretty(&artifact)
 }
@@ -453,6 +549,86 @@ pub fn render_inventory_markdown() -> String {
          only a run against that database can say so, and only for that database. Each run \
          reports `SATISFIED`, `DRIFTED` or `NOT_EVALUATED` per table in its machine report."
     );
+    let _ = writeln!(out);
+
+    let _ = writeln!(out, "## STEP 4B MIGRATION CONTRACT");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Typed, not prose. Every planned column, index, unique target, foreign key and \
+         constraint below is a value in `tenancy::plan::PLANNED_OBJECTS`; this section is \
+         generated from it. Invariants check the plan as data — that every planned foreign key \
+         has a matching unique target in the same column order, that no key depends on a target \
+         created in a later tranche, and that every object has exactly one owning tranche."
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "**Nothing here has been created.** Step 4B-0 is the contract; the DDL belongs to Step \
+         4B-1 onward."
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "### Three-stage tranche execution");
+    let _ = writeln!(out);
+    for stage in plan::Stage::ALL {
+        let _ = writeln!(out, "1. **{}**", stage.as_str());
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", plan::FINALIZE_GUARD);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", plan::CONCURRENT_BUILD_MECHANISM);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "### Lock profiles");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| Operation | Locks taken |");
+    let _ = writeln!(out, "|---|---|");
+    for profile in plan::LockProfile::ALL {
+        let _ = writeln!(out, "| `{}` | {} |", profile.as_str(), profile.locks());
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "### Transitional write strategy");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", plan::TRANSITIONAL_WRITE_RATIONALE);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", plan::TRANSITIONAL_WRITE_GUARANTEE);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "### Planned objects by tranche");
+    let _ = writeln!(out);
+    for tranche in Tranche::ALL {
+        let objects = plan::planned_in(*tranche);
+        if objects.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "#### {}", tranche.as_str());
+        let _ = writeln!(out);
+        for object in objects {
+            let _ = writeln!(out, "- {}", object.describe());
+        }
+        let _ = writeln!(out);
+    }
+
+    let _ = writeln!(out, "### Structurally unreachable required-zero codes");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Recorded rather than silently dropped. The enum values stay — they are a stable \
+         contract — but these table/code pairs cannot currently fire, so leaving them in a \
+         required-zero set would make a gate look stricter than it is."
+    );
+    let _ = writeln!(out);
+    for unreachable in plan::UNREACHABLE_REQUIRED_ZERO {
+        let _ = writeln!(
+            out,
+            "- `{}` / `{}` — {}",
+            unreachable.table,
+            unreachable.code.as_str(),
+            unreachable.reason
+        );
+    }
     let _ = writeln!(out);
 
     let _ = writeln!(out, "## Session semantics");
@@ -556,36 +732,59 @@ pub fn render_inventory_markdown() -> String {
         if let Some(evidence) = entry.global_scope_evidence {
             let _ = writeln!(out, "- **global-scope evidence**: {evidence}");
         }
-        let _ = writeln!(
-            out,
-            "- **added columns**: {}",
-            list(entry.plan.added_columns)
-        );
+        // Planned objects are rendered from the typed plan, never from a second
+        // prose copy kept beside it.
+        let planned = plan::planned_for(entry.table);
+        if planned.is_empty() {
+            let _ = writeln!(
+                out,
+                "- **planned objects**: *(none — this table owes no DDL)*"
+            );
+        } else {
+            let _ = writeln!(out, "- **planned objects**:");
+            for object in &planned {
+                let _ = writeln!(
+                    out,
+                    "  - [{}] {}",
+                    object.creating_tranche().as_str(),
+                    object.describe()
+                );
+            }
+        }
+        if let Some(strategy) = plan::transition_for(entry.table) {
+            let _ = writeln!(
+                out,
+                "- **transitional writes**: `{}`{}",
+                strategy.as_str(),
+                match strategy {
+                    plan::TransitionalWrite::BridgeTrigger { trigger, .. } =>
+                        format!(" — `{trigger}` installed in PREPARE, before any backfill"),
+                    plan::TransitionalWrite::OwnershipMayRemainNull { reason } =>
+                        format!(" — {reason}"),
+                }
+            );
+        }
+        if let Some(authority) = plan::backfill_authority_for(entry.table) {
+            let _ = writeln!(out, "- **backfill source**: `{}`", authority.source);
+            if let Some(agreement) = authority.agreement {
+                let _ = writeln!(out, "- **all paths must agree**: `{agreement}`");
+            }
+            let _ = writeln!(out, "- **on disagreement**: {}", authority.on_disagreement);
+        }
         let _ = writeln!(
             out,
             "- **initial nullability**: {}",
             entry.plan.initial_nullability
         );
-        let _ = writeln!(out, "- **backfill**: `{}`", entry.plan.backfill_source);
+        let _ = writeln!(
+            out,
+            "- **backfill shape**: `{}`",
+            entry.plan.backfill_source
+        );
         let _ = writeln!(
             out,
             "- **must be zero**: {}",
-            list(entry.plan.required_zero_codes)
-        );
-        let _ = writeln!(
-            out,
-            "- **pre-validation indexes**: {}",
-            list(entry.plan.required_pre_validation_indexes)
-        );
-        let _ = writeln!(
-            out,
-            "- **planned composite FKs**: {}",
-            list(entry.plan.planned_composite_fks)
-        );
-        let _ = writeln!(
-            out,
-            "- **NOT VALID appropriate**: {}",
-            entry.plan.not_valid_appropriate
+            list(&codes(entry.plan.required_zero_codes))
         );
         if let Some(step) = entry.plan.validate_step {
             let _ = writeln!(out, "- **validate step**: {step}");
@@ -621,6 +820,11 @@ pub fn render_inventory_markdown() -> String {
         );
     }
     out
+}
+
+/// Reason codes as their contract strings, for rendering only.
+fn codes(items: &[ReasonCode]) -> Vec<&'static str> {
+    items.iter().map(|c| c.as_str()).collect()
 }
 
 fn list(items: &[&str]) -> String {

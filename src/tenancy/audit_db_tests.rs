@@ -726,11 +726,17 @@ async fn a_future_composite_fk_mismatch_is_reported(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_future_tenant_uniqueness_collision_is_reported(pool: PgPool) {
-    // Two agents in the *same* tenant using the same session identifier. Legal
-    // today, because `sessions` is unique on (agent_id, session_id); fatal to a
-    // future UNIQUE (tenant_id, session_id), and the index build would be where
-    // it was discovered.
+async fn two_agents_in_one_tenant_may_share_a_session_identifier(pool: PgPool) {
+    // The scenario that decided the session-identity question. Two agents in the
+    // *same* tenant using the same caller-supplied session string is ordinary
+    // caller behaviour — `session_id` is TEXT the caller chooses, and `default`
+    // or `main` is exactly what several agents will pick.
+    //
+    // Under a tenant-scoped `UNIQUE (tenant_id, session_id)` this would be a
+    // collision, and the index build would be where it was discovered. Step 4B
+    // therefore keeps session identity AGENT-scoped —
+    // `UNIQUE (tenant_id, agent_uuid, session_id)` — which is a superset of the
+    // current `(agent_id, session_id)` key and so cannot collide.
     seed_clean(&pool, "agent-one", TENANT).await;
     sqlx::query(
         "INSERT INTO agents (agent_id, tenant_id, external_agent_id) \
@@ -749,14 +755,21 @@ async fn a_future_tenant_uniqueness_collision_is_reported(pool: PgPool) {
 
     let report = audit(&pool).await;
     assert!(
-        has(
+        !has(
             &report,
             "sessions",
             ReasonCode::FutureTenantUniquenessCollision
         ),
-        "{:?}",
+        "agent-scoped session identity must not report this as a collision: {:?}",
         codes_for(&report, "sessions")
     );
+    // …and the rows are otherwise clean, so the absence is a real pass rather
+    // than a scan that never ran.
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Satisfied)
+    );
+    assert!(!report.is_blocked(), "{:?}", codes_for(&report, "sessions"));
 }
 
 #[sqlx::test(migrations = "./migrations")]

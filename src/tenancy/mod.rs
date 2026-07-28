@@ -31,6 +31,9 @@ pub mod audit;
 #[cfg(test)]
 mod audit_db_tests;
 pub mod inventory;
+// Step 4B-0: the typed migration contract. Planning data only — it creates no
+// column, no index, no constraint and no migration file.
+pub mod plan;
 pub mod report;
 
 use std::collections::BTreeMap;

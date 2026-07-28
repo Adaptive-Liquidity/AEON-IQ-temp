@@ -1979,11 +1979,14 @@ fn assess_tranches(findings: &[Finding]) -> Vec<TrancheReadiness> {
                             | ReasonCode::MissingCanonicalOwnershipPath
                             | ReasonCode::SchemaRelationshipDrift
                     );
+                    // Typed comparison. While these were strings, a renamed code
+                    // would have silently stopped matching and quietly emptied
+                    // the gate instead of failing to compile.
                     if is_contract
                         || entry
                             .plan
                             .required_zero_codes
-                            .contains(&finding.reason_code.as_str())
+                            .contains(&finding.reason_code)
                     {
                         blocking.push(format!("{}: {}", entry.table, finding.reason_code));
                     }

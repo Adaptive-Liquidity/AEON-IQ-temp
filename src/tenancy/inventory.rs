@@ -33,6 +33,8 @@
 
 use serde::Serialize;
 
+use super::audit::ReasonCode;
+
 /// What kind of thing a table is, for tenancy purposes.
 ///
 /// Exactly one of these per table. `LEGACY_UNMAPPED` is deliberately absent:
@@ -95,8 +97,11 @@ pub enum Tranche {
     Memories,
     #[serde(rename = "TRANCHE_4_LINEAGE_AND_ARCHIVAL")]
     LineageAndArchival,
-    #[serde(rename = "TRANCHE_5_TENANT_GLOBAL_OPERATIONS")]
-    TenantGlobalOperations,
+    /// Named for what it holds. Both its tables — `amp_controller_state` and
+    /// `rmk_episodes` — are `DIRECT_AGENT_CHILD`, so the previous name
+    /// `TRANCHE_5_TENANT_GLOBAL_OPERATIONS` described neither of them.
+    #[serde(rename = "TRANCHE_5_OPERATIONS")]
+    Operations,
     #[serde(rename = "FINAL_CONSTRAINT_TIGHTENING")]
     FinalConstraintTightening,
 }
@@ -108,7 +113,7 @@ impl Tranche {
             Self::Sessions => "TRANCHE_2_SESSIONS",
             Self::Memories => "TRANCHE_3_MEMORIES",
             Self::LineageAndArchival => "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
-            Self::TenantGlobalOperations => "TRANCHE_5_TENANT_GLOBAL_OPERATIONS",
+            Self::Operations => "TRANCHE_5_OPERATIONS",
             Self::FinalConstraintTightening => "FINAL_CONSTRAINT_TIGHTENING",
         }
     }
@@ -119,7 +124,7 @@ impl Tranche {
         Self::Sessions,
         Self::Memories,
         Self::LineageAndArchival,
-        Self::TenantGlobalOperations,
+        Self::Operations,
         Self::FinalConstraintTightening,
     ];
 }
@@ -212,26 +217,33 @@ pub struct OwnershipPath {
     pub nullable: bool,
 }
 
-/// The constraint work Step 4B will owe for one table. Descriptive only — Step
-/// 4A creates no DDL.
+/// The narrative half of one table's Step 4B work.
+///
+/// The *objects* — columns, indexes, unique targets, foreign keys, constraints —
+/// are not here. They live in [`super::plan::PLANNED_OBJECTS`] as typed data,
+/// because carrying them as prose is what let two foreign keys reference parent
+/// tuples that no planned unique target covered. This struct keeps only what is
+/// genuinely narrative, and the artifacts render the objects from the typed
+/// source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct MigrationPlan {
-    /// Columns Step 4B proposes to add.
-    pub added_columns: &'static [&'static str],
-    /// What those columns are created as, before any backfill.
+    /// What the added columns are created as, before any backfill.
     pub initial_nullability: &'static str,
     /// The shape of the backfill query, expressed against the canonical path.
+    ///
+    /// Where a table has more than one ownership path the *authoritative* form —
+    /// including the predicate every path must satisfy before ownership is
+    /// written — is [`super::plan::BackfillAuthority`]. This field is the shape;
+    /// that one is the contract.
     pub backfill_source: &'static str,
     /// Reason codes that must be at zero for this table before Step 4B may
     /// touch it.
-    pub required_zero_codes: &'static [&'static str],
-    /// Indexes that must exist before validation, so the check does not
-    /// sequential-scan a large table under a lock.
-    pub required_pre_validation_indexes: &'static [&'static str],
-    /// Composite foreign keys Step 4B will add.
-    pub planned_composite_fks: &'static [&'static str],
-    /// Whether the composite FK should be added `NOT VALID` first.
-    pub not_valid_appropriate: bool,
+    ///
+    /// Typed rather than stringly, so a rename cannot silently empty a gate, and
+    /// **per table** rather than unioned across a tranche: `audit_logs` may
+    /// legitimately hold agentless rows, so `LEGACY_UNMAPPED` is deliberately
+    /// absent from its set and a tranche-wide union would put it back.
+    pub required_zero_codes: &'static [ReasonCode],
     /// The later `VALIDATE CONSTRAINT` step, if any.
     pub validate_step: Option<&'static str>,
     /// How uniqueness changes when the table becomes tenant-scoped.
@@ -239,7 +251,12 @@ pub struct MigrationPlan {
     /// The tuple a future `UNIQUE (tenant_id, ...)` would cover, if one is
     /// planned. Drives the collision pre-check.
     pub future_unique_columns: Option<&'static [&'static str]>,
-    /// Expected locking / rewrite behaviour.
+    /// Expected locking / rewrite behaviour, in words.
+    ///
+    /// The precise locks are typed on [`super::plan::LockProfile`] per planned
+    /// object. This field says what is notable about *this table* — its size,
+    /// its write pattern, whether the backfill needs batching — not what lock a
+    /// generic `VALIDATE` takes.
     pub lock_profile: &'static str,
     /// What must be rolled back before this table can be.
     pub rollback_dependencies: &'static [&'static str],
@@ -616,42 +633,69 @@ const fn foreign_key(
 // ── Shared plan fragments ───────────────────────────────────────────────────
 // Most tables owe the same work, so the differences are what stand out.
 
-const TENANT_COLUMN: &[&str] = &["tenant_id UUID"];
-const AGENT_UUID_AND_TENANT: &[&str] = &["agent_uuid UUID", "tenant_id UUID"];
 const NULLABLE_THEN_TIGHTENED: &str =
     "added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill \
      verification reports zero blocking findings";
-const NO_COLUMNS: &[&str] = &[];
 const NONE_REQUIRED: &[&str] = &[];
 
 /// The reason codes that must be zero before any tenant-bearing table moves.
-const OWNERSHIP_CODES: &[&str] = &[
-    "LEGACY_UNMAPPED",
-    "ORPHANED_AGENT_REFERENCE",
-    "UNMAPPED_AGENT",
-    "UNRESOLVABLE_OWNER",
-    "NULL_OWNERSHIP_LINK",
+///
+/// Per table, never unioned across a tranche. A union would hand every table the
+/// strictest set any of its neighbours needs, and `audit_logs` is the case that
+/// makes the difference concrete: agentless events are valid rows, so
+/// `LEGACY_UNMAPPED` is absent from its set on purpose.
+const OWNERSHIP_CODES: &[ReasonCode] = &[
+    ReasonCode::LegacyUnmapped,
+    ReasonCode::OrphanedAgentReference,
+    ReasonCode::UnmappedAgent,
+    ReasonCode::UnresolvableOwner,
+    ReasonCode::NullOwnershipLink,
 ];
 
-const SESSION_CODES: &[&str] = &[
-    "LEGACY_UNMAPPED",
-    "ORPHANED_AGENT_REFERENCE",
-    "ORPHANED_SESSION_REFERENCE",
-    "UNMAPPED_AGENT",
-    "UNRESOLVABLE_OWNER",
-    "NULL_OWNERSHIP_LINK",
-    "OWNERSHIP_PATH_DISAGREEMENT",
+/// For `working_memory`, the one true `SESSION_CHILD`: its canonical path *is*
+/// the session, so a missing session row is a real orphan.
+const SESSION_CHILD_CODES: &[ReasonCode] = &[
+    ReasonCode::LegacyUnmapped,
+    ReasonCode::OrphanedAgentReference,
+    ReasonCode::OrphanedSessionReference,
+    ReasonCode::UnmappedAgent,
+    ReasonCode::UnresolvableOwner,
+    ReasonCode::NullOwnershipLink,
+    ReasonCode::OwnershipPathDisagreement,
 ];
 
-const MEMORY_CODES: &[&str] = &[
-    "LEGACY_UNMAPPED",
-    "ORPHANED_MEMORY_REFERENCE",
-    "ORPHANED_AGENT_REFERENCE",
-    "UNMAPPED_AGENT",
-    "UNRESOLVABLE_OWNER",
-    "NULL_OWNERSHIP_LINK",
-    "CROSS_TENANT_PARENT_CHILD",
-    "OWNERSHIP_PATH_DISAGREEMENT",
+/// For `memories`, which has a secondary path but whose session is
+/// `CONTEXT_ONLY`.
+///
+/// `ORPHANED_SESSION_REFERENCE` is deliberately **absent**: memories' canonical
+/// path is `AGENT_TEXT` and no session path is registered, so the code cannot
+/// fire for this table. A gate that can never fail is not a gate, and leaving it
+/// in made the required-zero set look stricter than it was. Recorded in
+/// [`super::plan::UNREACHABLE_REQUIRED_ZERO`] rather than silently dropped.
+const MEMORIES_CODES: &[ReasonCode] = &[
+    ReasonCode::LegacyUnmapped,
+    ReasonCode::OrphanedAgentReference,
+    ReasonCode::UnmappedAgent,
+    ReasonCode::UnresolvableOwner,
+    ReasonCode::NullOwnershipLink,
+    ReasonCode::OwnershipPathDisagreement,
+];
+
+/// For the three `MEMORY_LINEAGE_CHILD` tables.
+///
+/// `ORPHANED_MEMORY_REFERENCE` is deliberately **absent**: every memory
+/// reference in this schema is backed by a declared foreign key, so an orphan
+/// cannot exist while the contract holds, and producing one means dropping that
+/// key — which is `SCHEMA_RELATIONSHIP_DRIFT` and blocks by a different code.
+/// The gate is still closed; it is closed by the code that can actually fire.
+const LINEAGE_CODES: &[ReasonCode] = &[
+    ReasonCode::LegacyUnmapped,
+    ReasonCode::OrphanedAgentReference,
+    ReasonCode::UnmappedAgent,
+    ReasonCode::UnresolvableOwner,
+    ReasonCode::NullOwnershipLink,
+    ReasonCode::CrossTenantParentChild,
+    ReasonCode::OwnershipPathDisagreement,
 ];
 
 const WORKER_PATHS: &[&str] = &["rmk_worker", "extraction_worker", "hnsw_maintenance"];
@@ -696,21 +740,15 @@ const fn memory_path(column: &'static str, nullable: bool) -> OwnershipPath {
 #[allow(clippy::too_many_arguments)]
 const fn agent_child_plan(
     backfill_source: &'static str,
-    indexes: &'static [&'static str],
-    fks: &'static [&'static str],
     validate: &'static str,
     lock_profile: &'static str,
     rollback_dependencies: &'static [&'static str],
     inactive_paths: &'static [&'static str],
 ) -> MigrationPlan {
     MigrationPlan {
-        added_columns: AGENT_UUID_AND_TENANT,
         initial_nullability: NULLABLE_THEN_TIGHTENED,
         backfill_source,
         required_zero_codes: OWNERSHIP_CODES,
-        required_pre_validation_indexes: indexes,
-        planned_composite_fks: fks,
-        not_valid_appropriate: true,
         validate_step: Some(validate),
         future_uniqueness: None,
         future_unique_columns: None,
@@ -738,14 +776,10 @@ pub const REGISTRY: &[TableEntry] = &[
         consistency: None,
         tranche: Tranche::FinalConstraintTightening,
         plan: MigrationPlan {
-            added_columns: NO_COLUMNS,
             initial_nullability: "n/a — no ownership columns are added",
             backfill_source: "n/a — SYSTEM_GLOBAL tables are never backfilled with an \
                               inferred tenant",
-            required_zero_codes: &["GLOBAL_SCOPE_UNVERIFIED"],
-            required_pre_validation_indexes: NONE_REQUIRED,
-            planned_composite_fks: NONE_REQUIRED,
-            not_valid_appropriate: false,
+            required_zero_codes: &[ReasonCode::GlobalScopeUnverified],
             validate_step: None,
             future_uniqueness: None,
             future_unique_columns: None,
@@ -802,7 +836,6 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: NO_COLUMNS,
             initial_nullability: "already present from migration 0028",
             backfill_source: "already backfilled by step 1 under an explicit \
                               LEGACY_MIGRATION_MODE",
@@ -811,23 +844,22 @@ pub const REGISTRY: &[TableEntry] = &[
             // Gating only on UNMAPPED_AGENT let tranche 1 read READY while its
             // planned SET NOT NULL could not possibly succeed.
             required_zero_codes: &[
-                "LEGACY_UNMAPPED",
-                "NULL_OWNERSHIP_LINK",
-                "UNMAPPED_AGENT",
-                "FUTURE_TENANT_UNIQUENESS_COLLISION",
+                ReasonCode::LegacyUnmapped,
+                ReasonCode::NullOwnershipLink,
+                ReasonCode::UnmappedAgent,
             ],
-            required_pre_validation_indexes: &["agents_tenant_id_id_key (exists)"],
-            planned_composite_fks: NONE_REQUIRED,
-            not_valid_appropriate: false,
             validate_step: Some(
                 "SET NOT NULL on agents.tenant_id once UNMAPPED_AGENT reaches zero",
             ),
             future_uniqueness: Some(
-                "`agents_agent_id_key` is globally UNIQUE on the legacy TEXT identifier. Once \
-                 tenants are real that is a cross-tenant namespace: two tenants cannot both use \
-                 the identifier `assistant`. It must become UNIQUE (tenant_id, agent_id), which \
-                 is a relaxation and cannot collide — the collision risk runs the other way and \
-                 is checked on `sessions`.",
+                "Nothing is added. `agents` already carries UNIQUE (tenant_id, \
+                 external_agent_id) from migration 0028, which is the tenant-scoped identity, \
+                 and UNIQUE (tenant_id, id), which is the composite FK target every child \
+                 references. `agents_agent_id_key` is *not* replaced by UNIQUE (tenant_id, \
+                 agent_id): that would introduce a second tenant-scoped name for the same \
+                 agent, leaving two identity keys to keep in agreement. The legacy global key \
+                 is removed together with the legacy `agent_id` column in FUTURE STEP 7, once \
+                 Step 5 endpoint enforcement and Step 6 legacy-key retirement have merged.",
             ),
             future_unique_columns: None,
             lock_profile: "SET NOT NULL takes ACCESS EXCLUSIVE and scans the table; on PG 16 a \
@@ -848,12 +880,10 @@ pub const REGISTRY: &[TableEntry] = &[
         canonical_path: Some(agent_text("agent_id", false)),
         secondary_paths: &[],
         consistency: None,
-        tranche: Tranche::TenantGlobalOperations,
+        tranche: Tranche::Operations,
         plan: agent_child_plan(
             "UPDATE amp_controller_state s SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = s.agent_id",
-            &["idx_amp_controller_state_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "primary key is the legacy TEXT `agent_id`; re-keying to `agent_uuid` is a table \
              rewrite and is deferred to FINAL_CONSTRAINT_TIGHTENING",
@@ -887,8 +917,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE archival_batches b SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = b.agent_id",
-            &["idx_archival_batches_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "ADD COLUMN NULL is metadata-only; the FK validation takes SHARE ROW EXCLUSIVE",
             &["memories (memories.archival_batch_id references this table)"],
@@ -914,21 +942,22 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: "added NULL-able and **stays** NULL-able until the disposition \
                                   of agent-less audit rows is decided",
             backfill_source: "UPDATE audit_logs l SET agent_uuid = a.id, tenant_id = a.tenant_id \
                               FROM agents a WHERE a.agent_id = l.agent_id",
+            // LEGACY_UNMAPPED is deliberately absent. audit_logs records
+            // agentless events — startup, configuration change,
+            // administrative action — which are legitimate rows with no
+            // owning agent. Requiring zero unmapped rows here would demand
+            // that the schema reject valid audit history, so its ownership
+            // columns stay permanently NULL-able and this gate asks only that
+            // the rows which *do* name an agent resolve correctly.
             required_zero_codes: &[
-                "ORPHANED_AGENT_REFERENCE",
-                "UNMAPPED_AGENT",
-                "UNRESOLVABLE_OWNER",
+                ReasonCode::OrphanedAgentReference,
+                ReasonCode::UnmappedAgent,
+                ReasonCode::UnresolvableOwner,
             ],
-            required_pre_validation_indexes: &["idx_audit_logs_tenant (tenant_id, agent_uuid)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-            ],
-            not_valid_appropriate: true,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: None,
             future_unique_columns: None,
@@ -971,17 +1000,10 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::LineageAndArchival,
         plan: MigrationPlan {
-            added_columns: TENANT_COLUMN,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE co_access_edges e SET tenant_id = m.tenant_id FROM memories \
                               m WHERE m.id = e.memory_a, only where memory_a and memory_b agree",
-            required_zero_codes: MEMORY_CODES,
-            required_pre_validation_indexes: &["idx_co_access_edges_tenant (tenant_id)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (memory_a, tenant_id) REFERENCES memories(id, tenant_id)",
-                "FOREIGN KEY (memory_b, tenant_id) REFERENCES memories(id, tenant_id)",
-            ],
-            not_valid_appropriate: true,
+            required_zero_codes: LINEAGE_CODES,
             validate_step: Some("VALIDATE both constraints after backfill"),
             future_uniqueness: None,
             future_unique_columns: None,
@@ -1016,8 +1038,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE cognitive_hypervisor_timeline t SET agent_uuid = a.id, \
              tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = t.agent_id",
-            &["idx_cht_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "append-only hash-chained timeline; ADD COLUMN NULL is metadata-only",
             &["sessions (tranche 2)"],
@@ -1075,13 +1095,12 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: NO_COLUMNS,
             initial_nullability: "already NOT NULL from migration 0030",
             backfill_source: "n/a — already tenant-scoped",
-            required_zero_codes: &["OWNERSHIP_PATH_DISAGREEMENT", "SCHEMA_RELATIONSHIP_DRIFT"],
-            required_pre_validation_indexes: NONE_REQUIRED,
-            planned_composite_fks: NONE_REQUIRED,
-            not_valid_appropriate: false,
+            required_zero_codes: &[
+                ReasonCode::OwnershipPathDisagreement,
+                ReasonCode::SchemaRelationshipDrift,
+            ],
             validate_step: None,
             future_uniqueness: None,
             future_unique_columns: None,
@@ -1123,13 +1142,9 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: NO_COLUMNS,
             initial_nullability: "already NOT NULL from migration 0029",
             backfill_source: "n/a — created tenant-scoped",
-            required_zero_codes: &["SCHEMA_RELATIONSHIP_DRIFT"],
-            required_pre_validation_indexes: NONE_REQUIRED,
-            planned_composite_fks: NONE_REQUIRED,
-            not_valid_appropriate: false,
+            required_zero_codes: &[ReasonCode::SchemaRelationshipDrift],
             validate_step: None,
             future_uniqueness: None,
             future_unique_columns: None,
@@ -1154,16 +1169,10 @@ pub const REGISTRY: &[TableEntry] = &[
         consistency: None,
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE entities e SET agent_uuid = a.id, tenant_id = a.tenant_id \
                               FROM agents a WHERE a.agent_id = e.agent_id",
             required_zero_codes: OWNERSHIP_CODES,
-            required_pre_validation_indexes: &["idx_entities_tenant (tenant_id, agent_uuid)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-            ],
-            not_valid_appropriate: true,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some(
                 "`entities_agent_id_name_key` is UNIQUE (agent_id, name) and stays agent-scoped: \
@@ -1202,8 +1211,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE extraction_jobs j SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = j.agent_id",
-            &["idx_extraction_jobs_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "queue table with frequent updates; ADD COLUMN NULL is metadata-only",
             &["sessions (tranche 2)"],
@@ -1247,22 +1254,10 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::Memories,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE memories m SET agent_uuid = a.id, tenant_id = a.tenant_id \
                               FROM agents a WHERE a.agent_id = m.agent_id",
-            required_zero_codes: SESSION_CODES,
-            required_pre_validation_indexes: &[
-                "idx_memories_tenant (tenant_id, agent_uuid)",
-                "memories_id_tenant_id_key UNIQUE (id, tenant_id) — required as the FK target \
-                 for every lineage child",
-            ],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-                "FOREIGN KEY (archival_batch_id, tenant_id) REFERENCES \
-                 archival_batches(id, tenant_id)",
-            ],
-            not_valid_appropriate: true,
+            required_zero_codes: MEMORIES_CODES,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some(
                 "Adds UNIQUE (id, tenant_id) — not a new restriction, since `id` is already the \
@@ -1321,12 +1316,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE memory_conflicts c SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = c.agent_id",
-            &["idx_memory_conflicts_tenant (tenant_id, agent_uuid)"],
-            &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-                "FOREIGN KEY (memory_a, tenant_id) REFERENCES memories(id, tenant_id)",
-                "FOREIGN KEY (memory_b, tenant_id) REFERENCES memories(id, tenant_id)",
-            ],
             "VALIDATE all three after backfill",
             "small; three FK validations",
             &["memories (tranche 3)"],
@@ -1375,17 +1364,10 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::LineageAndArchival,
         plan: MigrationPlan {
-            added_columns: TENANT_COLUMN,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE memory_entity_links l SET tenant_id = m.tenant_id FROM \
                               memories m WHERE m.id = l.memory_id",
-            required_zero_codes: MEMORY_CODES,
-            required_pre_validation_indexes: &["idx_memory_entity_links_tenant (tenant_id)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (memory_id, tenant_id) REFERENCES memories(id, tenant_id)",
-                "FOREIGN KEY (entity_id, tenant_id) REFERENCES entities(id, tenant_id)",
-            ],
-            not_valid_appropriate: true,
+            required_zero_codes: LINEAGE_CODES,
             validate_step: Some("VALIDATE both after backfill"),
             future_uniqueness: None,
             future_unique_columns: None,
@@ -1410,8 +1392,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE memory_graph g SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = g.agent_id",
-            &["idx_memory_graph_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "ADD COLUMN NULL is metadata-only",
             &["tranche 1"],
@@ -1444,8 +1424,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE memory_retrieval_logs l SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = l.agent_id",
-            &["idx_memory_retrieval_logs_tenant (tenant_id, agent_uuid)"],
-            &["FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)"],
             "VALIDATE CONSTRAINT after backfill",
             "append-heavy; also carries `query_text`, which the report must never echo",
             &["sessions (tranche 2)"],
@@ -1477,16 +1455,10 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::LineageAndArchival,
         plan: MigrationPlan {
-            added_columns: TENANT_COLUMN,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE memory_versions v SET tenant_id = m.tenant_id FROM memories \
                               m WHERE m.id = v.memory_id",
-            required_zero_codes: MEMORY_CODES,
-            required_pre_validation_indexes: &["idx_memory_versions_tenant (tenant_id)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (memory_id, tenant_id) REFERENCES memories(id, tenant_id)",
-            ],
-            not_valid_appropriate: true,
+            required_zero_codes: LINEAGE_CODES,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some(
                 "`memory_versions_memory_id_version_number_key` stays scoped to the memory. \
@@ -1525,11 +1497,6 @@ pub const REGISTRY: &[TableEntry] = &[
         plan: agent_child_plan(
             "UPDATE retrieval_feedback f SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = f.agent_id",
-            &["idx_retrieval_feedback_tenant (tenant_id, agent_uuid)"],
-            &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-                "FOREIGN KEY (memory_id, tenant_id) REFERENCES memories(id, tenant_id)",
-            ],
             "VALIDATE both after backfill",
             "small; the FK to memories must tolerate a NULL memory_id (MATCH SIMPLE)",
             &["memories (tranche 3)"],
@@ -1567,15 +1534,10 @@ pub const REGISTRY: &[TableEntry] = &[
             "An episode's policy, where set, must belong to the same agent. `policy_id` is \
              `ON DELETE SET NULL`, so it cannot be canonical.",
         ),
-        tranche: Tranche::TenantGlobalOperations,
+        tranche: Tranche::Operations,
         plan: agent_child_plan(
             "UPDATE rmk_episodes e SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = e.agent_id",
-            &["idx_rmk_episodes_tenant (tenant_id, agent_uuid)"],
-            &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-                "FOREIGN KEY (policy_id, tenant_id) REFERENCES rmk_policies(id, tenant_id)",
-            ],
             "VALIDATE both after backfill",
             "append-heavy training log",
             &["rmk_policies (tranche 1)", "sessions (tranche 2)"],
@@ -1596,20 +1558,10 @@ pub const REGISTRY: &[TableEntry] = &[
         consistency: None,
         tranche: Tranche::RootsAndDirectAgentChildren,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE rmk_policies p SET agent_uuid = a.id, tenant_id = \
                               a.tenant_id FROM agents a WHERE a.agent_id = p.agent_id",
             required_zero_codes: OWNERSHIP_CODES,
-            required_pre_validation_indexes: &[
-                "idx_rmk_policies_tenant (tenant_id, agent_uuid)",
-                "rmk_policies_id_tenant_id_key UNIQUE (id, tenant_id) — FK target for \
-                 rmk_episodes",
-            ],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-            ],
-            not_valid_appropriate: true,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some("Adds UNIQUE (id, tenant_id) as the FK target for episodes."),
             future_unique_columns: None,
@@ -1648,29 +1600,26 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::Sessions,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE sessions s SET agent_uuid = a.id, tenant_id = a.tenant_id \
                               FROM agents a WHERE a.agent_id = s.agent_id",
             required_zero_codes: OWNERSHIP_CODES,
-            required_pre_validation_indexes: &[
-                "idx_sessions_tenant (tenant_id, agent_uuid)",
-                "sessions_tenant_session_key — required *before* the uniqueness change below",
-            ],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-            ],
-            not_valid_appropriate: true,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some(
-                "`idx_sessions_agent_session` is UNIQUE (agent_id, session_id). If Step 4B \
-                 widens session identity to the tenant — UNIQUE (tenant_id, session_id) — then \
-                 two agents in the same tenant that happen to share a `session_id` collide. That \
-                 is a real possibility because `session_id` is caller-supplied TEXT, so it is \
-                 pre-checked as FUTURE_TENANT_UNIQUENESS_COLLISION rather than discovered when \
-                 the index build fails.",
+                "Session identity stays AGENT-scoped. `idx_sessions_agent_session` is UNIQUE \
+                 (agent_id, session_id) today and becomes UNIQUE (tenant_id, agent_uuid, \
+                 session_id) as `sessions_tenant_agent_session_key`, which is the FK target \
+                 `working_memory` references. A tenant-scoped UNIQUE (tenant_id, session_id) is \
+                 explicitly **rejected**: `session_id` is caller-supplied TEXT, so two agents in \
+                 one tenant sharing the string `default` is ordinary caller behaviour, and \
+                 widening identity to the tenant would make that a collision. Because the new \
+                 tuple is a superset of the current one, the change is a relaxation and cannot \
+                 collide.",
             ),
-            future_unique_columns: Some(&["session_id"]),
+            // Grouped by tenant, agent and session — the tuple the future key
+            // actually covers. Expected to stay at zero while the current unique
+            // index holds; it is a defensive pre-check, not a prediction.
+            future_unique_columns: None,
             lock_profile: "ADD COLUMN NULL is metadata-only; a new UNIQUE index should be built \
                            CONCURRENTLY outside the migration transaction",
             rollback_dependencies: &[
@@ -1716,24 +1665,21 @@ pub const REGISTRY: &[TableEntry] = &[
         ),
         tranche: Tranche::Sessions,
         plan: MigrationPlan {
-            added_columns: AGENT_UUID_AND_TENANT,
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE working_memory w SET agent_uuid = s.agent_uuid, tenant_id = \
                               s.tenant_id FROM sessions s WHERE s.agent_id = w.agent_id AND \
                               s.session_id = w.session_id",
-            required_zero_codes: SESSION_CODES,
-            required_pre_validation_indexes: &["idx_working_memory_tenant (tenant_id, agent_uuid)"],
-            planned_composite_fks: &[
-                "FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents(tenant_id, id)",
-            ],
-            not_valid_appropriate: true,
+            required_zero_codes: SESSION_CHILD_CODES,
             validate_step: Some("VALIDATE CONSTRAINT after backfill"),
             future_uniqueness: Some(
-                "`working_memory_agent_id_session_id_key` follows whatever `sessions` does; if \
-                 session identity becomes tenant-scoped this must move with it or the two \
-                 uniqueness rules disagree.",
+                "`working_memory_agent_id_session_id_key` moves with `sessions` and stays \
+                 agent-scoped: UNIQUE (tenant_id, agent_uuid, session_id). It also gains a real \
+                 composite foreign key — (tenant_id, agent_uuid, session_id) REFERENCES \
+                 sessions(tenant_id, agent_uuid, session_id) — so the session reference is \
+                 enforced by the database rather than by convention. The two uniqueness rules \
+                 must move together or they disagree about what identifies a session.",
             ),
-            future_unique_columns: Some(&["session_id"]),
+            future_unique_columns: None,
             lock_profile: "one row per active session; small",
             rollback_dependencies: &["sessions (tranche 2)"],
             inactive_paths: &["every session-scoped write"],
