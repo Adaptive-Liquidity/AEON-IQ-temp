@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::audit::{self, ReasonCode, Severity, AUDIT_TRANSACTION};
 use super::inventory::{self, TableClass, Tranche};
+use super::plan;
 use super::report::{self, ContractStatus, TenancyAuditReport};
 
 const TENANT: &str = "11111111-1111-1111-1111-111111111111";
@@ -726,11 +727,17 @@ async fn a_future_composite_fk_mismatch_is_reported(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn a_future_tenant_uniqueness_collision_is_reported(pool: PgPool) {
-    // Two agents in the *same* tenant using the same session identifier. Legal
-    // today, because `sessions` is unique on (agent_id, session_id); fatal to a
-    // future UNIQUE (tenant_id, session_id), and the index build would be where
-    // it was discovered.
+async fn two_agents_in_one_tenant_may_share_a_session_identifier(pool: PgPool) {
+    // The scenario that decided the session-identity question. Two agents in the
+    // *same* tenant using the same caller-supplied session string is ordinary
+    // caller behaviour — `session_id` is TEXT the caller chooses, and `default`
+    // or `main` is exactly what several agents will pick.
+    //
+    // Under a tenant-scoped `UNIQUE (tenant_id, session_id)` this would be a
+    // collision, and the index build would be where it was discovered. Step 4B
+    // therefore keeps session identity AGENT-scoped —
+    // `UNIQUE (tenant_id, agent_uuid, session_id)` — which is a superset of the
+    // current `(agent_id, session_id)` key and so cannot collide.
     seed_clean(&pool, "agent-one", TENANT).await;
     sqlx::query(
         "INSERT INTO agents (agent_id, tenant_id, external_agent_id) \
@@ -749,14 +756,21 @@ async fn a_future_tenant_uniqueness_collision_is_reported(pool: PgPool) {
 
     let report = audit(&pool).await;
     assert!(
-        has(
+        !has(
             &report,
             "sessions",
             ReasonCode::FutureTenantUniquenessCollision
         ),
-        "{:?}",
+        "agent-scoped session identity must not report this as a collision: {:?}",
         codes_for(&report, "sessions")
     );
+    // …and the rows are otherwise clean, so the absence is a real pass rather
+    // than a scan that never ran.
+    assert_eq!(
+        status_of(&report, "sessions"),
+        Some(ContractStatus::Satisfied)
+    );
+    assert!(!report.is_blocked(), "{:?}", codes_for(&report, "sessions"));
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1970,4 +1984,237 @@ async fn unresolved_tenants_do_not_manufacture_a_uniqueness_collision(pool: PgPo
     );
     // The rows are still blocked — by the code that actually describes them.
     assert!(has(&report, "sessions", ReasonCode::UnmappedAgent));
+}
+
+// ── Nullability and gate reachability ───────────────────────────────────────
+
+/// Nullability is a property of `(table, column)` and never of a column name.
+///
+/// Proven in both directions against the live schema, because a name-keyed list
+/// got this wrong in both at once: it marked keys unenforced that are fully
+/// enforced, and left keys enforced that `MATCH SIMPLE` silently skips. Only the
+/// database can settle it, so only the database is asked.
+#[sqlx::test(migrations = "./migrations")]
+async fn nullability_is_a_property_of_table_and_column_not_of_a_name(pool: PgPool) {
+    async fn is_nullable(pool: &PgPool, table: &str, column: &str) -> Option<bool> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        raw.map(|v| v == "YES")
+    }
+
+    // Direction 1 — everything the plan records as NULL-able really is. A pair
+    // that is actually NOT NULL would mark a key unenforced that the database
+    // enforces in full, understating the guarantee.
+    for (table, column) in plan::PRE_EXISTING_NULLABLE {
+        let observed = is_nullable(&pool, table, column)
+            .await
+            .unwrap_or_else(|| panic!("`{table}.{column}` is recorded NULL-able but absent"));
+        assert!(
+            observed,
+            "`{table}.{column}` is recorded as NULL-able but the schema says NOT NULL; the key \
+             that names it is enforced for every row, and marking it unenforced understates the \
+             constraint"
+        );
+    }
+
+    // Direction 2 — nothing else in a planned key is NULL-able. A missing pair
+    // is the dangerous direction: the key would be treated as evidence of
+    // ownership for rows MATCH SIMPLE never checks.
+    //
+    // This half skips ownership columns Step 4B has not created yet and pairs
+    // already covered by direction 1, so it is counted: a filter that quietly
+    // excluded everything would leave the loop asserting nothing at all, which
+    // is the same vacuous-gate failure this PR removes elsewhere.
+    let mut checked = 0usize;
+    for object in plan::PLANNED_OBJECTS {
+        if object.unenforced_when_null().is_none() {
+            continue;
+        }
+        let table = object.table();
+        for column in object.local_columns() {
+            // Ownership columns are Step 4B's to create; they do not exist yet.
+            if matches!(*column, "agent_uuid" | "tenant_id") {
+                continue;
+            }
+            if plan::PRE_EXISTING_NULLABLE.contains(&(table, column)) {
+                continue;
+            }
+            let Some(observed) = is_nullable(&pool, table, column).await else {
+                continue; // not created yet
+            };
+            assert!(
+                !observed,
+                "`{table}.{column}` is NULL-able in the live schema but the plan does not record \
+                 it; MATCH SIMPLE leaves rows with a NULL there unchecked, so `{}` would be \
+                 treated as evidence of ownership for rows nothing verified",
+                object.name()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 6,
+        "direction 2 checked only {checked} column(s); the planned keys name at least six \
+         pre-existing non-ownership columns (working_memory.session_id, \
+         memory_versions.memory_id, memory_entity_links.memory_id, \
+         memory_entity_links.entity_id, co_access_edges.memory_a, co_access_edges.memory_b), so \
+         a lower count means the filters excluded real work and the loop is asserting nothing"
+    );
+
+    // The trap itself, stated as a fact about the database rather than a
+    // comment: one name, two answers, on each of the two names that collide.
+    for (name, not_null_on, nullable_on) in [
+        ("memory_id", "memory_versions", "retrieval_feedback"),
+        ("memory_a", "co_access_edges", "memory_conflicts"),
+    ] {
+        assert_eq!(
+            is_nullable(&pool, not_null_on, name).await,
+            Some(false),
+            "`{not_null_on}.{name}` must be NOT NULL"
+        );
+        assert_eq!(
+            is_nullable(&pool, nullable_on, name).await,
+            Some(true),
+            "`{nullable_on}.{name}` must be NULL-able — same name, opposite answer, which is why \
+             the list is keyed on the pair"
+        );
+    }
+}
+
+/// `co_access_edges` gates the codes its paths can produce, and only those.
+///
+/// It is the only table in the schema with no agent column, so
+/// `ORPHANED_AGENT_REFERENCE` cannot be produced for it: the audit derives the
+/// orphan code from the path kind, and both of its paths are `Memory`. But
+/// `UNMAPPED_AGENT` and `LEGACY_UNMAPPED` come off the canonical chain
+/// `memory_a -> memories.agent_id -> agents.tenant_id` and remain reachable, so
+/// removing them with it would have opened a real gate.
+#[sqlx::test(migrations = "./migrations")]
+async fn co_access_edges_gates_only_the_codes_its_paths_can_produce(pool: PgPool) {
+    sqlx::query("INSERT INTO agents (agent_id, external_agent_id) VALUES ('nomap', 'ext-nomap')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "INSERT INTO memories (agent_id, content, memory_type) \
+         VALUES ('nomap', 'left', 'fact'), ('nomap', 'right', 'fact') RETURNING id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    // `co_access_edges` carries CHECK (memory_a < memory_b) — edges are stored
+    // order-agnostically — so the pair is normalised by the database's own
+    // comparison rather than by an assumption about UUID ordering in Rust.
+    sqlx::query(
+        "INSERT INTO co_access_edges (memory_a, memory_b) \
+         VALUES (LEAST($1, $2), GREATEST($1, $2))",
+    )
+    .bind(ids[0])
+    .bind(ids[1])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let report = audit(&pool).await;
+    let observed = codes_for(&report, "co_access_edges");
+
+    // Reachable transitively — the gate can fail, so it is a gate.
+    for reachable in [ReasonCode::UnmappedAgent, ReasonCode::LegacyUnmapped] {
+        assert!(
+            has(&report, "co_access_edges", reachable),
+            "{reachable} must reach co_access_edges through its memory chain, so it stays in the \
+             required-zero set: {observed:?}"
+        );
+    }
+
+    // Structurally impossible — no agent column means no agent path.
+    assert!(
+        !has(
+            &report,
+            "co_access_edges",
+            ReasonCode::OrphanedAgentReference
+        ),
+        "co_access_edges has no agent column, so the audit cannot produce \
+         ORPHANED_AGENT_REFERENCE for it: {observed:?}"
+    );
+
+    // The registry must agree with what the audit can actually emit.
+    let entry = inventory::entry("co_access_edges").expect("registered");
+    assert!(
+        !entry
+            .plan
+            .required_zero_codes
+            .contains(&ReasonCode::OrphanedAgentReference),
+        "requiring zero of a code that cannot be produced is not a gate"
+    );
+    for reachable in [ReasonCode::UnmappedAgent, ReasonCode::LegacyUnmapped] {
+        assert!(
+            entry.plan.required_zero_codes.contains(&reachable),
+            "{reachable} is reachable here and must remain gated"
+        );
+    }
+}
+
+/// `agent_tenancy_migrations` cannot carry checkpoint evidence.
+///
+/// The contract asserts this in prose; only a database can settle it. Measured
+/// rather than remembered, because a hardcoded column list would keep agreeing
+/// with itself forever after a migration added the very column it denies.
+#[sqlx::test(migrations = "./migrations")]
+async fn agent_tenancy_migrations_cannot_carry_checkpoint_evidence(pool: PgPool) {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'agent_tenancy_migrations'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !columns.is_empty(),
+        "agent_tenancy_migrations must exist for this comparison to mean anything"
+    );
+
+    // The four things a FINALIZE guard would have to read, none of which this
+    // table has. If a migration ever adds one, this fails and the contract's
+    // stated reason has to be revisited rather than silently going stale.
+    for missing in ["tranche", "digest", "cursor", "status"] {
+        assert!(
+            !columns.iter().any(|c| c.contains(missing)),
+            "agent_tenancy_migrations now has a `{missing}`-like column ({columns:?}); revisit \
+             whether it can carry checkpoint evidence, because plan.rs says it cannot"
+        );
+    }
+
+    // The replacement names all four roles the existing table lacks.
+    let planned: Vec<&str> = plan::TENANCY_BACKFILL_CHECKPOINTS
+        .columns
+        .iter()
+        .map(|c| c.name)
+        .collect();
+    for required in ["tranche", "contract_digest", "status", "resume_cursor"] {
+        assert!(
+            planned.contains(&required),
+            "the planned checkpoint table must declare `{required}`: {planned:?}"
+        );
+    }
+    // And it does not exist yet — this PR plans it, it does not create it.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'tenancy_backfill_checkpoints')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !exists,
+        "Step 4B-0 is a contract: it declares tenancy_backfill_checkpoints, and Step 4B-1 creates \
+         it. A table appearing here means DDL leaked into the contract step."
+    );
 }

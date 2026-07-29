@@ -62,7 +62,25 @@ pub const ROW_ID_DOMAIN: &str = "aeon-tenancy-audit-row-id-v1";
 /// The report's schema version. Bumped whenever the serialized shape changes,
 /// so a consumer can refuse a report it does not understand instead of
 /// misreading one.
-pub const REPORT_SCHEMA_VERSION: &str = "step4a.1";
+///
+/// `step4a.1` -> `step4b0.1`: Step 4B-0 added the typed migration contract to
+/// the payload, and a consumer pinned to the Step 4A shape cannot read it. The
+/// `step_4b_contract` block gained planned tables, the FINALIZE precondition,
+/// compatibility prerequisites and uniqueness transitions; every planned object
+/// gained `declared_in`, `requires_creation`, typed MATCH semantics and its
+/// NULL-able local columns; and `creating_tranche`, `validating_tranche` and
+/// `creation_lock` became nullable, because an already-current target is
+/// created by nothing.
+///
+/// `step4b0.1` -> `step4b0.2`: every planned object gained `attachment_lock`,
+/// and `LockProfile` gained `AddUniqueUsingIndex` as a value it can hold. A
+/// unique target is built in two phases — `CREATE UNIQUE INDEX CONCURRENTLY`
+/// then a brief `ADD CONSTRAINT ... USING INDEX` — and only the first was
+/// published, so a consumer reading the old shape was told the strong lock
+/// never occurs. Both the new field and the new enum value can reach a consumer
+/// pinned to `step4b0.1`, which is why this is a version bump rather than a
+/// silent addition.
+pub const REPORT_SCHEMA_VERSION: &str = "step4b0.2";
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -1979,11 +1997,14 @@ fn assess_tranches(findings: &[Finding]) -> Vec<TrancheReadiness> {
                             | ReasonCode::MissingCanonicalOwnershipPath
                             | ReasonCode::SchemaRelationshipDrift
                     );
+                    // Typed comparison. While these were strings, a renamed code
+                    // would have silently stopped matching and quietly emptied
+                    // the gate instead of failing to compile.
                     if is_contract
                         || entry
                             .plan
                             .required_zero_codes
-                            .contains(&finding.reason_code.as_str())
+                            .contains(&finding.reason_code)
                     {
                         blocking.push(format!("{}: {}", entry.table, finding.reason_code));
                     }
