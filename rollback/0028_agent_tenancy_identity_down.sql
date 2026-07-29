@@ -128,6 +128,14 @@ BEGIN
       FROM pg_catalog.pg_proc p
       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'public'
+       -- By signature, not by name alone. PostgreSQL allows overloading, so an
+       -- unrelated `fn_entities_tenancy_bridge(integer)` would keep this guard
+       -- reporting tranche 1 as applied after the real bridges are gone, sending
+       -- the operator to rollback/0032, which cannot remove an overload it never
+       -- created. Migration 0032 installs these as zero-argument functions
+       -- returning `trigger`; nothing else counts.
+       AND p.pronargs   = 0
+       AND p.prorettype = 'pg_catalog.trigger'::regtype
        AND p.proname IN (
            'fn_archival_batches_tenancy_bridge',
            'fn_audit_logs_tenancy_bridge',

@@ -114,9 +114,17 @@ END $$;
 -- a next action, and it is indistinguishable from the script being broken.
 --
 -- The rename-proof handle is the bridge trigger: `pg_trigger.tgrelid` is an OID,
--- and `ALTER TABLE ... RENAME` does not rename triggers. Resolving each expected
--- trigger name to the table it is actually on, and comparing that against the
--- table this script names, catches the rename before anything is touched.
+-- and `ALTER TABLE ... RENAME` does not rename triggers. Resolving each bridge to
+-- the table it is actually on, and comparing that against the table this script
+-- names, catches the rename before anything is touched.
+--
+-- Reached through the trigger's FUNCTION, not its name. Trigger names are unique
+-- only per table, so a name-only join classifies any unrelated table's
+-- `trg_entities_tenancy_bridge` as a moved tranche trigger and refuses this
+-- rollback permanently, even with all five real bridges correctly in place. The
+-- zero-argument `trigger`-returning `fn_*_tenancy_bridge` functions that
+-- migration 0032 installs are the thing that is actually ours, and `tgfoid`
+-- points at them by OID.
 DO $$
 DECLARE
     moved TEXT;
@@ -126,14 +134,19 @@ BEGIN
                       ', ' ORDER BY t.tgname)
       INTO moved
       FROM (VALUES
-              ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
-              ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
-              ('trg_entities_tenancy_bridge',         'entities'),
-              ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
-              ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
-           ) AS expected(trg, tbl)
+              ('fn_archival_batches_tenancy_bridge', 'archival_batches'),
+              ('fn_audit_logs_tenancy_bridge',       'audit_logs'),
+              ('fn_entities_tenancy_bridge',         'entities'),
+              ('fn_memory_graph_tenancy_bridge',     'memory_graph'),
+              ('fn_rmk_policies_tenancy_bridge',     'rmk_policies')
+           ) AS expected(fn, tbl)
+      JOIN pg_catalog.pg_proc p
+        ON p.proname      = expected.fn
+       AND p.pronamespace = 'public'::regnamespace
+       AND p.pronargs     = 0
+       AND p.prorettype   = 'pg_catalog.trigger'::regtype
       JOIN pg_catalog.pg_trigger t
-        ON t.tgname = expected.trg
+        ON t.tgfoid = p.oid
        AND NOT t.tgisinternal
      WHERE t.tgrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl));
 

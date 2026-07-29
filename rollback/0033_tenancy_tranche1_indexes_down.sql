@@ -111,45 +111,113 @@ BEGIN
     END IF;
 END $$;
 
--- Refuse if any index this script drops now belongs to a table it does not name.
+-- Refuse unless each index this script drops is the one the tranche built.
 --
--- The drops below are by index name, and an index keeps its name when its table
--- is renamed, so without this check a rollback scoped to `public.rmk_policies`
--- would drop an index that is now serving `rmk_policies_old`. Resolved by
--- comparing each index's `indrelid` against the OID of the table this script
+-- Two distinct ways a name-based drop goes wrong, and both are checked here.
+--
+-- The table moved. The drops below are by index name, and an index keeps its
+-- name when its table is renamed, so without this a rollback scoped to
+-- `public.rmk_policies` would drop an index now serving `rmk_policies_old`.
+-- Resolved by comparing `indrelid` against the OID of the table this script
 -- believes it is unwinding.
+--
+-- The index is not ours. `indrelid` alone is not ownership: migrations
+-- 0033-0040 build with `CREATE INDEX ... IF NOT EXISTS`, so a pre-existing index
+-- holding a reserved name on the expected table is skipped by the build with a
+-- notice, and a guard checking only the table would then let this script drop an
+-- index the tranche never created and retire versions 33-40 over it. This is the
+-- same defect the constraint guards in 0041 were rewritten to close, one object
+-- kind further down. Columns are resolved by name through pg_attribute for the
+-- same reason they are there: attnums differ per table and shift after any
+-- rollback/re-apply cycle.
+--
+-- Expected shape, as migrations 0033-0040 build it: the five lookup indexes are
+-- non-unique btree over (tenant_id, agent_uuid); the three unique indexes are
+-- unique btree over (id, tenant_id); none is partial and none is an expression
+-- index.
 DO $$
 DECLARE
-    moved TEXT;
+    spec     RECORD;
+    idx      RECORD;
+    problems TEXT[];
+    bad      TEXT[] := ARRAY[]::TEXT[];
+    cols     TEXT[];
 BEGIN
-    SELECT string_agg(format('%s is on %s (expected public.%s)',
-                             ic.relname, i.indrelid::regclass, expected.tbl),
-                      ', ' ORDER BY ic.relname)
-      INTO moved
-      FROM (VALUES
-              ('idx_archival_batches_tenant',        'archival_batches'),
-              ('idx_audit_logs_tenant',              'audit_logs'),
-              ('idx_entities_tenant',                'entities'),
-              ('idx_memory_graph_tenant',            'memory_graph'),
-              ('idx_rmk_policies_tenant',            'rmk_policies'),
-              ('archival_batches_id_tenant_id_key',  'archival_batches'),
-              ('entities_id_tenant_id_key',          'entities'),
-              ('rmk_policies_id_tenant_id_key',      'rmk_policies')
-           ) AS expected(idx, tbl)
-      JOIN pg_catalog.pg_class ic
-        ON ic.oid = to_regclass(format('public.%I', expected.idx))
-      JOIN pg_catalog.pg_index i
-        ON i.indexrelid = ic.oid
-     WHERE i.indrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl));
+    FOR spec IN
+        SELECT * FROM (VALUES
+            ('idx_archival_batches_tenant',       'archival_batches', FALSE,
+                 ARRAY['tenant_id', 'agent_uuid']),
+            ('idx_audit_logs_tenant',             'audit_logs',       FALSE,
+                 ARRAY['tenant_id', 'agent_uuid']),
+            ('idx_entities_tenant',               'entities',         FALSE,
+                 ARRAY['tenant_id', 'agent_uuid']),
+            ('idx_memory_graph_tenant',           'memory_graph',     FALSE,
+                 ARRAY['tenant_id', 'agent_uuid']),
+            ('idx_rmk_policies_tenant',           'rmk_policies',     FALSE,
+                 ARRAY['tenant_id', 'agent_uuid']),
+            ('archival_batches_id_tenant_id_key', 'archival_batches', TRUE,
+                 ARRAY['id', 'tenant_id']),
+            ('entities_id_tenant_id_key',         'entities',         TRUE,
+                 ARRAY['id', 'tenant_id']),
+            ('rmk_policies_id_tenant_id_key',     'rmk_policies',     TRUE,
+                 ARRAY['id', 'tenant_id'])
+        ) AS s(idx_name, tbl, is_unique, cols)
+        ORDER BY s.idx_name
+    LOOP
+        SELECT i.indrelid, i.indisunique, i.indnkeyatts, i.indnatts, i.indkey,
+               i.indpred IS NOT NULL AS is_partial,
+               i.indexprs IS NOT NULL AS is_expression
+          INTO idx
+          FROM pg_catalog.pg_index i
+         WHERE i.indexrelid = to_regclass(format('public.%I', spec.idx_name));
 
-    IF moved IS NOT NULL THEN
+        CONTINUE WHEN NOT FOUND;   -- already dropped, or moved with its table
+
+        problems := ARRAY[]::TEXT[];
+
+        IF idx.indrelid IS DISTINCT FROM to_regclass(format('public.%I', spec.tbl)) THEN
+            problems := problems
+                || format('it is on %s, expected public.%s', idx.indrelid::regclass, spec.tbl);
+        END IF;
+        IF idx.indisunique <> spec.is_unique THEN
+            problems := problems
+                || format('indisunique=%s, expected %s', idx.indisunique, spec.is_unique);
+        END IF;
+        IF idx.is_partial THEN
+            problems := problems || 'it is partial; the tranche builds no predicate'::TEXT;
+        END IF;
+        IF idx.is_expression THEN
+            problems := problems || 'it indexes an expression, not plain columns'::TEXT;
+        END IF;
+        IF idx.indnatts <> 2 OR idx.indnkeyatts <> 2 THEN
+            problems := problems
+                || format('it has %s column(s) (%s key), expected 2', idx.indnatts,
+                          idx.indnkeyatts);
+        ELSE
+            SELECT array_agg(a.attname::TEXT ORDER BY k.ord)
+              INTO cols
+              FROM unnest(idx.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+              JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = idx.indrelid AND a.attnum = k.attnum;
+            IF cols IS DISTINCT FROM spec.cols THEN
+                problems := problems
+                    || format('columns are %L, expected %L', cols, spec.cols);
+            END IF;
+        END IF;
+
+        IF cardinality(problems) > 0 THEN
+            bad := bad || format('%s (%s)', spec.idx_name, array_to_string(problems, '; '));
+        END IF;
+    END LOOP;
+
+    IF cardinality(bad) > 0 THEN
         RAISE EXCEPTION
-            'a tranche 1 index belongs to a table this script does not name: %. The table was '
-            'renamed after the tranche was applied, and an index keeps its name across a rename, '
-            'so dropping by name would unwind a table this rollback is not scoped to. Nothing '
-            'has been dropped. Rename the table back to what migration 0032 created, then '
-            're-run.',
-            moved
+            'refusing to drop indexes this tranche does not own: %. Each holds a name migrations '
+            '0033-0040 use but is not the object they build, so dropping it would destroy '
+            'something else and retire versions 33-40 over work that was never done. Nothing has '
+            'been dropped. Rename or remove the occupant, or restore the table to the name '
+            'migration 0032 created, then re-run.',
+            array_to_string(bad, ' | ')
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 END $$;
