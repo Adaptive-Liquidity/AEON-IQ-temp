@@ -1068,3 +1068,75 @@ async fn a_partially_unwound_0041_still_blocks_the_indexes_rollback(pool: PgPool
         db.message()
     );
 }
+
+/// `rollback/0028` received the same table-scoping fix as 0032 and 0033, and
+/// needs its own decoy — a CHECK-typed one does not exercise it, because that
+/// guard already filtered `contype = 'f'`. The decoy here is a genuine foreign
+/// key carrying a tranche-1 constraint name on an unrelated table.
+///
+/// It deliberately references a local parent rather than `agents`: an FK
+/// pointing at `agents(tenant_id, id)` would be a real dependency on the unique
+/// key this rollback drops, and refusing it would be correct rather than a
+/// false positive.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unrelated_foreign_key_of_the_same_name_does_not_block_step_one_rollback(pool: PgPool) {
+    const GRANTS_HARDENING_DOWN: &str =
+        include_str!("../../rollback/0031_credential_agent_grants_hardening_down.sql");
+    const GRANTS_DOWN: &str = include_str!("../../rollback/0030_credential_agent_grants_down.sql");
+    const STEP_ONE_DOWN: &str = include_str!("../../rollback/0028_agent_tenancy_identity_down.sql");
+
+    for script in [CONSTRAINTS_DOWN_SQL, INDEXES_DOWN_SQL, PREPARE_DOWN_SQL] {
+        sqlx::raw_sql(script).execute(&pool).await.expect("unwind");
+    }
+
+    for stmt in [
+        "CREATE TABLE public.zz_fk_parent (a uuid, b uuid, UNIQUE (a, b))",
+        "CREATE TABLE public.zz_fk_decoy (a uuid, b uuid, \
+         CONSTRAINT entities_tenant_agent_fkey FOREIGN KEY (a, b) \
+         REFERENCES public.zz_fk_parent (a, b))",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let decoy_is_a_real_fk: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid \
+         WHERE c.conname = 'entities_tenant_agent_fkey' AND c.contype = 'f' \
+           AND t.relname = 'zz_fk_decoy')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        decoy_is_a_real_fk,
+        "the decoy must be FK-typed to be a real test"
+    );
+
+    sqlx::raw_sql(GRANTS_HARDENING_DOWN)
+        .execute(&pool)
+        .await
+        .expect("0031 rollback");
+    sqlx::raw_sql(GRANTS_DOWN)
+        .execute(&pool)
+        .await
+        .expect("0030 rollback");
+    sqlx::raw_sql(STEP_ONE_DOWN)
+        .execute(&pool)
+        .await
+        .expect("an unrelated FK of the same name must not block the step-1 rollback");
+
+    // And it actually did the work, rather than merely not erroring.
+    let gone: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema='public' AND table_name='agents' \
+           AND column_name='external_agent_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        gone,
+        "the rollback must have run, not just declined to fail"
+    );
+}
