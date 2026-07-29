@@ -154,6 +154,50 @@ BEGIN
     END IF;
 END $$;
 
+-- Refuse if a tranche table is not in `public` at all.
+--
+-- The index check below starts from `to_regclass('public.<index>')`, which is
+-- rename-proof only because a rename leaves the index where it was. It is NOT
+-- move-proof: `ALTER TABLE ... SET SCHEMA` takes the table's indexes with it, so
+-- that lookup yields NULL, the join produces no row, and the guard reports
+-- nothing. The `DROP INDEX IF EXISTS public.<name>` statements then no-op
+-- silently and the ledger delete still runs. Measured on pg16: with `audit_logs`
+-- moved to another schema, this script emitted one "does not exist, skipping"
+-- notice and COMMITted, reporting success while the table, its bridge trigger and
+-- its lookup index were all still live somewhere else.
+--
+-- Checking that each expected table is present in `public` is the unambiguous
+-- form of that question, and it subsumes moved, renamed and dropped in one test.
+-- Detecting the moved object directly is not reliable: an unrelated
+-- `decoy.entities` may legitimately carry an index of the same name -- the
+-- existing `identically_named_constraints_elsewhere_do_not_block_rollback` test
+-- requires exactly that not to block -- and nothing distinguishes the two by
+-- catalog shape alone. All five tables are created by migrations 0001, 0006 and
+-- 0017, so a healthy database never trips this.
+DO $$
+DECLARE
+    missing TEXT;
+BEGIN
+    SELECT string_agg(expected.tbl, ', ' ORDER BY expected.tbl)
+      INTO missing
+      FROM (VALUES
+              ('archival_batches'), ('audit_logs'), ('entities'),
+              ('memory_graph'), ('rmk_policies')
+           ) AS expected(tbl)
+     WHERE to_regclass(format('public.%I', expected.tbl)) IS NULL;
+
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION
+            'tranche 1 table(s) missing from schema public: %. This rollback drops indexes and '
+            'retires ledger versions 33-40 by name, so it cannot prove those objects are gone '
+            'while the table they belong to is not where it is expected -- it was renamed, moved '
+            'to another schema, or dropped. Nothing has been dropped. Restore the table to '
+            'public under the name migration 0032 created, then re-run.',
+            missing
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END $$;
+
 DROP INDEX IF EXISTS public.idx_archival_batches_tenant;
 DROP INDEX IF EXISTS public.idx_audit_logs_tenant;
 DROP INDEX IF EXISTS public.idx_entities_tenant;

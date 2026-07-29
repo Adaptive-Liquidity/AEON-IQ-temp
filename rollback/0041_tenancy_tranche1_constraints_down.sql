@@ -69,6 +69,7 @@ DECLARE
     actual      TEXT[];
     problems    TEXT[];
     foreigners  TEXT[] := ARRAY[]::TEXT[];
+    absent      TEXT[] := ARRAY[]::TEXT[];
     to_drop     TEXT[] := ARRAY[]::TEXT[];
 BEGIN
     SELECT c.conindid INTO agents_idx
@@ -77,15 +78,28 @@ BEGIN
        AND c.conrelid = agents_oid
        AND c.contype = 'u';
 
-    -- ── Refuse if a tranche key has moved to a table under another name ──────
-    -- Found by OID through the parent's unique key, so a renamed child is still
-    -- seen.  `agents_idx` is NULL only when 0028 is already unwound, in which
-    -- case none of these keys can exist either.
-    IF agents_idx IS NOT NULL THEN
-        SELECT string_agg(format('%s is now on %s (expected public.%s)',
-                                 c.conname, c.conrelid::regclass, expected.tbl),
-                          ', ' ORDER BY c.conname)
-          INTO moved
+    -- ── Refuse if any tranche constraint has moved under another table name ──
+    -- Both kinds are checked, and the unique half is not redundant.  Checking
+    -- only the five foreign keys looks sufficient -- every table carrying an
+    -- adopted unique constraint carries an ownership key too -- but that holds
+    -- only while 0041 is fully applied.  Measured on pg16: drop the five keys
+    -- (the state an interrupted rollback leaves), rename `rmk_policies`, and a
+    -- foreign-key-only rename check finds nothing; the drop loop below then
+    -- resolves `public.rmk_policies` to NULL, skips it as "already gone", drops
+    -- the other two unique constraints, deletes ledger version 41 and reports
+    -- success -- leaving `rmk_policies_id_tenant_id_key` attached to the renamed
+    -- table with a ledger claiming 0041 was never applied.  That is the exact
+    -- failure this guard exists to prevent, reachable through the half-unwound
+    -- state rather than the fully-applied one.
+    --
+    -- Each kind is reached through a handle a rename does not disturb: the keys
+    -- through `conindid` on the parent's unique key, the unique constraints
+    -- through the OID of the index they adopted, which keeps its own name.
+    -- `agents_idx` is NULL only when 0028 is already unwound, in which case no
+    -- ownership key can exist either, so that arm simply yields nothing.
+    SELECT string_agg(found.label, ', ' ORDER BY found.label) INTO moved FROM (
+        SELECT format('%s is now on %s (expected public.%s)',
+                      c.conname, c.conrelid::regclass, expected.tbl) AS label
           FROM pg_catalog.pg_constraint c
           JOIN (VALUES
                   ('archival_batches_tenant_agent_fkey', 'archival_batches'),
@@ -95,18 +109,32 @@ BEGIN
                   ('rmk_policies_tenant_agent_fkey',     'rmk_policies')
                ) AS expected(name, tbl) ON expected.name = c.conname
          WHERE c.contype = 'f'
+           AND agents_idx IS NOT NULL
            AND c.conindid = agents_idx
-           AND c.conrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl));
+           AND c.conrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl))
+        UNION ALL
+        SELECT format('%s is now on %s (expected public.%s)',
+                      c.conname, c.conrelid::regclass, expected.tbl) AS label
+          FROM (VALUES
+                  ('archival_batches_id_tenant_id_key', 'archival_batches'),
+                  ('entities_id_tenant_id_key',         'entities'),
+                  ('rmk_policies_id_tenant_id_key',     'rmk_policies')
+               ) AS expected(name, tbl)
+          JOIN pg_catalog.pg_constraint c
+            ON c.conname = expected.name
+           AND c.contype = 'u'
+           AND c.conindid = to_regclass(format('public.%I', expected.name))
+         WHERE c.conrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl))
+    ) AS found;
 
-        IF moved IS NOT NULL THEN
-            RAISE EXCEPTION
-                'a tranche 1 ownership key is attached to a table this script does not name: %. '
-                'The table was renamed after the tranche was applied, so dropping by the names '
-                'below would miss the constraint and leave the tranche half-attached. Nothing has '
-                'been dropped. Rename the table back to what migration 0032 created, then re-run.',
-                moved
-                USING ERRCODE = 'object_not_in_prerequisite_state';
-        END IF;
+    IF moved IS NOT NULL THEN
+        RAISE EXCEPTION
+            'a tranche 1 constraint is attached to a table this script does not name: %. '
+            'The table was renamed after the tranche was applied, so dropping by the names '
+            'below would miss the constraint and leave the tranche half-attached. Nothing has '
+            'been dropped. Rename the table back to what migration 0032 created, then re-run.',
+            moved
+            USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 
     -- ── Classify every name this script would drop ───────────────────────────
@@ -132,7 +160,29 @@ BEGIN
         ORDER BY s.kind, s.tbl
     LOOP
         tbl_oid := to_regclass(format('public.%I', spec.tbl));
-        CONTINUE WHEN tbl_oid IS NULL;   -- table already gone; nothing to drop
+
+        -- A tranche table missing from `public` is refused, not skipped.
+        --
+        -- Skipping it was a hole with the same shape as the rename one above, but
+        -- reached differently: `ALTER TABLE ... SET SCHEMA` moves the table AND
+        -- its indexes, so the rename guard's `to_regclass('public.<index>')`
+        -- lookup yields NULL and finds nothing, and this loop then treated the
+        -- table as already gone. Measured: with the sibling foreign key already
+        -- dropped by hand and `archival_batches` moved to another schema, the
+        -- script dropped what it could reach and committed, leaving
+        -- `archival_batches_id_tenant_id_key` attached in the new schema.
+        --
+        -- Detecting the move itself is not reliable -- an unrelated
+        -- `decoy.entities` may legitimately hold a constraint of the same name,
+        -- and no reverse dependency distinguishes the two -- but the absence of
+        -- the table this script is scoped to is unambiguous, and it covers being
+        -- moved, renamed and dropped at once. All five tables are created by
+        -- migrations 0001, 0006 and 0017, so a healthy database never reaches
+        -- this branch.
+        IF tbl_oid IS NULL THEN
+            absent := absent || format('%s (for %s)', spec.tbl, spec.con_name);
+            CONTINUE;
+        END IF;
 
         SELECT c.contype, c.conkey, c.confrelid, c.confkey, c.confupdtype,
                c.confdeltype, c.confmatchtype, c.condeferrable, c.condeferred,
@@ -168,7 +218,7 @@ BEGIN
         END IF;
 
         IF con.conparentid <> 0 THEN
-            problems := problems || 'constraint is inherited from a partitioned parent';
+            problems := problems || 'constraint is inherited from a partitioned parent'::TEXT;
         END IF;
 
         IF spec.kind = 'f' THEN
@@ -216,6 +266,20 @@ BEGIN
     END LOOP;
 
     -- ── Refuse before dropping anything, or drop everything verified ─────────
+    -- A missing table is a prerequisite-state problem, not an ownership dispute,
+    -- so it raises 55000 with the rename guard's wording rather than 42710's
+    -- "this is somebody else's object".
+    IF cardinality(absent) > 0 THEN
+        RAISE EXCEPTION
+            'tranche 1 table(s) missing from schema public: %. This script drops constraints and '
+            'retires ledger version 41 by name, so it cannot prove those constraints are gone '
+            'while the table holding them is not where it is expected -- it was renamed, moved to '
+            'another schema, or dropped. Nothing has been dropped. Restore the table to public '
+            'under the name migration 0032 created, then re-run.',
+            array_to_string(absent, ', ')
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
     IF cardinality(foreigners) > 0 THEN
         RAISE EXCEPTION
             'refusing to drop constraints this tranche does not own: %. Each of these holds a '

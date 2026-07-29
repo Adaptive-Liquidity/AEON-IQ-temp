@@ -81,6 +81,26 @@
 -- and completes. This guard is what keeps the permissive build honest.
 --
 -- The Step 4A verifier reports the same condition as drift, independently.
+
+-- Never trust the caller's session search_path, matching this migration's own
+-- rollback and the 0028/0032/0033 scripts.
+--
+-- Schema-qualifying every relation name is NOT sufficient on its own, and the
+-- asymmetry is easy to miss: `'public.agents'::regclass` is a type-input cast and
+-- cannot be shadowed, but `to_regclass(...)` is an ordinary, overridable catalog
+-- function. Qualifying the string ARGUMENT does nothing to protect the FUNCTION
+-- CALL. Demonstrated on pg16 with `search_path = hostile, public, pg_catalog` and
+-- a `hostile.to_regclass(text)`: the cast still resolved `agents`, the function
+-- call returned an attacker-chosen decoy. Since the guard below resolves table
+-- OIDs through `to_regclass` and then reads pg_constraint against them, a
+-- poisoned resolver could make a wrong-shape occupant look correct and defeat the
+-- very check this migration adds. The DDL itself still targets literal
+-- `public.<table>`, so the target cannot be redirected -- only the guard fooled.
+--
+-- SET LOCAL is confined to this transaction, which this file has because it
+-- carries no `-- no-transaction` marker.
+SET LOCAL search_path = pg_catalog, public;
+
 DO $$
 DECLARE
     broken TEXT;
@@ -268,7 +288,7 @@ BEGIN
         END IF;
 
         IF con.conparentid <> 0 THEN
-            problems := problems || 'constraint is inherited from a partitioned parent';
+            problems := problems || 'constraint is inherited from a partitioned parent'::TEXT;
         END IF;
 
         IF spec.kind = 'f' THEN
@@ -314,7 +334,7 @@ BEGIN
              WHERE i.indexrelid = con.conindid;
 
             IF NOT FOUND THEN
-                problems := problems || 'constraint owns no index';
+                problems := problems || 'constraint owns no index'::TEXT;
             ELSIF NOT idx.indisunique
                OR NOT idx.indisvalid
                OR NOT idx.is_total
