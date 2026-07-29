@@ -803,3 +803,268 @@ async fn the_checkpoint_completion_index_predicate_is_verified_exactly(pool: PgP
         "the correctly declared index must pass: {drift:?}"
     );
 }
+
+// ── Recovering from a failed concurrent index build ─────────────────────────
+
+const BUILD_MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/0033_tenancy_tranche1_index_idx_archival_batches_tenant.sql"),
+    include_str!("../../migrations/0034_tenancy_tranche1_index_idx_audit_logs_tenant.sql"),
+    include_str!("../../migrations/0035_tenancy_tranche1_index_idx_entities_tenant.sql"),
+    include_str!("../../migrations/0036_tenancy_tranche1_index_idx_memory_graph_tenant.sql"),
+    include_str!("../../migrations/0037_tenancy_tranche1_index_idx_rmk_policies_tenant.sql"),
+    include_str!(
+        "../../migrations/0038_tenancy_tranche1_index_archival_batches_id_tenant_id_key.sql"
+    ),
+    include_str!("../../migrations/0039_tenancy_tranche1_index_entities_id_tenant_id_key.sql"),
+    include_str!("../../migrations/0040_tenancy_tranche1_index_rmk_policies_id_tenant_id_key.sql"),
+];
+const CONSTRAINTS_UP: &str = include_str!("../../migrations/0041_tenancy_tranche1_constraints.sql");
+const CONSTRAINTS_DOWN_SQL: &str =
+    include_str!("../../rollback/0041_tenancy_tranche1_constraints_down.sql");
+const INDEXES_DOWN_SQL: &str =
+    include_str!("../../rollback/0033_tenancy_tranche1_indexes_down.sql");
+const PREPARE_DOWN_SQL: &str =
+    include_str!("../../rollback/0032_tenancy_tranche1_prepare_down.sql");
+
+const TRANCHE1_INDEXES: &str = "'idx_archival_batches_tenant','idx_audit_logs_tenant',\
+    'idx_entities_tenant','idx_memory_graph_tenant','idx_rmk_policies_tenant',\
+    'archival_batches_id_tenant_id_key','entities_id_tenant_id_key',\
+    'rmk_policies_id_tenant_id_key'";
+
+async fn count_tranche1_indexes(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+         WHERE n.nspname='public' AND c.relkind='i' AND c.relname IN ({TRANCHE1_INDEXES})"
+    )))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The authoritative recovery path for a failed `CREATE INDEX CONCURRENTLY`.
+///
+/// A failed concurrent build leaves the index behind INVALID. The build files
+/// carry `IF NOT EXISTS`, so the next `sqlx migrate run` skips the broken index
+/// with a notice, the migration *succeeds*, and sqlx records the version — over
+/// an index that enforces nothing, and which it will now never rebuild. That is
+/// why "drop it and re-run its build migration" is not a recovery: the ledger
+/// entry is already there.
+///
+/// The path that works is rollback/0033, which drops all eight indexes AND
+/// deletes ledger versions 33-40, after which a normal migrate rebuilds them.
+/// This proves each link: the guard rejects, the rollback clears both the
+/// indexes and the ledger, the rebuild produces valid indexes, and 0041 then
+/// applies.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_failed_concurrent_build_recovers_through_the_indexes_rollback(pool: PgPool) {
+    // Model the state a failed build leaves: index present but INVALID, with
+    // 0041 not yet applied because its guard would have refused.
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback");
+    for stmt in [
+        "CREATE UNIQUE INDEX IF NOT EXISTS archival_batches_id_tenant_id_key ON archival_batches (id, tenant_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS entities_id_tenant_id_key ON entities (id, tenant_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS rmk_policies_id_tenant_id_key ON rmk_policies (id, tenant_id)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false \
+         WHERE indexrelid = 'public.idx_entities_tenant'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 1. The guard rejects the invalid build, and says what actually recovers.
+    let error = sqlx::raw_sql(CONSTRAINTS_UP)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    let db = error.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("55000"), "{error}");
+    assert!(
+        db.message().contains("idx_entities_tenant"),
+        "must name the broken index: {}",
+        db.message()
+    );
+    assert!(
+        db.message()
+            .contains("rollback/0033_tenancy_tranche1_indexes_down.sql"),
+        "must prescribe the rollback, not a re-run of the build migration: {}",
+        db.message()
+    );
+    assert!(
+        db.message().contains("will NOT fix"),
+        "must say plainly that re-running the build migration does not work: {}",
+        db.message()
+    );
+
+    // 2. The rollback clears the indexes AND the ledger entries that would
+    //    otherwise stop sqlx ever rebuilding them.
+    sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0033-0040 rollback");
+    assert_eq!(
+        count_tranche1_indexes(&pool).await,
+        0,
+        "indexes must be gone"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger, 0,
+        "ledger versions 33-40 must be cleared, or sqlx will never rebuild them"
+    );
+
+    // 3. A normal migrate rebuilds them, all valid.
+    for build in BUILD_MIGRATIONS {
+        sqlx::raw_sql(*build).execute(&pool).await.expect("rebuild");
+    }
+    let all_valid: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT bool_and(i.indisvalid) FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid \
+         WHERE c.relname IN ({TRANCHE1_INDEXES})"
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(all_valid, "every rebuilt index must be valid");
+
+    // 4. And 0041 now applies.
+    sqlx::raw_sql(CONSTRAINTS_UP)
+        .execute(&pool)
+        .await
+        .expect("0041 must apply once the indexes are valid");
+}
+
+// ── Rollback catalog checks are scoped to the tables they mean ──────────────
+
+/// `conname` is unique only per relation, so an unrelated table — or another
+/// schema entirely — may legitimately hold a constraint called
+/// `entities_id_tenant_id_key`. A guard matching on the bare name would refuse
+/// a rollback that has nothing to do with it.
+#[sqlx::test(migrations = "./migrations")]
+async fn identically_named_constraints_elsewhere_do_not_block_rollback(pool: PgPool) {
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback");
+
+    for stmt in [
+        "CREATE SCHEMA decoy",
+        "CREATE TABLE decoy.entities (id uuid PRIMARY KEY, tenant_id uuid)",
+        "ALTER TABLE decoy.entities ADD CONSTRAINT entities_id_tenant_id_key \
+         UNIQUE (id, tenant_id)",
+        "CREATE TABLE public.zz_unrelated (id uuid PRIMARY KEY, tenant_id uuid)",
+        "ALTER TABLE public.zz_unrelated ADD CONSTRAINT entities_tenant_agent_fkey \
+         CHECK (tenant_id IS NOT NULL)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Both decoys carry names the guards look for. Neither is on a tranche-1
+    // table in `public`, so neither may block.
+    sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("decoy constraints must not block the indexes rollback");
+    sqlx::raw_sql(PREPARE_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("decoy constraints must not block the prepare rollback");
+}
+
+// ── The dependency preflight is complete, and runs before any damage ────────
+
+/// Rolling back 0032 or 0033 while 0041's foreign keys are still attached would
+/// leave them referencing columns about to be dropped. Both scripts refuse, and
+/// the refusal happens before any drop and before the ledger delete — so a
+/// refused run leaves the database exactly as it was.
+#[sqlx::test(migrations = "./migrations")]
+async fn both_rollbacks_refuse_while_any_tranche1_foreign_key_remains(pool: PgPool) {
+    for (label, script) in [("0033-0040", INDEXES_DOWN_SQL), ("0032", PREPARE_DOWN_SQL)] {
+        // Each script opens its own transaction, so a RAISE leaves the
+        // connection aborted and it must be cleared before reuse.
+        let mut conn = pool.acquire().await.unwrap();
+        let error = sqlx::raw_sql(script).execute(&mut *conn).await.unwrap_err();
+        sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+        drop(conn);
+        let db = error.as_database_error().expect("a database error");
+        assert_eq!(
+            db.code().as_deref(),
+            Some("2BP01"),
+            "{label}: must be dependent_objects_still_exist, got {error}"
+        );
+        assert!(
+            db.message()
+                .contains("entities_tenant_agent_fkey on entities"),
+            "{label}: must name the constraint and its table: {}",
+            db.message()
+        );
+    }
+
+    // Nothing was destroyed by either refusal.
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema='public' AND column_name IN ('agent_uuid','tenant_id') \
+           AND table_name IN ('archival_batches','audit_logs','entities','memory_graph', \
+                              'rmk_policies')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns, 10,
+        "no ownership column may be dropped by a refusal"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 32 AND 41")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger, 10, "no ledger row may be deleted by a refusal");
+}
+
+/// A partially unwound 0041 — unique constraints dropped, foreign keys still
+/// attached — is the state an interrupted rollback leaves. The old guard checked
+/// only the unique constraints and would have waved this through.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_partially_unwound_0041_still_blocks_the_indexes_rollback(pool: PgPool) {
+    for stmt in [
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+        "ALTER TABLE entities DROP CONSTRAINT entities_id_tenant_id_key",
+        "ALTER TABLE rmk_policies DROP CONSTRAINT rmk_policies_id_tenant_id_key",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let mut conn = pool.acquire().await.unwrap();
+    let error = sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&mut *conn)
+        .await
+        .unwrap_err();
+    sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+    drop(conn);
+    let db = error.as_database_error().expect("a database error");
+    assert_eq!(db.code().as_deref(), Some("2BP01"), "{error}");
+    assert!(
+        db.message().contains("tenant_agent_fkey"),
+        "the surviving foreign keys must be what blocks it: {}",
+        db.message()
+    );
+}

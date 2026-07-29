@@ -55,8 +55,28 @@
 --
 -- The guard lives here rather than with the builds because this is the file
 -- that ADOPTS them: an INVALID unique index must never become a constraint.
--- Recovery is to DROP INDEX CONCURRENTLY the named index and re-run its build
--- migration; the Step 4A verifier reports the same condition as drift.
+-- Recovery is NOT "drop the index and re-run its build migration". By the time
+-- this guard fires, sqlx has already recorded versions 0033-0040 in
+-- `_sqlx_migrations`: a failed CONCURRENTLY build leaves the index behind
+-- INVALID, and the next `sqlx migrate run` re-executes that file, whose
+-- `IF NOT EXISTS` skips the broken index with a notice and lets the migration
+-- succeed. The version is then recorded over an index that enforces nothing,
+-- and sqlx will never run that file again.
+--
+-- The authoritative path is to run rollback/0033_tenancy_tranche1_indexes_down
+-- .sql, which drops all eight indexes AND deletes ledger versions 33-40, then
+-- `sqlx migrate run` to rebuild them. Measured end to end on pg16: guard fires
+-- -> rollback leaves 0 indexes and 0 ledger rows for 33-40 -> rerun rebuilds
+-- all eight valid -> this migration applies clean.
+--
+-- The `IF NOT EXISTS` on those builds is deliberate and stays. Removing it
+-- would make a failed build louder but would strand the *other* failure mode:
+-- measured, a crash after a successful build but before the ledger write leaves
+-- a valid index, and re-running without `IF NOT EXISTS` fails with `relation
+-- already exists` and no forward path, where `IF NOT EXISTS` yields a notice
+-- and completes. This guard is what keeps the permissive build honest.
+--
+-- The Step 4A verifier reports the same condition as drift, independently.
 DO $$
 DECLARE
     broken TEXT;
@@ -82,9 +102,12 @@ BEGIN
     IF broken IS NOT NULL THEN
         RAISE EXCEPTION
             'tranche 1 concurrent index build left INVALID indexes: %. '
-            'DROP INDEX CONCURRENTLY each one and re-run its build migration; '
-            'an INVALID unique index enforces nothing and must not be adopted '
-            'as a constraint below.',
+            'Re-running the build migration will NOT fix this: sqlx has already '
+            'recorded versions 33-40, and those files skip an existing index. '
+            'Run rollback/0033_tenancy_tranche1_indexes_down.sql (it drops all '
+            'eight indexes and deletes ledger versions 33-40), then re-run '
+            'sqlx migrate. An INVALID unique index enforces nothing and must '
+            'not be adopted as a constraint below.',
             broken
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;

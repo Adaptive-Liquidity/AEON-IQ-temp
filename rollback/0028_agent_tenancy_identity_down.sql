@@ -91,17 +91,27 @@ DECLARE
     remaining TEXT;
     bridges   TEXT;
 BEGIN
-    SELECT string_agg(conname, ', ' ORDER BY conname)
+    -- Scoped to the exact public tables. `conname` is unique only per
+    -- relation, so an unrelated table -- or a different schema -- may hold a
+    -- constraint of the same name without having anything to do with tranche 1,
+    -- and blocking on the bare name would refuse a rollback that is in fact
+    -- safe.
+    SELECT string_agg(format('%s on %s', c.conname, expected.tbl), ', '
+                      ORDER BY c.conname)
       INTO remaining
-      FROM pg_catalog.pg_constraint
-     WHERE contype = 'f'
-       AND conname IN (
-           'archival_batches_tenant_agent_fkey',
-           'audit_logs_tenant_agent_fkey',
-           'entities_tenant_agent_fkey',
-           'memory_graph_tenant_agent_fkey',
-           'rmk_policies_tenant_agent_fkey'
-       );
+      FROM (VALUES
+              ('archival_batches_tenant_agent_fkey', 'archival_batches'),
+              ('audit_logs_tenant_agent_fkey',       'audit_logs'),
+              ('entities_tenant_agent_fkey',         'entities'),
+              ('memory_graph_tenant_agent_fkey',     'memory_graph'),
+              ('rmk_policies_tenant_agent_fkey',     'rmk_policies')
+           ) AS expected(name, tbl)
+      JOIN pg_catalog.pg_class t
+        ON t.relname = expected.tbl
+      JOIN pg_catalog.pg_namespace n
+        ON n.oid = t.relnamespace AND n.nspname = 'public'
+      JOIN pg_catalog.pg_constraint c
+        ON c.conname = expected.name AND c.conrelid = t.oid AND c.contype = 'f';
 
     SELECT string_agg(p.proname, ', ' ORDER BY p.proname)
       INTO bridges
