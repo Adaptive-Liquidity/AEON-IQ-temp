@@ -101,6 +101,31 @@ pub async fn delete_agent(state: &AppState, agent_id: &str) -> Result<bool> {
         .bind(agent_id)
         .execute(&mut *tx)
         .await?;
+    // rmk_policies is the fifth table tenancy tranche 1 hangs a composite
+    // ownership key off (migration 0041), and it was the only one of the five
+    // that nothing here emptied: archival_batches goes by the ON DELETE CASCADE
+    // on its agent_id key, and entities, memory_graph and audit_logs go by the
+    // statements above. That key defaults to ON DELETE NO ACTION, so leaving the
+    // policies behind makes this whole transaction fail for any agent RMK has
+    // ever served.
+    //
+    // Deleted explicitly rather than by putting ON DELETE CASCADE on the key,
+    // because the key is MATCH SIMPLE over columns that stay NULL-able until
+    // BACKFILL runs: PostgreSQL skips the constraint for any row with a NULL
+    // component, and a skipped constraint cascades nothing. Measured on pg16, a
+    // cascade removed a bridge-populated policy and left a pre-backfill one
+    // behind, so an agent's policies would be half-deleted according to when
+    // each row happened to be written. `agent_id` has no such gap: it is
+    // globally unique per agents_agent_id_key and NOT NULL on every
+    // rmk_policies row since migration 0017.
+    //
+    // rmk_episodes is deliberately NOT deleted: it is a metrics log, and its
+    // policy_id is ON DELETE SET NULL (migration 0018), so retained episodes
+    // simply lose the policy reference.
+    sqlx::query("DELETE FROM rmk_policies WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
     // sessions and archival_batches cascade from agents; delete agent row last
     let result = sqlx::query("DELETE FROM agents WHERE agent_id = $1")
         .bind(agent_id)
