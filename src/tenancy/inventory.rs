@@ -554,8 +554,15 @@ impl SchemaObjectContract {
                 if *require_ready {
                     flags.push("ready");
                 }
+                // Stated either way, not only when strict. Rendering nothing for
+                // the partial case made the published artifact misleading by
+                // omission: a deliberately partial index read as though it were
+                // total, which is exactly the property the reader needs and the
+                // one the declaration exists to carry.
                 if *require_non_partial {
                     flags.push("non-partial");
+                } else {
+                    flags.push("partial");
                 }
                 if *require_no_expressions {
                     flags.push("no expressions");
@@ -582,6 +589,36 @@ const fn unique_index(
         require_valid: true,
         require_ready: true,
         require_non_partial: true,
+        require_no_expressions: true,
+    }
+}
+
+/// A unique index whose partial predicate is the guarantee, not a weakening.
+///
+/// Separate from [`unique_index`] rather than a parameter on it, because the two
+/// say opposite things. `unique_index` requires `require_non_partial` so that a
+/// uniqueness the scanner depends on cannot quietly be scoped down to a subset
+/// of rows. A *deliberately* partial index inverts that: scoping it is the
+/// point, and requiring it to be total would reject the only correct shape.
+///
+/// The only user today is the backfill checkpoint table's completion key, where
+/// `WHERE status = 'COMPLETED'` is what allows retained ABANDONED attempts to
+/// coexist with at most one authoritative completion. Requiring non-partial
+/// there would demand an index that makes a retry impossible.
+///
+/// Everything else stays strict: still unique, still valid, still ready, still
+/// free of expressions.
+const fn partial_unique_index(
+    name: &'static str,
+    columns: &'static [&'static str],
+) -> SchemaObjectContract {
+    SchemaObjectContract::UniqueIndex {
+        name,
+        columns,
+        require_unique: true,
+        require_valid: true,
+        require_ready: true,
+        require_non_partial: false,
         require_no_expressions: true,
     }
 }
@@ -1663,6 +1700,61 @@ pub const REGISTRY: &[TableEntry] = &[
         rationale: "Owned by its agent through a real FK to `agents(agent_id)`. Everything \
                     session-scoped resolves through `(agent_id, session_id)`, which is the only \
                     unique key on this table besides its surrogate primary key.",
+    },
+    TableEntry {
+        table: "tenancy_backfill_checkpoints",
+        schema_contract: &[
+            primary_key("tenancy_backfill_checkpoints_pkey", &["id"]),
+            // The partial scope is the whole point, and it is why this is
+            // declared here rather than left to drift: a plain UNIQUE would
+            // reject the retry an operator makes after abandoning an attempt
+            // against the same digest, and a missing one would let two rows
+            // both claim to be the authoritative completion a FINALIZE guard
+            // reads.
+            partial_unique_index(
+                "tenancy_backfill_checkpoints_completed_key",
+                &["tranche", "contract_digest"],
+            ),
+        ],
+        row_identity: SURROGATE_ID,
+        session_semantics: None,
+        class: TableClass::SystemGlobal,
+        canonical_path: None,
+        secondary_paths: &[],
+        consistency: None,
+        tranche: Tranche::RootsAndDirectAgentChildren,
+        plan: MigrationPlan {
+            initial_nullability: "n/a — no ownership columns are added",
+            backfill_source: "n/a — SYSTEM_GLOBAL tables are never backfilled with an \
+                              inferred tenant",
+            required_zero_codes: &[ReasonCode::GlobalScopeUnverified],
+            validate_step: None,
+            future_uniqueness: None,
+            future_unique_columns: None,
+            lock_profile: "none — created by tranche 1's PREPARE and not modified afterwards",
+            // NONE_REQUIRED, not the 0032 rollback script. This field means
+            // "what must be rolled back before this table can be", and nothing
+            // must: `rollback/0032_tenancy_tranche1_prepare_down.sql`
+            // deliberately RETAINS this table rather than dropping it, so
+            // naming it here would name the one script that does not roll this
+            // table back. Removing the table at all is a separate, manual
+            // DROP an operator performs knowingly — see that script's header.
+            rollback_dependencies: NONE_REQUIRED,
+            inactive_paths: NONE_REQUIRED,
+        },
+        global_scope_evidence: Some(
+            "Evidence about migration *runs*, not about tenant data. Each row records that a \
+             named tranche was backfilled against a named contract digest, and is written only \
+             by the operator's backfill command and read only by the FINALIZE guard. It is on \
+             no request path and carries no tenant-shaped column at all: `tranche` and \
+             `contract_digest` describe the migration, not an owner. Giving these rows a tenant \
+             would misrepresent an operator action as tenant data, and would additionally make \
+             the FINALIZE guard tenant-scoped, which would let one tenant's backfill authorise \
+             a schema change for every tenant.",
+        ),
+        rationale: "Protocol bookkeeping for the three-stage tenancy migration. Registered here \
+                    in the same change that creates it, so it cannot exist as an unregistered \
+                    side-table the verifier reports as drift.",
     },
     TableEntry {
         table: "working_memory",

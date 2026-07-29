@@ -3,8 +3,8 @@
 Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry is the source of truth and a test regenerates this file and compares it.
 
 - schema version: `step4b0.2`
-- inventory digest: `sha256:fb14c12561f280a182f8e8c096a98f997de00715bda0723890e95509cac1b7e2`
-- tables classified: 22
+- inventory digest: `sha256:64ca90d6176e5d15ec5cb3febab834c3956d600c2de117483e5c082b1919c8ce`
+- tables classified: 23
 
 ## Classification summary
 
@@ -15,7 +15,7 @@ Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry 
 | `SESSION_CHILD` | `working_memory` |
 | `MEMORY_LINEAGE_CHILD` | `co_access_edges`, `memory_entity_links`, `memory_versions` |
 | `TENANT_GLOBAL` | `credentials` |
-| `SYSTEM_GLOBAL` | `agent_tenancy_migrations` |
+| `SYSTEM_GLOBAL` | `agent_tenancy_migrations`, `tenancy_backfill_checkpoints` |
 
 ## REQUIRED_CURRENT_SCHEMA_CONTRACT
 
@@ -227,6 +227,7 @@ constraints — not from whether the column happens to be NULL-able.
 - `entities`
 - `memory_graph`
 - `rmk_policies`
+- `tenancy_backfill_checkpoints`
 
 ### TRANCHE_2_SESSIONS
 
@@ -840,6 +841,25 @@ constraints — not from whether the column happens to be NULL-able.
 - **lock profile**: ADD COLUMN NULL is metadata-only; a new UNIQUE index should be built CONCURRENTLY outside the migration transaction
 - **rollback dependencies**: `working_memory`, `memories`, `memory_retrieval_logs`, `extraction_jobs`, `cognitive_hypervisor_timeline`, `rmk_episodes`
 - **must stay inactive**: `POST /sessions`, `every session-scoped write`
+
+### `tenancy_backfill_checkpoints`
+
+- **class**: `SYSTEM_GLOBAL`
+- **tranche**: `TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN`
+- **rationale**: Protocol bookkeeping for the three-stage tenancy migration. Registered here in the same change that creates it, so it cannot exist as an unregistered side-table the verifier reports as drift.
+- **row identity**: `id` (surrogate, emitted as-is)
+- **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
+  - `tenancy_backfill_checkpoints_pkey` PRIMARY KEY (id), validated
+  - `tenancy_backfill_checkpoints_completed_key` INDEX (tranche, contract_digest) - unique, valid, ready, partial, no expressions
+- **canonical path**: *(none — SYSTEM_GLOBAL)*
+- **global-scope evidence**: Evidence about migration *runs*, not about tenant data. Each row records that a named tranche was backfilled against a named contract digest, and is written only by the operator's backfill command and read only by the FINALIZE guard. It is on no request path and carries no tenant-shaped column at all: `tranche` and `contract_digest` describe the migration, not an owner. Giving these rows a tenant would misrepresent an operator action as tenant data, and would additionally make the FINALIZE guard tenant-scoped, which would let one tenant's backfill authorise a schema change for every tenant.
+- **planned objects**: *(none — this table owes no DDL)*
+- **initial nullability**: n/a — no ownership columns are added
+- **backfill shape**: `n/a — SYSTEM_GLOBAL tables are never backfilled with an inferred tenant`
+- **must be zero**: `GLOBAL_SCOPE_UNVERIFIED`
+- **lock profile**: none — created by tranche 1's PREPARE and not modified afterwards
+- **rollback dependencies**: *(none)*
+- **must stay inactive**: *(none)*
 
 ### `working_memory`
 

@@ -272,6 +272,15 @@ mod db_tests {
         include_str!("../../rollback/0031_credential_agent_grants_hardening_down.sql");
     const MIGRATION_0028_DOWN: &str =
         include_str!("../../rollback/0028_agent_tenancy_identity_down.sql");
+    // Tenancy tranche 1 hangs five composite foreign keys off
+    // `agents_tenant_id_id_key`, which 0028's rollback drops, so it has to come
+    // out before 0028 the same way 0030 does.
+    const MIGRATION_0041_DOWN: &str =
+        include_str!("../../rollback/0041_tenancy_tranche1_constraints_down.sql");
+    const MIGRATION_0033_DOWN: &str =
+        include_str!("../../rollback/0033_tenancy_tranche1_indexes_down.sql");
+    const MIGRATION_0032_DOWN: &str =
+        include_str!("../../rollback/0032_tenancy_tranche1_prepare_down.sql");
 
     /// Put a credential into the contradictory state the triggers exist to
     /// prevent, the only way it can happen in practice: with the trigger off.
@@ -987,8 +996,21 @@ mod db_tests {
         assert!(still_there, "the refusal must change nothing");
 
         // In the right order it succeeds.
-        // 0031 first: it is the later migration, and 0030's rollback now
-        // refuses while it is applied.
+        // Tenancy tranche 1 first, then 0031, then 0030: each is a later
+        // migration than the one below it, and each rollback refuses while its
+        // successor is still applied.
+        sqlx::raw_sql(MIGRATION_0041_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0041 rollback");
+        sqlx::raw_sql(MIGRATION_0033_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0033-0040 rollback");
+        sqlx::raw_sql(MIGRATION_0032_DOWN)
+            .execute(&pool)
+            .await
+            .expect("0032 rollback");
         sqlx::raw_sql(MIGRATION_0031_DOWN)
             .execute(&pool)
             .await
@@ -1000,7 +1022,7 @@ mod db_tests {
         sqlx::raw_sql(STEP_ONE_ROLLBACK)
             .execute(&pool)
             .await
-            .expect("0028 rollback, once 0030 is gone");
+            .expect("0028 rollback, once tranche 1 and 0030 are gone");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -1487,6 +1509,9 @@ mod db_tests {
             .await
             .unwrap();
         for (label, script) in [
+            ("0041", MIGRATION_0041_DOWN),
+            ("0033-0040", MIGRATION_0033_DOWN),
+            ("0032", MIGRATION_0032_DOWN),
             ("0031", MIGRATION_0031_DOWN),
             ("0030", MIGRATION_0030_DOWN),
             ("0028", MIGRATION_0028_DOWN),

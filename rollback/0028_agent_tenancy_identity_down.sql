@@ -64,6 +64,71 @@ BEGIN
     END IF;
 END $$;
 
+-- Tranche 1 of the tenancy migration (0032-0041) hangs five more composite
+-- foreign keys off `agents_tenant_id_id_key`.  Same hazard, same remedy, and
+-- the same refusal to reach for CASCADE: cascading here would drop the
+-- ownership constraints on five tables as a side effect of a rollback the
+-- operator asked for on migration 0028.
+--
+-- Checked per constraint rather than by testing for one table, because the five
+-- are attached by a single migration but dropped by a rollback an operator
+-- could have run partially.  Naming which ones are still present is what turns
+-- this from "something depends on it" into a next action.
+--
+-- The bridge FUNCTIONS are checked as well as the constraints, and that is the
+-- load-bearing half.  The five `fn_*_tenancy_bridge` bodies read
+-- `agents.tenant_id` and `agents.id` directly, so they depend on this rollback's
+-- work whether or not any foreign key does.  Checking constraints alone left a
+-- real hole, measured on pg16: roll back 0041 only -- which drops all five
+-- foreign keys but leaves 0032's triggers and columns in place -- and a
+-- constraint-only guard is satisfied. This script would then drop
+-- `agents.tenant_id` while five BEFORE INSERT OR UPDATE triggers still select
+-- it, and every subsequent write to those five tables fails with
+-- `column a.tenant_id does not exist`. The database would be left accepting no
+-- writes at all on five tables, from a rollback that reported success.
+DO $$
+DECLARE
+    remaining TEXT;
+    bridges   TEXT;
+BEGIN
+    SELECT string_agg(conname, ', ' ORDER BY conname)
+      INTO remaining
+      FROM pg_catalog.pg_constraint
+     WHERE contype = 'f'
+       AND conname IN (
+           'archival_batches_tenant_agent_fkey',
+           'audit_logs_tenant_agent_fkey',
+           'entities_tenant_agent_fkey',
+           'memory_graph_tenant_agent_fkey',
+           'rmk_policies_tenant_agent_fkey'
+       );
+
+    SELECT string_agg(p.proname, ', ' ORDER BY p.proname)
+      INTO bridges
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname IN (
+           'fn_archival_batches_tenancy_bridge',
+           'fn_audit_logs_tenancy_bridge',
+           'fn_entities_tenancy_bridge',
+           'fn_memory_graph_tenancy_bridge',
+           'fn_rmk_policies_tenancy_bridge'
+       );
+
+    IF remaining IS NOT NULL OR bridges IS NOT NULL THEN
+        RAISE EXCEPTION
+            'tenancy tranche 1 is still applied and depends on columns this rollback drops. '
+            'Constraints still present: %. Bridge functions still installed: %. '
+            'Run rollback/0041_tenancy_tranche1_constraints_down.sql, then '
+            'rollback/0033_tenancy_tranche1_indexes_down.sql, then '
+            'rollback/0032_tenancy_tranche1_prepare_down.sql, before this script.',
+            COALESCE(remaining, 'none'),
+            COALESCE(bridges, 'none')
+            USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+END $$;
+
 -- ── Restore caller-facing identifiers ────────────────────────────────────────
 -- Runs before anything is dropped.  Skipped entirely when 0028 was never
 -- applied; plpgsql plans the statements lazily, so the guard is enough to keep
