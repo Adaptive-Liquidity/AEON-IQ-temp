@@ -1424,7 +1424,15 @@ async fn expect_refusal(pool: &PgPool, script: &'static str, label: &str) -> (St
     let result = sqlx::raw_sql(script).execute(&mut *conn).await;
     // Each script opens its own transaction, so a RAISE leaves the connection
     // aborted and it must be cleared before the pool reuses it.
-    sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.ok();
+    // Unwrapped, matching the rest of this file. This helper only runs when the
+    // script raised, so the connection is always inside an aborted transaction
+    // and the ROLLBACK always has something to clear -- `.ok()` here would
+    // silence a genuinely dead connection and hand it back to the pool with no
+    // diagnostic.
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("clearing the aborted transaction must succeed");
     drop(conn);
     let error = match result {
         Ok(_) => panic!("{label}: the script must refuse, but it succeeded"),
@@ -1515,6 +1523,53 @@ async fn a_same_named_object_of_the_wrong_shape_is_refused_not_adopted(pool: PgP
             ],
             "ALTER TABLE rmk_policies DROP CONSTRAINT rmk_policies_tenant_agent_fkey",
             "ON DELETE action is 'c', expected 'a' (NO ACTION)",
+        ),
+        (
+            // Reaches the "constraint owns no index" branch, which no
+            // format()-built case does. That branch appended a bare literal to a
+            // TEXT[], which PostgreSQL resolves as anyarray || anyarray and then
+            // fails to parse as an array literal -- so the guard crashed with
+            // `malformed array literal` instead of refusing cleanly. Found by
+            // review, not by the six shape cases, because every other append
+            // goes through format() and is therefore already text-typed.
+            "CHECK constraint occupying a UNIQUE name",
+            &[
+                "DROP INDEX entities_id_tenant_id_key",
+                "ALTER TABLE entities ADD CONSTRAINT entities_id_tenant_id_key \
+                 CHECK (tenant_id IS NOT NULL)",
+            ],
+            "ALTER TABLE entities DROP CONSTRAINT entities_id_tenant_id_key",
+            "constraint type is 'c', expected 'u'",
+        ),
+        (
+            "foreign key with the wrong ON UPDATE action",
+            &[
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+               FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+               ON UPDATE CASCADE NOT VALID",
+            ],
+            "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+            "ON UPDATE action is 'c', expected 'a' (NO ACTION)",
+        ),
+        (
+            "foreign key with the wrong match type",
+            &[
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+               FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+               MATCH FULL NOT VALID",
+            ],
+            "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+            "match type is 'f', expected 's' (MATCH SIMPLE)",
+        ),
+        (
+            "deferrable foreign key",
+            &[
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+               FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+               DEFERRABLE INITIALLY DEFERRED NOT VALID",
+            ],
+            "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+            "deferrability is (condeferrable=t, condeferred=t), expected (f, f)",
         ),
         (
             "UNIQUE constraint over the wrong columns",
@@ -1680,6 +1735,184 @@ async fn the_0041_rollback_refuses_to_drop_a_constraint_it_does_not_own(pool: Pg
     assert_eq!(ledger, 1, "a refused rollback must not retire version 41");
 }
 
+/// The rollback's copy of the identity test, on every axis the migration's is.
+///
+/// The two guards are hand-duplicated rather than shared -- sqlx has no include
+/// mechanism, and a rollback that depended on an object the forward migration
+/// installs could not run after that object was removed. Duplication means they
+/// can drift, and a down-script that silently accepted a foreign key pointing at
+/// the wrong table would drop it. Testing the down copy on one axis only would
+/// not catch that, so each axis is exercised against the rollback specifically.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_0041_rollback_identity_test_covers_the_same_axes_as_the_migration(pool: PgPool) {
+    let cases: &[(&str, &[&str], &str, &[&str])] = &[
+        (
+            "wrong local columns",
+            &[
+                "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+                 FOREIGN KEY (agent_uuid, tenant_id) REFERENCES agents (id, tenant_id) NOT VALID",
+            ],
+            "local columns are '{agent_uuid,tenant_id}', expected '{tenant_id,agent_uuid}'",
+            &["ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey"],
+        ),
+        (
+            "wrong referenced columns",
+            &[
+                "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+                 FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (id, tenant_id) NOT VALID",
+            ],
+            "referenced columns are '{id,tenant_id}', expected '{tenant_id,id}'",
+            &["ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey"],
+        ),
+        (
+            "wrong ON DELETE action",
+            &[
+                "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+                 FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+                 ON DELETE CASCADE NOT VALID",
+            ],
+            "ON DELETE action is 'c', expected 'a' (NO ACTION)",
+            &["ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey"],
+        ),
+        (
+            "wrong match type",
+            &[
+                "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+                 FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+                 MATCH FULL NOT VALID",
+            ],
+            "match type is 'f', expected 's' (MATCH SIMPLE)",
+            &["ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey"],
+        ),
+        (
+            "deferrable",
+            &[
+                "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+                "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey \
+                 FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) \
+                 DEFERRABLE INITIALLY DEFERRED NOT VALID",
+            ],
+            "deferrability is (condeferrable=t, condeferred=t), expected (f, f)",
+            &["ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey"],
+        ),
+        (
+            "wrong local columns on a UNIQUE name",
+            &[
+                "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+                "ALTER TABLE archival_batches ADD CONSTRAINT archival_batches_id_tenant_id_key \
+                 UNIQUE (id, agent_uuid)",
+            ],
+            "local columns are '{id,agent_uuid}', expected '{id,tenant_id}'",
+            &[
+                // Dropping a UNIQUE constraint drops the index it adopted, so the
+                // index has to be rebuilt before 0041 can re-adopt it.
+                "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+                "CREATE UNIQUE INDEX archival_batches_id_tenant_id_key \
+                 ON archival_batches (id, tenant_id)",
+            ],
+        ),
+    ];
+
+    for (label, setup, expected_phrase, cleanup) in cases {
+        for stmt in *setup {
+            sqlx::query(sqlx::AssertSqlSafe((*stmt).to_owned()))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: occupant setup failed: {e}"));
+        }
+
+        let (code, message) = expect_refusal(&pool, CONSTRAINTS_DOWN_SQL, label).await;
+        assert_eq!(
+            code, "42710",
+            "{label}: must be duplicate_object, got {code}: {message}"
+        );
+        assert!(
+            message.contains(expected_phrase),
+            "{label}: the rollback must name the axis that differs \
+             (expected {expected_phrase:?}): {message}"
+        );
+        assert!(
+            message.contains("Nothing has been dropped"),
+            "{label}: {message}"
+        );
+
+        // The refusal left every one of 0041's own objects attached, including
+        // the ones it could have reached before hitting the occupant.
+        let intact: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint c \
+             WHERE (c.contype = 'f' AND c.conname LIKE '%tenant\\_agent\\_fkey' \
+                    AND c.confrelid = 'public.agents'::regclass) \
+                OR (c.contype = 'u' AND c.conname IN ('archival_batches_id_tenant_id_key', \
+                        'entities_id_tenant_id_key', 'rmk_policies_id_tenant_id_key'))",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            intact, 8,
+            "{label}: a refused rollback must leave all eight names occupied"
+        );
+
+        // Remove the occupant, then let 0041 put its own object back for the
+        // next case. The occupant has to go first: with it attached, 0041
+        // correctly refuses, which is what the migration-side test asserts.
+        for stmt in *cleanup {
+            sqlx::query(sqlx::AssertSqlSafe((*stmt).to_owned()))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: cleanup {stmt} failed: {e}"));
+        }
+        sqlx::raw_sql(CONSTRAINTS_UP)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: could not restore the tranche state: {e}"));
+    }
+}
+
+/// Adopting a unique constraint whose index is gone names what rebuilds it.
+///
+/// Dropping one of the three unique constraints takes its adopted index with it,
+/// so a re-run of 0041 has nothing to adopt. Without the pre-check that is a bare
+/// `relation "..." does not exist`; with it, the operator is told which
+/// migrations build the index.
+#[sqlx::test(migrations = "./migrations")]
+async fn adopting_a_missing_unique_index_names_the_builds_that_create_it(pool: PgPool) {
+    sqlx::query(sqlx::AssertSqlSafe(
+        "ALTER TABLE entities DROP CONSTRAINT entities_id_tenant_id_key".to_owned(),
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let index_went_with_it: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.entities_id_tenant_id_key') IS NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        index_went_with_it,
+        "dropping the constraint must also drop the index it adopted, or this \
+         test is not exercising the missing-index branch"
+    );
+
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_UP, "missing unique index").await;
+    assert_eq!(
+        code, "55000",
+        "must be object_not_in_prerequisite_state, got {code}: {message}"
+    );
+    assert!(
+        message.contains("unique index entities_id_tenant_id_key is missing"),
+        "the refusal must name the missing index: {message}"
+    );
+    assert!(
+        message.contains("migrations 0038-0040"),
+        "and must name what rebuilds it: {message}"
+    );
+}
+
 // ── Renamed child tables defeat name-based discovery ────────────────────────
 
 /// Every tranche rollback refuses when a child table has been renamed.
@@ -1703,6 +1936,9 @@ async fn the_0041_rollback_refuses_to_drop_a_constraint_it_does_not_own(pool: Pg
 /// and ledger rows are asserted intact.
 #[sqlx::test(migrations = "./migrations")]
 async fn every_tranche_rollback_refuses_after_a_child_table_is_renamed(pool: PgPool) {
+    // Literal-only by convention, not by type: `AssertSqlSafe` is the crate's
+    // opt-out of SQL checking, so `from` and `to` must never come from anything
+    // but a hardcoded name. Every call below passes one.
     async fn rename(pool: &PgPool, from: &str, to: &str) {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {from} RENAME TO {to}"
@@ -1867,5 +2103,175 @@ async fn every_tranche_rollback_refuses_after_a_child_table_is_renamed(pool: PgP
     assert_eq!(
         bridges, 5,
         "0032: no bridge function may be dropped by a refused run"
+    );
+}
+
+/// The rename hole that only opens in a half-unwound tranche.
+///
+/// Checking only the five ownership keys for a rename looks sufficient, because
+/// every table carrying an adopted unique constraint carries an ownership key
+/// too. That holds only while 0041 is fully applied. Drop the five keys -- the
+/// state an interrupted rollback leaves -- rename `rmk_policies`, and a
+/// key-only rename check finds nothing; the drop loop then resolves
+/// `public.rmk_policies` to NULL, skips it as "already gone", drops the other two
+/// unique constraints, deletes ledger version 41 and reports success. The
+/// tranche is left with `rmk_policies_id_tenant_id_key` attached to the renamed
+/// table and a ledger claiming 0041 was never applied.
+///
+/// Measured before the unique arm was added to the guard: exactly that, silently.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_half_unwound_0041_still_refuses_after_a_rename(pool: PgPool) {
+    for stmt in [
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_tenant_agent_fkey",
+        "ALTER TABLE audit_logs DROP CONSTRAINT audit_logs_tenant_agent_fkey",
+        "ALTER TABLE entities DROP CONSTRAINT entities_tenant_agent_fkey",
+        "ALTER TABLE memory_graph DROP CONSTRAINT memory_graph_tenant_agent_fkey",
+        "ALTER TABLE rmk_policies DROP CONSTRAINT rmk_policies_tenant_agent_fkey",
+        "ALTER TABLE rmk_policies RENAME TO rmk_policies_old",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_DOWN_SQL, "half-unwound 0041").await;
+    assert_eq!(code, "55000", "{message}");
+    assert!(
+        message.contains("rmk_policies_id_tenant_id_key is now on rmk_policies_old"),
+        "the refusal must be raised by the UNIQUE arm of the rename guard, since no \
+         ownership key is left to raise it: {message}"
+    );
+
+    // All three unique constraints survive, including the one on the renamed
+    // table that a name-based drop would have orphaned.
+    let uniques: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE contype = 'u' AND conname IN ( \
+             'archival_batches_id_tenant_id_key', 'entities_id_tenant_id_key', \
+             'rmk_policies_id_tenant_id_key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        uniques, 3,
+        "a refused run must not drop the two constraints it could still reach"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 41")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger, 1,
+        "and must not record the tranche as unapplied while a constraint is still attached"
+    );
+}
+
+/// A table moved to another schema is refused, not skipped.
+///
+/// `ALTER TABLE ... SET SCHEMA` is the variant a rename guard misses. A rename
+/// leaves the table's indexes where they were, so a lookup by index name still
+/// resolves and the mismatch is visible; a schema move takes the indexes with it,
+/// so `to_regclass('public.<index>')` yields NULL and the guard finds nothing to
+/// compare.
+///
+/// Measured before both scripts learned to ask whether the table is in `public`
+/// at all: rollback/0033 emitted one "does not exist, skipping" notice and
+/// COMMITted, retiring ledger versions 33-40 while the moved table kept its
+/// bridge trigger and its lookup index; rollback/0041 dropped what it could reach
+/// and left the moved table's unique constraint attached.
+///
+/// Two phases, because each script reaches the check from a different state.
+/// rollback/0033 refuses on the still-applied-0041 guard long before it looks at
+/// tables, so its own missing-table check is only reachable once 0041 is properly
+/// unwound.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_table_moved_to_another_schema_refuses_both_rollbacks(pool: PgPool) {
+    async fn exec(pool: &PgPool, stmt: &str) {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    async fn moved_unique_survives(pool: &PgPool) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+             WHERE conname = 'archival_batches_id_tenant_id_key' \
+               AND conrelid = 'elsewhere.archival_batches'::regclass)",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    exec(&pool, "CREATE SCHEMA elsewhere").await;
+    // The sibling key gone is what lets the move escape a key-only check.
+    exec(
+        &pool,
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_tenant_agent_fkey",
+    )
+    .await;
+    exec(&pool, "ALTER TABLE archival_batches SET SCHEMA elsewhere").await;
+
+    // ── Phase 1: rollback/0041 ────────────────────────────────────────────────
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_DOWN_SQL, "0041").await;
+    assert_eq!(code, "55000", "0041: {message}");
+    assert!(
+        message.contains("archival_batches"),
+        "0041 must name the table that is no longer in public: {message}"
+    );
+    assert!(
+        message.contains("Nothing has been dropped"),
+        "0041 must say the database is unchanged: {message}"
+    );
+    assert!(
+        moved_unique_survives(&pool).await,
+        "0041: the moved table's unique constraint must survive the refusal"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 41")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger, 1, "0041: version 41 must not be retired");
+
+    // ── Phase 2: rollback/0033, reached only once 0041 is properly unwound ────
+    exec(
+        &pool,
+        "ALTER TABLE elsewhere.archival_batches SET SCHEMA public",
+    )
+    .await;
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback must succeed once the table is back in public");
+    exec(&pool, "ALTER TABLE archival_batches SET SCHEMA elsewhere").await;
+
+    let (code, message) = expect_refusal(&pool, INDEXES_DOWN_SQL, "0033").await;
+    assert_eq!(code, "55000", "0033: {message}");
+    assert!(
+        message.contains("archival_batches"),
+        "0033 must name the table that is no longer in public: {message}"
+    );
+    let index_survives: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = 'idx_archival_batches_tenant' AND n.nspname = 'elsewhere')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        index_survives,
+        "0033: the moved lookup index must survive the refusal"
+    );
+    let build_ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        build_ledger, 8,
+        "0033: versions 33-40 must not be retired while a tranche index is still live elsewhere"
     );
 }
