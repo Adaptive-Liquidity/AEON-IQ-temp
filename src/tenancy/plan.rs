@@ -330,6 +330,24 @@ pub enum LockProfile {
     /// Runs outside a transaction. Two table scans, `SHARE UPDATE EXCLUSIVE`,
     /// concurrent reads and writes continue.
     CreateIndexConcurrently,
+    /// `ACCESS EXCLUSIVE` on the table alone, and brief: `ADD CONSTRAINT ...
+    /// USING INDEX` adopts an index that already exists rather than building
+    /// one, so it examines no rows and names no parent.
+    ///
+    /// Separate from [`Self::CreateIndexConcurrently`] because a unique target
+    /// is not one operation but two, and they differ on every axis that matters
+    /// operationally. The concurrent build takes the weak
+    /// `SHARE UPDATE EXCLUSIVE`, runs outside a transaction block, and is the
+    /// slow half; the attach takes the strongest lock PostgreSQL has, runs in
+    /// milliseconds, and is the half that actually blocks readers. Reporting
+    /// only the build would tell an operator planning a maintenance window that
+    /// the strong lock never happens.
+    ///
+    /// No row scan applies here specifically because these targets are `UNIQUE`
+    /// rather than `PRIMARY KEY`: `USING INDEX` scans only when it has to mark
+    /// columns `NOT NULL`, and the ownership columns stay NULL-able for the
+    /// whole of the transition.
+    AddUniqueUsingIndex,
     /// `SHARE ROW EXCLUSIVE` on the child **and** on the referenced table.
     /// Blocks writes to both for the duration of the catalog change, which with
     /// `NOT VALID` is brief because no rows are examined.
@@ -367,6 +385,7 @@ impl LockProfile {
         match self {
             Self::AddColumnNullable => "ADD COLUMN NULL",
             Self::CreateIndexConcurrently => "CREATE INDEX CONCURRENTLY",
+            Self::AddUniqueUsingIndex => "ADD CONSTRAINT ... USING INDEX",
             Self::AddForeignKeyNotValid => "ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID",
             Self::AddCheckNotValid => "ADD CONSTRAINT ... CHECK ... NOT VALID",
             Self::ValidateConstraint => "VALIDATE CONSTRAINT (foreign key)",
@@ -383,6 +402,10 @@ impl LockProfile {
             Self::AddColumnNullable => "ACCESS EXCLUSIVE, catalog-only — no rewrite, no scan",
             Self::CreateIndexConcurrently => {
                 "SHARE UPDATE EXCLUSIVE; must run outside a transaction block"
+            }
+            Self::AddUniqueUsingIndex => {
+                "ACCESS EXCLUSIVE on the table alone, brief — adopts an already-built index, so \
+                 no rows are scanned and no parent is locked alongside it"
             }
             Self::AddForeignKeyNotValid => {
                 "SHARE ROW EXCLUSIVE on the child AND on the referenced table"
@@ -406,6 +429,7 @@ impl LockProfile {
     pub const ALL: &'static [LockProfile] = &[
         Self::AddColumnNullable,
         Self::CreateIndexConcurrently,
+        Self::AddUniqueUsingIndex,
         Self::AddForeignKeyNotValid,
         Self::AddCheckNotValid,
         Self::ValidateConstraint,
@@ -829,14 +853,38 @@ impl PlannedObject {
     const fn creation_lock_kind(&self) -> LockProfile {
         match self {
             Self::Column { .. } => LockProfile::AddColumnNullable,
-            // A unique target is built CONCURRENTLY and attached with
-            // `ADD CONSTRAINT ... USING INDEX`, so the strong lock is held only
-            // for the attach rather than for the whole build.
+            // Both are built CONCURRENTLY. A unique target additionally has an
+            // attach phase, which is reported by `attachment_lock()` rather
+            // than folded in here.
             Self::Index { .. } | Self::UniqueTarget { .. } => LockProfile::CreateIndexConcurrently,
             Self::ForeignKey { .. } => LockProfile::AddForeignKeyNotValid,
             // A CHECK names no parent, so it locks one table rather than two —
             // but it locks it more strongly.
             Self::Constraint { .. } => LockProfile::AddCheckNotValid,
+        }
+    }
+
+    /// The lock taken when a concurrently-built unique index is adopted as a
+    /// constraint, for the objects that have such a phase at all.
+    ///
+    /// This is a second accessor rather than [`Self::creation_lock`] returning
+    /// an ordered sequence, and the reason is that the two phases are not
+    /// interchangeable list elements. `concurrent_build_required()` keys the
+    /// migration file's `-- no-transaction` header off the *build*, so a
+    /// sequence would have to be read positionally — "element zero decides the
+    /// header" — which is exactly the kind of unwritten convention this module
+    /// exists to replace with data. Naming the phase makes it queryable and
+    /// renders it into the artifacts, which is what was actually missing.
+    ///
+    /// `None` for every other kind of object, and `None` for an already-current
+    /// target: nothing is built, so nothing is attached.
+    pub const fn attachment_lock(&self) -> Option<LockProfile> {
+        if !self.requires_creation() {
+            return None;
+        }
+        match self {
+            Self::UniqueTarget { .. } => Some(LockProfile::AddUniqueUsingIndex),
+            _ => None,
         }
     }
 
@@ -2803,6 +2851,11 @@ mod invariants {
             !target.concurrent_build_required(),
             "nothing is built, so it dictates no `-- no-transaction` header"
         );
+        assert_eq!(
+            target.attachment_lock(),
+            None,
+            "nothing is built, so nothing is attached"
+        );
 
         // Excluded from every PREPARE worklist, in every tranche.
         for tranche in Tranche::ALL {
@@ -3073,6 +3126,74 @@ mod invariants {
             );
         }
         assert!(CONCURRENT_BUILD_MECHANISM.contains("-- no-transaction"));
+    }
+
+    /// A built unique target is two operations, and both are now published.
+    ///
+    /// The attach phase was real before this test existed — it was described in
+    /// a comment inside `creation_lock_kind` — but a comment is not in the
+    /// artifacts. An operator sizing a maintenance window from the rendered
+    /// contract saw `SHARE UPDATE EXCLUSIVE` alone and would conclude no reader
+    /// is ever blocked, which is the opposite of what the attach does.
+    #[test]
+    fn a_built_unique_target_publishes_both_phases_of_its_build() {
+        let mut built_targets = 0;
+        for object in PLANNED_OBJECTS {
+            let expected =
+                matches!(object, PlannedObject::UniqueTarget { .. }) && object.requires_creation();
+            assert_eq!(
+                object.attachment_lock().is_some(),
+                expected,
+                "`{}` disagrees with itself about having an attach phase",
+                object.name()
+            );
+
+            if !expected {
+                continue;
+            }
+            built_targets += 1;
+
+            // Both halves, and the right way round: the slow concurrent build
+            // first, the brief strong lock second.
+            assert_eq!(
+                object.creation_lock(),
+                Some(LockProfile::CreateIndexConcurrently),
+                "`{}` must still report the concurrent build as its creation lock",
+                object.name()
+            );
+            assert_eq!(
+                object.attachment_lock(),
+                Some(LockProfile::AddUniqueUsingIndex),
+                "`{}` must report the attach as a distinct lock",
+                object.name()
+            );
+        }
+
+        // If no target were built, the accessor would be vacuous and the
+        // assertions above would pass without proving anything.
+        assert!(
+            built_targets > 0,
+            "no unique target is built, so nothing exercises the attach phase"
+        );
+    }
+
+    /// The attach profile must not inherit the wording of the phase it is
+    /// distinguished from, or splitting them changes nothing a reader can see.
+    #[test]
+    fn the_attach_profile_names_one_table_and_no_scan() {
+        let locks = LockProfile::AddUniqueUsingIndex.locks();
+        assert!(
+            locks.contains("ACCESS EXCLUSIVE"),
+            "the attach takes the strongest lock; that is the whole reason to publish it"
+        );
+        for borrowed in ["SHARE UPDATE EXCLUSIVE", "ROW SHARE", "referenced table"] {
+            assert!(
+                !locks.contains(borrowed),
+                "the attach profile borrowed `{borrowed}` from another operation — it locks one \
+                 table, names no parent, and is not the concurrent build"
+            );
+        }
+        assert!(LockProfile::ALL.contains(&LockProfile::AddUniqueUsingIndex));
     }
 
     /// Human-readable rendering is generated, so every object must produce one

@@ -71,7 +71,16 @@ pub const ROW_ID_DOMAIN: &str = "aeon-tenancy-audit-row-id-v1";
 /// NULL-able local columns; and `creating_tranche`, `validating_tranche` and
 /// `creation_lock` became nullable, because an already-current target is
 /// created by nothing.
-pub const REPORT_SCHEMA_VERSION: &str = "step4b0.1";
+///
+/// `step4b0.1` -> `step4b0.2`: every planned object gained `attachment_lock`,
+/// and `LockProfile` gained `AddUniqueUsingIndex` as a value it can hold. A
+/// unique target is built in two phases — `CREATE UNIQUE INDEX CONCURRENTLY`
+/// then a brief `ADD CONSTRAINT ... USING INDEX` — and only the first was
+/// published, so a consumer reading the old shape was told the strong lock
+/// never occurs. Both the new field and the new enum value can reach a consumer
+/// pinned to `step4b0.1`, which is why this is a version bump rather than a
+/// silent addition.
+pub const REPORT_SCHEMA_VERSION: &str = "step4b0.2";
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 

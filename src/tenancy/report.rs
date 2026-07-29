@@ -362,6 +362,10 @@ pub struct PlannedObjectDoc {
     pub not_valid_permitted: bool,
     pub concurrent_build_required: bool,
     pub creation_lock: Option<plan::LockProfile>,
+    /// The brief `ADD CONSTRAINT ... USING INDEX` attach, for the unique targets
+    /// that are built in two phases. `None` for everything else, including an
+    /// already-current target, which is built by nothing.
+    pub attachment_lock: Option<plan::LockProfile>,
     pub validation_lock: Option<plan::LockProfile>,
     pub nullability: Option<plan::Nullability>,
     /// Whether a NULL in the local key leaves rows unchecked. `None` for
@@ -418,6 +422,7 @@ pub fn step_4b_contract() -> Step4bContract {
                     not_valid_permitted: o.not_valid_permitted(),
                     concurrent_build_required: o.concurrent_build_required(),
                     creation_lock: o.creation_lock(),
+                    attachment_lock: o.attachment_lock(),
                     validation_lock: o.validation_lock(),
                     nullability: o.nullability(),
                     unenforced_when_null: o.unenforced_when_null(),
@@ -1029,17 +1034,22 @@ mod tests {
     /// assigned from, which passes for any string. Step 4B-0 changed the
     /// serialized shape, so a consumer pinned to `step4a.1` must be refused;
     /// that only holds if the value is actually the new one.
+    ///
+    /// Bumped to `step4b0.2` when planned objects gained `attachment_lock` and
+    /// `LockProfile` gained `AddUniqueUsingIndex`. Both are reachable by a
+    /// consumer pinned to `step4b0.1`, so the addition is not backward
+    /// compatible in the way a purely additive field would be.
     #[test]
     fn the_report_schema_version_is_pinned_to_the_step_4b0_shape() {
         assert_eq!(
             super::super::audit::REPORT_SCHEMA_VERSION,
-            "step4b0.1",
+            "step4b0.2",
             "the Step 4B-0 contract changed the payload shape; reverting the version would let a \
              Step 4A consumer read a report it cannot understand"
         );
         assert_eq!(
             canonical_inventory_payload().schema_version,
-            "step4b0.1",
+            "step4b0.2",
             "the payload must carry the bumped version, not merely define it"
         );
     }

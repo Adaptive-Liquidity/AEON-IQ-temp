@@ -2,8 +2,8 @@
 
 Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry is the source of truth and a test regenerates this file and compares it.
 
-- schema version: `step4b0.1`
-- inventory digest: `sha256:a5edc2b890880f810e8f6598a75de0e4147c43e05683de01dbac492eea15591d`
+- schema version: `step4b0.2`
+- inventory digest: `sha256:fb14c12561f280a182f8e8c096a98f997de00715bda0723890e95509cac1b7e2`
 - tables classified: 22
 
 ## Classification summary
@@ -49,6 +49,7 @@ A migration containing CREATE INDEX CONCURRENTLY must carry `-- no-transaction` 
 |---|---|
 | `ADD COLUMN NULL` | ACCESS EXCLUSIVE, catalog-only — no rewrite, no scan |
 | `CREATE INDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE; must run outside a transaction block |
+| `ADD CONSTRAINT ... USING INDEX` | ACCESS EXCLUSIVE on the table alone, brief — adopts an already-built index, so no rows are scanned and no parent is locked alongside it |
 | `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` | SHARE ROW EXCLUSIVE on the child AND on the referenced table |
 | `ADD CONSTRAINT ... CHECK ... NOT VALID` | ACCESS EXCLUSIVE on the table alone, brief — no row scan, and no parent is locked alongside it |
 | `VALIDATE CONSTRAINT (foreign key)` | SHARE UPDATE EXCLUSIVE on the child, ROW SHARE on the referenced table |
