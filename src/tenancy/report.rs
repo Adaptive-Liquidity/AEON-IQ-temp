@@ -478,7 +478,19 @@ pub fn canonical_inventory_payload() -> CanonicalInventoryPayload {
 pub fn inventory_digest() -> String {
     use sha2::{Digest, Sha256};
 
-    let canonical = serde_json::to_string(&canonical_inventory_payload()).unwrap_or_default();
+    // Fail loud rather than defaulting to an empty string. A digest computed
+    // over `""` is stable, reproducible and wrong: every determinism test
+    // compares two equally-empty hashes and still passes, so the one thing the
+    // digest exists to detect — that the artifact no longer matches the
+    // registry it claims to describe — is exactly what a silent default hides.
+    // The payload is built from `&'static str` constants and derived `Serialize`
+    // impls with no non-string map keys, so failure here is a structural defect
+    // in this module, not a runtime condition a caller could handle.
+    let canonical = serde_json::to_string(&canonical_inventory_payload()).expect(
+        "canonical inventory payload must serialize: it is static data with derived \
+                 Serialize impls, so a failure here means the payload gained a type serde \
+                 cannot represent (e.g. a non-string map key)",
+    );
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
@@ -927,11 +939,18 @@ pub fn render_inventory_markdown() -> String {
                          when {} agree, and never picks a side",
                         parents.join(" and ")
                     ),
-                    other => format!(
+                    // The three remaining shapes carry the same `{trigger,
+                    // function}` payload and render identically. Named
+                    // explicitly rather than caught by a wildcard so that a
+                    // sixth strategy is a compile error here, not generic prose
+                    // that quietly omits whatever makes it different.
+                    shared @ (plan::TransitionalWrite::AgentBridge { .. }
+                    | plan::TransitionalWrite::SessionBridge { .. }
+                    | plan::TransitionalWrite::MemoryBridge { .. }) => format!(
                         " — `{}` (`{}`) installed in PREPARE, before any backfill{}",
-                        other.trigger(),
-                        other.function(),
-                        if other.resolves_through_a_parent() {
+                        shared.trigger(),
+                        shared.function(),
+                        if shared.resolves_through_a_parent() {
                             ", resolving through the parent its backfill authority names"
                         } else {
                             ""

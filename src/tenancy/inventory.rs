@@ -760,7 +760,6 @@ const fn memory_path(column: &'static str, nullable: bool) -> OwnershipPath {
 
 /// A plan for a table whose only work is `agent_uuid` + `tenant_id` plus a
 /// composite FK back to `agents`.
-#[allow(clippy::too_many_arguments)]
 const fn agent_child_plan(
     backfill_source: &'static str,
     validate: &'static str,

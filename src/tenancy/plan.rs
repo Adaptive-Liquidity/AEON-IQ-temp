@@ -660,7 +660,10 @@ impl PlannedObject {
                 referenced_columns,
                 ..
             } => Some((referenced_table, referenced_columns)),
-            _ => None,
+            Self::Column { .. }
+            | Self::Index { .. }
+            | Self::UniqueTarget { .. }
+            | Self::Constraint { .. } => None,
         }
     }
 
@@ -668,14 +671,17 @@ impl PlannedObject {
         match self {
             Self::Index { unique, .. } => *unique,
             Self::UniqueTarget { .. } => true,
-            _ => false,
+            Self::Column { .. } | Self::ForeignKey { .. } | Self::Constraint { .. } => false,
         }
     }
 
     pub const fn nullability(&self) -> Option<Nullability> {
         match self {
             Self::Column { nullability, .. } => Some(*nullability),
-            _ => None,
+            Self::Index { .. }
+            | Self::UniqueTarget { .. }
+            | Self::ForeignKey { .. }
+            | Self::Constraint { .. } => None,
         }
     }
 
@@ -685,7 +691,10 @@ impl PlannedObject {
     pub const fn requires_creation(&self) -> bool {
         match self {
             Self::UniqueTarget { status, .. } => status.requires_creation(),
-            _ => true,
+            Self::Column { .. }
+            | Self::Index { .. }
+            | Self::ForeignKey { .. }
+            | Self::Constraint { .. } => true,
         }
     }
 
@@ -737,7 +746,9 @@ impl PlannedObject {
             | Self::Constraint {
                 validating_tranche, ..
             } => Some(*validating_tranche),
-            _ => self.creating_tranche(),
+            Self::Column { .. } | Self::Index { .. } | Self::UniqueTarget { .. } => {
+                self.creating_tranche()
+            }
         }
     }
 
@@ -751,7 +762,10 @@ impl PlannedObject {
                 unenforced_when_null,
                 ..
             } => Some(*unenforced_when_null),
-            _ => None,
+            Self::Column { .. }
+            | Self::Index { .. }
+            | Self::UniqueTarget { .. }
+            | Self::Constraint { .. } => None,
         }
     }
 
@@ -807,7 +821,7 @@ impl PlannedObject {
                             Some(Nullability::NullableThenTightened) => {
                                 window == EnforcementWindow::DuringTransition
                             }
-                            _ => false,
+                            None => false,
                         }
                 })
             })
@@ -831,7 +845,10 @@ impl PlannedObject {
     /// "not valid" in this sense — a failed concurrent build leaves an INVALID
     /// index, which is a fault, not a planned intermediate state.
     pub const fn not_valid_permitted(&self) -> bool {
-        matches!(self, Self::ForeignKey { .. } | Self::Constraint { .. })
+        match self {
+            Self::ForeignKey { .. } | Self::Constraint { .. } => true,
+            Self::Column { .. } | Self::Index { .. } | Self::UniqueTarget { .. } => false,
+        }
     }
 
     /// Whether the build must run outside a transaction block.
@@ -839,7 +856,13 @@ impl PlannedObject {
     /// An already-current target is not built, so it dictates nothing about any
     /// migration file's `-- no-transaction` header.
     pub const fn concurrent_build_required(&self) -> bool {
-        self.requires_creation() && matches!(self, Self::Index { .. } | Self::UniqueTarget { .. })
+        if !self.requires_creation() {
+            return false;
+        }
+        match self {
+            Self::Index { .. } | Self::UniqueTarget { .. } => true,
+            Self::Column { .. } | Self::ForeignKey { .. } | Self::Constraint { .. } => false,
+        }
     }
 
     /// The lock this object's creation takes, or `None` when nothing is created.
@@ -884,7 +907,10 @@ impl PlannedObject {
         }
         match self {
             Self::UniqueTarget { .. } => Some(LockProfile::AddUniqueUsingIndex),
-            _ => None,
+            Self::Column { .. }
+            | Self::Index { .. }
+            | Self::ForeignKey { .. }
+            | Self::Constraint { .. } => None,
         }
     }
 
@@ -898,7 +924,7 @@ impl PlannedObject {
             // validation side that `AddCheckNotValid` fixes on the creation
             // side.
             Self::Constraint { .. } => Some(LockProfile::ValidateCheckConstraint),
-            _ => None,
+            Self::Column { .. } | Self::Index { .. } | Self::UniqueTarget { .. } => None,
         }
     }
 
@@ -2380,6 +2406,64 @@ mod invariants {
                 "`{}` on `{}` is declared more than once",
                 object.name(),
                 object.table()
+            );
+        }
+    }
+
+    /// The four side tables are read with `.iter().find(...)`, which returns the
+    /// *first* match and silently ignores every later one. A duplicated key
+    /// would therefore compile, pass every other test, and quietly serve a
+    /// strategy, authority, prerequisite or transition that is not the one an
+    /// editor believed they had written. Each test keys on exactly the field its
+    /// lookup function compares, so the invariant and the lookup cannot drift
+    /// apart.
+    #[test]
+    fn every_transition_table_is_declared_once() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (table, _) in TRANSITION {
+            assert!(
+                seen.insert(table),
+                "`{table}` appears in TRANSITION more than once; `transition_for` would serve \
+                 only the first",
+            );
+        }
+    }
+
+    #[test]
+    fn every_backfill_authority_table_is_declared_once() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for authority in BACKFILL_AUTHORITY {
+            assert!(
+                seen.insert(authority.table),
+                "`{}` appears in BACKFILL_AUTHORITY more than once; `backfill_authority_for` \
+                 would serve only the first",
+                authority.table
+            );
+        }
+    }
+
+    #[test]
+    fn every_compatibility_prerequisite_object_is_declared_once() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for prerequisite in COMPATIBILITY_PREREQUISITES {
+            assert!(
+                seen.insert(prerequisite.planned_object),
+                "`{}` appears in COMPATIBILITY_PREREQUISITES more than once; \
+                 `compatibility_prerequisite_for` would serve only the first",
+                prerequisite.planned_object
+            );
+        }
+    }
+
+    #[test]
+    fn every_uniqueness_transition_table_is_declared_once() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for transition in UNIQUENESS_TRANSITIONS {
+            assert!(
+                seen.insert(transition.table),
+                "`{}` appears in UNIQUENESS_TRANSITIONS more than once; \
+                 `uniqueness_transition_for` would serve only the first",
+                transition.table
             );
         }
     }
