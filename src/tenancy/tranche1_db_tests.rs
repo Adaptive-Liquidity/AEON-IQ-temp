@@ -2046,7 +2046,8 @@ async fn every_tranche_rollback_refuses_after_a_child_table_is_renamed(pool: PgP
     let (code, message) = expect_refusal(&pool, INDEXES_DOWN_SQL, "0033").await;
     assert_eq!(code, "55000", "0033: {message}");
     assert!(
-        message.contains("idx_audit_logs_tenant is on audit_logs_moved"),
+        message.contains("idx_audit_logs_tenant")
+            && message.contains("it is on audit_logs_moved, expected public.audit_logs"),
         "0033 must name the index and the table it now serves: {message}"
     );
     let index_survives: bool =
@@ -2273,5 +2274,177 @@ async fn a_table_moved_to_another_schema_refuses_both_rollbacks(pool: PgPool) {
     assert_eq!(
         build_ledger, 8,
         "0033: versions 33-40 must not be retired while a tranche index is still live elsewhere"
+    );
+}
+
+// ── Identity by name, one object kind further down ──────────────────────────
+
+/// An index holding a reserved name but built by someone else is not dropped.
+///
+/// Migrations 0033-0040 build with `CREATE INDEX ... IF NOT EXISTS`, so a
+/// pre-existing index already holding a reserved name on the expected table is
+/// skipped with a notice and never replaced. A rollback guard that checked only
+/// `indrelid` would then treat it as the tranche's own, drop it, and retire ledger
+/// versions 33-40 over an object the tranche never created -- the same defect the
+/// 0041 constraint guards were rewritten to close, one object kind down.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_indexes_rollback_refuses_an_index_it_does_not_own(pool: PgPool) {
+    // 0041 first: its unique constraints own three of the eight indexes.
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback");
+
+    for stmt in [
+        "DROP INDEX idx_audit_logs_tenant",
+        // Right table, reserved name, right arity, wrong columns -- exactly what
+        // the build's IF NOT EXISTS would have skipped over. Two columns on
+        // purpose: a one-column decoy is caught by the arity check and never
+        // reaches the column-name comparison.
+        "CREATE INDEX idx_audit_logs_tenant ON audit_logs (event_type, created_at)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(&pool, INDEXES_DOWN_SQL, "0033").await;
+    assert_eq!(code, "55000", "{message}");
+    assert!(
+        message.contains("idx_audit_logs_tenant") && message.contains("columns are"),
+        "the refusal must name the index and say its columns differ: {message}"
+    );
+
+    let occupant_survives: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_audit_logs_tenant' \
+           AND indexdef LIKE '%event_type%')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        occupant_survives,
+        "the unrelated index must be left exactly where it was"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        ledger, 8,
+        "versions 33-40 must not be retired over an object the tranche never built"
+    );
+}
+
+/// An unrelated table's same-named trigger must not block the 0032 rollback.
+///
+/// Trigger names are unique only per table. Discovering the five bridges by
+/// `tgname` classified any other table's `trg_entities_tenancy_bridge` as a moved
+/// tranche trigger and refused this rollback permanently, with all five real
+/// bridges correctly in place -- a false refusal with no way out, since
+/// rollback/0032 cannot remove a trigger it never created. The bridges are now
+/// reached through `tgfoid`, the OID of the zero-argument `trigger`-returning
+/// function migration 0032 installs.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unrelated_trigger_of_the_same_name_does_not_block_the_prepare_rollback(pool: PgPool) {
+    for stmt in [
+        "CREATE TABLE zz_trigger_decoy (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), v int)",
+        "CREATE FUNCTION zz_decoy_fn() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RETURN NEW; END $$",
+        // Same name as a tranche bridge, on a table that has nothing to do with it.
+        "CREATE TRIGGER trg_entities_tenancy_bridge BEFORE INSERT ON zz_trigger_decoy \
+         FOR EACH ROW EXECUTE FUNCTION zz_decoy_fn()",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let decoy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgname = 'trg_entities_tenancy_bridge' AND c.relname = 'zz_trigger_decoy')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        decoy_exists,
+        "the decoy trigger must exist to be a real test"
+    );
+
+    for script in [CONSTRAINTS_DOWN_SQL, INDEXES_DOWN_SQL] {
+        sqlx::raw_sql(script).execute(&pool).await.expect("unwind");
+    }
+    sqlx::raw_sql(PREPARE_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("an unrelated same-named trigger must not block the prepare rollback");
+
+    // And it did the work rather than merely declining to fail.
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name IN ('agent_uuid', 'tenant_id') \
+           AND table_name IN ('archival_batches', 'audit_logs', 'entities', 'memory_graph', \
+                              'rmk_policies')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns, 0,
+        "the rollback must have dropped the ownership columns"
+    );
+    assert!(
+        decoy_exists,
+        "and the decoy trigger is none of its business"
+    );
+}
+
+/// An overloaded bridge-function name must not make 0028 refuse forever.
+///
+/// PostgreSQL allows overloading, and the guard matched only `proname`. After the
+/// real zero-argument bridges are gone, an unrelated
+/// `fn_entities_tenancy_bridge(integer)` kept 0028 reporting tranche 1 as applied
+/// and directing the operator to rollback/0032 -- which cannot remove an overload
+/// it never created. The lookup is now pinned to the zero-argument
+/// `trigger`-returning signature migration 0032 installs.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_overloaded_bridge_function_name_does_not_block_step_one_rollback(pool: PgPool) {
+    for script in [
+        CONSTRAINTS_DOWN_SQL,
+        INDEXES_DOWN_SQL,
+        PREPARE_DOWN_SQL,
+        GRANTS_HARDENING_DOWN_SQL,
+        GRANTS_DOWN_SQL,
+    ] {
+        sqlx::raw_sql(script).execute(&pool).await.expect("unwind");
+    }
+
+    sqlx::query(sqlx::AssertSqlSafe(
+        "CREATE FUNCTION public.fn_entities_tenancy_bridge(integer) RETURNS integer \
+         LANGUAGE sql AS $$ SELECT $1 $$"
+            .to_owned(),
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(STEP_ONE_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("an unrelated overload must not be mistaken for an installed bridge");
+
+    let gone: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'agents' AND column_name = 'tenant_id')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        gone,
+        "the rollback must have run, not just declined to fail"
     );
 }
