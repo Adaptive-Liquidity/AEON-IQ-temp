@@ -125,14 +125,68 @@ BEGIN
            AND c.contype = 'u'
            AND c.conindid = to_regclass(format('public.%I', expected.name))
          WHERE c.conrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl))
+        UNION ALL
+        -- The CONSTRAINT renamed, rather than its table.
+        --
+        -- Both arms above still require the original `conname`, so
+        -- `ALTER TABLE ... RENAME CONSTRAINT` hides the object from them; the
+        -- classification loop then finds nothing under the expected name, treats
+        -- it as already dropped, drops the others and retires ledger version 41
+        -- while the renamed constraint stays attached. 0033 misses it for the
+        -- same reason and clears 33-40, and 0032 then fails on the surviving
+        -- column dependency -- half-unwound, from a run that reported success.
+        --
+        -- A renamed foreign key is still reachable from the parent's unique key,
+        -- so it is found by OID and reported by whatever it is called now.
+        SELECT format('%s on %s is a tranche 1 ownership key under an unexpected name',
+                      c.conname, c.conrelid::regclass) AS label
+          FROM pg_catalog.pg_constraint c
+         WHERE c.contype = 'f'
+           AND agents_idx IS NOT NULL
+           AND c.conindid = agents_idx
+           AND c.conrelid IN (to_regclass('public.archival_batches'),
+                              to_regclass('public.audit_logs'),
+                              to_regclass('public.entities'),
+                              to_regclass('public.memory_graph'),
+                              to_regclass('public.rmk_policies'))
+           AND c.conname NOT IN ('archival_batches_tenant_agent_fkey',
+                                 'audit_logs_tenant_agent_fkey',
+                                 'entities_tenant_agent_fkey',
+                                 'memory_graph_tenant_agent_fkey',
+                                 'rmk_policies_tenant_agent_fkey')
+        UNION ALL
+        -- A renamed UNIQUE constraint takes its index's name with it, so there
+        -- is no name left to find it by. It is identified by its shape instead:
+        -- a two-column unique key over exactly (id, tenant_id) on one of the
+        -- three tables, not deferrable, not partition-inherited. Anything
+        -- matching that IS this tranche's object for practical purposes, and if
+        -- an operator genuinely added their own, refusing and saying so is the
+        -- safe answer.
+        SELECT format('%s on %s is a tranche 1 unique key under an unexpected name',
+                      c.conname, c.conrelid::regclass) AS label
+          FROM pg_catalog.pg_constraint c
+         WHERE c.contype = 'u'
+           AND NOT c.condeferrable AND NOT c.condeferred AND c.conparentid = 0
+           AND c.conrelid IN (to_regclass('public.archival_batches'),
+                              to_regclass('public.entities'),
+                              to_regclass('public.rmk_policies'))
+           AND c.conname NOT IN ('archival_batches_id_tenant_id_key',
+                                 'entities_id_tenant_id_key',
+                                 'rmk_policies_id_tenant_id_key')
+           AND (SELECT array_agg(a.attname::TEXT ORDER BY k.ord)
+                  FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = k.attnum)
+               = ARRAY['id', 'tenant_id']
     ) AS found;
 
     IF moved IS NOT NULL THEN
         RAISE EXCEPTION
-            'a tranche 1 constraint is attached to a table this script does not name: %. '
-            'The table was renamed after the tranche was applied, so dropping by the names '
-            'below would miss the constraint and leave the tranche half-attached. Nothing has '
-            'been dropped. Rename the table back to what migration 0032 created, then re-run.',
+            'a tranche 1 constraint is not where this script would look for it: %. Either its '
+            'table or the constraint itself was renamed after the tranche was applied, so '
+            'dropping by the names below would miss it and leave the tranche half-attached -- '
+            'and the 0033 and 0032 rollbacks would then miss it too. Nothing has been dropped. '
+            'Restore the name migration 0041 created, then re-run.',
             moved
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;

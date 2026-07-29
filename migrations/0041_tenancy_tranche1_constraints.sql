@@ -249,6 +249,68 @@ BEGIN
                         spec.con_name, spec.con_name
                         USING ERRCODE = 'object_not_in_prerequisite_state';
                 END IF;
+
+                -- The index EXISTING is not the index being OURS, and this is
+                -- the branch where that distinction bites hardest.
+                -- `USING INDEX` derives the constraint's columns from whatever
+                -- index it is handed, so adopting a wrong-shaped one produces a
+                -- constraint that is not the promised key while sqlx records 41
+                -- as applied. Measured: a pre-existing
+                -- `archival_batches_id_tenant_id_key ON (id, agent_uuid)` --
+                -- which 0038-0040 skip via IF NOT EXISTS -- was adopted as
+                -- `UNIQUE (id, agent_uuid)` without complaint. The identity test
+                -- further down only ever runs when a CONSTRAINT already exists,
+                -- so it could not catch this.
+                SELECT i.indrelid, i.indisunique, i.indnkeyatts, i.indnatts, i.indkey,
+                       i.indpred IS NOT NULL AS is_partial,
+                       i.indexprs IS NOT NULL AS is_expression
+                  INTO idx
+                  FROM pg_catalog.pg_index i
+                 WHERE i.indexrelid = to_regclass(format('public.%I', spec.con_name));
+
+                problems := ARRAY[]::TEXT[];
+                IF idx.indrelid IS DISTINCT FROM tbl_oid THEN
+                    problems := problems
+                        || format('it is on %s, expected public.%s',
+                                  idx.indrelid::regclass, spec.tbl);
+                END IF;
+                IF NOT idx.indisunique THEN
+                    problems := problems || 'it is not a unique index'::TEXT;
+                END IF;
+                IF idx.is_partial THEN
+                    problems := problems || 'it is partial'::TEXT;
+                END IF;
+                IF idx.is_expression THEN
+                    problems := problems || 'it indexes an expression'::TEXT;
+                END IF;
+                IF idx.indnatts <> 2 OR idx.indnkeyatts <> 2 THEN
+                    problems := problems
+                        || format('it has %s column(s) (%s key), expected 2',
+                                  idx.indnatts, idx.indnkeyatts);
+                ELSE
+                    SELECT array_agg(a.attname::TEXT ORDER BY k.ord)
+                      INTO actual
+                      FROM unnest(idx.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+                      JOIN pg_catalog.pg_attribute a
+                        ON a.attrelid = idx.indrelid AND a.attnum = k.attnum;
+                    IF actual IS DISTINCT FROM spec.local_cols THEN
+                        problems := problems
+                            || format('its columns are %L, expected %L',
+                                      actual, spec.local_cols);
+                    END IF;
+                END IF;
+
+                IF cardinality(problems) > 0 THEN
+                    RAISE EXCEPTION
+                        'index % is not the object migrations 0038-0040 build, so adopting it '
+                        'would create a constraint this migration never promised: %. '
+                        'ADD CONSTRAINT ... USING INDEX takes its columns from the index it is '
+                        'given, so the wrong index silently becomes the wrong key. Nothing has '
+                        'been changed. Rename or remove the occupying index, then re-run.',
+                        spec.con_name, array_to_string(problems, '; ')
+                        USING ERRCODE = 'object_not_in_prerequisite_state';
+                END IF;
+
                 EXECUTE format(
                     'ALTER TABLE public.%I ADD CONSTRAINT %I UNIQUE USING INDEX %I',
                     spec.tbl, spec.con_name, spec.con_name);
