@@ -34,41 +34,73 @@ SET LOCAL search_path = pg_catalog, public;
 
 -- Refuse while any tranche-1 constraint from 0041 is still attached.
 --
--- Scoped by table, not by name alone. `conname` is unique only per relation, so
--- an unrelated table -- or another schema entirely -- may legitimately hold a
--- constraint called `entities_id_tenant_id_key`, and matching on the bare name
--- would block a rollback that has nothing to do with it. The join pins each
--- name to the exact public table 0041 attaches it to.
+-- Discovered by OID, not by (name, table-name). `conname` is unique only per
+-- relation, so an unrelated table -- or another schema entirely -- may
+-- legitimately hold a constraint called `entities_id_tenant_id_key`, and
+-- matching on the bare name would block a rollback that has nothing to do with
+-- it. But pinning each name to a literal table name has the opposite failure:
+-- `ALTER TABLE ... RENAME` moves a table and leaves its constraint names alone,
+-- so a renamed child stops matching and the guard reports "none" while 0041 is
+-- still fully applied.
 --
--- Both kinds are checked. The three unique constraints own indexes this script
--- drops. The five foreign keys do not own them, but they are 0041's work and
--- unwinding out of order would leave them referencing columns that
--- rollback/0032 is about to remove -- so this script refuses rather than
--- letting the operator discover that two steps later.
+-- That was not a cosmetic inaccuracy here. PostgreSQL does not rename indexes
+-- when their table is renamed, so every `DROP INDEX` below still resolved. A
+-- rollback run against a renamed child therefore passed the guard, dropped the
+-- lookup indexes -- which no constraint owns, so nothing objected -- and deleted
+-- ledger versions 33-40, while 0041's foreign keys stayed attached. The tranche
+-- was left half-unwound, with a ledger claiming the indexes had never been
+-- built.
+--
+-- Both kinds are now found through something a rename does not disturb:
+--   * the five foreign keys through `conindid`, the OID of
+--     `agents_tenant_id_id_key` on the parent -- the one key all five depend on,
+--     whatever their own tables are called now;
+--   * the three unique constraints through the OID of the index they adopted,
+--     which keeps its name across a table rename.
+-- Each is reported with `conrelid::regclass`, so the message names where the
+-- constraint actually is rather than where this script expected it.
+--
+-- Both kinds must be checked. The three unique constraints own indexes this
+-- script drops. The five foreign keys do not own them, but they are 0041's work
+-- and unwinding out of order would leave them referencing columns that
+-- rollback/0032 is about to remove -- so this script refuses rather than letting
+-- the operator discover that two steps later.
 DO $$
 DECLARE
-    remaining TEXT;
+    remaining  TEXT;
+    agents_idx oid;
 BEGIN
-    SELECT string_agg(format('%s on %s', c.conname, expected.tbl), ', '
-                      ORDER BY c.conname)
-      INTO remaining
-      FROM (VALUES
-              ('archival_batches_id_tenant_id_key',  'archival_batches', 'u'),
-              ('entities_id_tenant_id_key',          'entities',         'u'),
-              ('rmk_policies_id_tenant_id_key',      'rmk_policies',     'u'),
-              ('archival_batches_tenant_agent_fkey', 'archival_batches', 'f'),
-              ('audit_logs_tenant_agent_fkey',       'audit_logs',       'f'),
-              ('entities_tenant_agent_fkey',         'entities',         'f'),
-              ('memory_graph_tenant_agent_fkey',     'memory_graph',     'f'),
-              ('rmk_policies_tenant_agent_fkey',     'rmk_policies',     'f')
-           ) AS expected(name, tbl, kind)
-      JOIN pg_catalog.pg_class t
-        ON t.relname = expected.tbl
-      JOIN pg_catalog.pg_namespace n
-        ON n.oid = t.relnamespace AND n.nspname = 'public'
-      JOIN pg_catalog.pg_constraint c
-        ON c.conname = expected.name AND c.conrelid = t.oid
-       AND c.contype = expected.kind;
+    SELECT c.conindid INTO agents_idx
+      FROM pg_catalog.pg_constraint c
+     WHERE c.conname = 'agents_tenant_id_id_key'
+       AND c.conrelid = 'public.agents'::regclass
+       AND c.contype = 'u';
+
+    SELECT string_agg(found.label, ', ' ORDER BY found.label) INTO remaining FROM (
+        -- The five ownership keys, reached from the parent's unique key.
+        SELECT format('%s on %s', c.conname, c.conrelid::regclass) AS label
+          FROM pg_catalog.pg_constraint c
+         WHERE c.contype = 'f'
+           AND agents_idx IS NOT NULL
+           AND c.conindid = agents_idx
+           AND c.conname IN ('archival_batches_tenant_agent_fkey',
+                             'audit_logs_tenant_agent_fkey',
+                             'entities_tenant_agent_fkey',
+                             'memory_graph_tenant_agent_fkey',
+                             'rmk_policies_tenant_agent_fkey')
+        UNION ALL
+        -- The three adopted unique constraints, reached from their own index.
+        SELECT format('%s on %s', c.conname, c.conrelid::regclass) AS label
+          FROM (VALUES
+                  ('archival_batches_id_tenant_id_key'),
+                  ('entities_id_tenant_id_key'),
+                  ('rmk_policies_id_tenant_id_key')
+               ) AS expected(name)
+          JOIN pg_catalog.pg_constraint c
+            ON c.conname = expected.name
+           AND c.contype = 'u'
+           AND c.conindid = to_regclass(format('public.%I', expected.name))
+    ) AS found;
 
     IF remaining IS NOT NULL THEN
         RAISE EXCEPTION
@@ -76,6 +108,49 @@ BEGIN
             'Run rollback/0041_tenancy_tranche1_constraints_down.sql first.',
             remaining
             USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+END $$;
+
+-- Refuse if any index this script drops now belongs to a table it does not name.
+--
+-- The drops below are by index name, and an index keeps its name when its table
+-- is renamed, so without this check a rollback scoped to `public.rmk_policies`
+-- would drop an index that is now serving `rmk_policies_old`. Resolved by
+-- comparing each index's `indrelid` against the OID of the table this script
+-- believes it is unwinding.
+DO $$
+DECLARE
+    moved TEXT;
+BEGIN
+    SELECT string_agg(format('%s is on %s (expected public.%s)',
+                             ic.relname, i.indrelid::regclass, expected.tbl),
+                      ', ' ORDER BY ic.relname)
+      INTO moved
+      FROM (VALUES
+              ('idx_archival_batches_tenant',        'archival_batches'),
+              ('idx_audit_logs_tenant',              'audit_logs'),
+              ('idx_entities_tenant',                'entities'),
+              ('idx_memory_graph_tenant',            'memory_graph'),
+              ('idx_rmk_policies_tenant',            'rmk_policies'),
+              ('archival_batches_id_tenant_id_key',  'archival_batches'),
+              ('entities_id_tenant_id_key',          'entities'),
+              ('rmk_policies_id_tenant_id_key',      'rmk_policies')
+           ) AS expected(idx, tbl)
+      JOIN pg_catalog.pg_class ic
+        ON ic.oid = to_regclass(format('public.%I', expected.idx))
+      JOIN pg_catalog.pg_index i
+        ON i.indexrelid = ic.oid
+     WHERE i.indrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl));
+
+    IF moved IS NOT NULL THEN
+        RAISE EXCEPTION
+            'a tranche 1 index belongs to a table this script does not name: %. The table was '
+            'renamed after the tranche was applied, and an index keeps its name across a rename, '
+            'so dropping by name would unwind a table this rollback is not scoped to. Nothing '
+            'has been dropped. Rename the table back to what migration 0032 created, then '
+            're-run.',
+            moved
+            USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 END $$;
 

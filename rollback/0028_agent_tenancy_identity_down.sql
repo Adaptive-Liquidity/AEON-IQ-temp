@@ -91,27 +91,37 @@ DECLARE
     remaining TEXT;
     bridges   TEXT;
 BEGIN
-    -- Scoped to the exact public tables. `conname` is unique only per
-    -- relation, so an unrelated table -- or a different schema -- may hold a
-    -- constraint of the same name without having anything to do with tranche 1,
-    -- and blocking on the bare name would refuse a rollback that is in fact
-    -- safe.
-    SELECT string_agg(format('%s on %s', c.conname, expected.tbl), ', '
+    -- Found by reverse dependency on the very key this script drops, rather than
+    -- by (name, table-name).
+    --
+    -- Scoping to exact table names was already better than matching the bare
+    -- `conname`, which is unique only per relation and would refuse a rollback
+    -- over an identically-named constraint on some unrelated table. But a
+    -- literal table name is defeated by `ALTER TABLE ... RENAME`: it moves the
+    -- table and leaves the constraint name alone, so a renamed child dropped out
+    -- of the join and the guard reported "Constraints still present: none" while
+    -- one was still attached. The script then reached
+    -- `DROP CONSTRAINT ... agents_tenant_id_id_key` and failed on a raw
+    -- dependency error -- exactly the "work out what state your database is in
+    -- now" outcome this guard exists to prevent.
+    --
+    -- `conindid` is the OID of that unique constraint's index, so this asks the
+    -- question that actually matters: what still depends on the key about to be
+    -- dropped? Rename-proof on both sides, and complete rather than enumerated --
+    -- a sixth dependant attached by a later tranche is reported without this
+    -- list being updated. `conrelid::regclass` names where each dependant really
+    -- lives.
+    SELECT string_agg(format('%s on %s', c.conname, c.conrelid::regclass), ', '
                       ORDER BY c.conname)
       INTO remaining
-      FROM (VALUES
-              ('archival_batches_tenant_agent_fkey', 'archival_batches'),
-              ('audit_logs_tenant_agent_fkey',       'audit_logs'),
-              ('entities_tenant_agent_fkey',         'entities'),
-              ('memory_graph_tenant_agent_fkey',     'memory_graph'),
-              ('rmk_policies_tenant_agent_fkey',     'rmk_policies')
-           ) AS expected(name, tbl)
-      JOIN pg_catalog.pg_class t
-        ON t.relname = expected.tbl
-      JOIN pg_catalog.pg_namespace n
-        ON n.oid = t.relnamespace AND n.nspname = 'public'
-      JOIN pg_catalog.pg_constraint c
-        ON c.conname = expected.name AND c.conrelid = t.oid AND c.contype = 'f';
+      FROM pg_catalog.pg_constraint c
+     WHERE c.contype = 'f'
+       AND c.conindid = (
+               SELECT p.conindid
+                 FROM pg_catalog.pg_constraint p
+                WHERE p.conname = 'agents_tenant_id_id_key'
+                  AND p.conrelid = 'public.agents'::regclass
+                  AND p.contype  = 'u');
 
     SELECT string_agg(p.proname, ', ' ORDER BY p.proname)
       INTO bridges

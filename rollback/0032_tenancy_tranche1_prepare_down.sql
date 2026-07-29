@@ -64,25 +64,33 @@ BEGIN
     -- drops. Checking them here, alongside the indexes, is what makes the
     -- refusal complete: an operator who unwound 0033-0040 but not 0041 would
     -- otherwise get past the index check and only discover the dependency when
-    -- ALTER TABLE ... DROP COLUMN failed partway down. Scoped by table rather
-    -- than by name alone, because `conname` is unique only per relation.
-    SELECT string_agg(format('%s on %s', c.conname, expected.tbl), ', '
+    -- ALTER TABLE ... DROP COLUMN failed partway down.
+    --
+    -- Reached from the parent's unique key by OID rather than by (name,
+    -- table-name). `conname` is unique only per relation, so a bare-name match
+    -- would refuse over a constraint on some unrelated table -- but a literal
+    -- table name is defeated by `ALTER TABLE ... RENAME`, which leaves
+    -- constraint names untouched, so a renamed child reported "none" while its
+    -- key was still attached. `conindid` is the OID of
+    -- `agents_tenant_id_id_key`, which all five depend on and which no rename of
+    -- a child can change; `conrelid::regclass` then reports where each one
+    -- actually is.
+    SELECT string_agg(format('%s on %s', c.conname, c.conrelid::regclass), ', '
                       ORDER BY c.conname)
       INTO constraints
-      FROM (VALUES
-              ('archival_batches_tenant_agent_fkey', 'archival_batches'),
-              ('audit_logs_tenant_agent_fkey',       'audit_logs'),
-              ('entities_tenant_agent_fkey',         'entities'),
-              ('memory_graph_tenant_agent_fkey',     'memory_graph'),
-              ('rmk_policies_tenant_agent_fkey',     'rmk_policies')
-           ) AS expected(name, tbl)
-      JOIN pg_catalog.pg_class t
-        ON t.relname = expected.tbl
-      JOIN pg_catalog.pg_namespace n
-        ON n.oid = t.relnamespace AND n.nspname = 'public'
-      JOIN pg_catalog.pg_constraint c
-        ON c.conname = expected.name AND c.conrelid = t.oid
-       AND c.contype = 'f';
+      FROM pg_catalog.pg_constraint c
+     WHERE c.contype = 'f'
+       AND c.conindid = (
+               SELECT p.conindid
+                 FROM pg_catalog.pg_constraint p
+                WHERE p.conname = 'agents_tenant_id_id_key'
+                  AND p.conrelid = 'public.agents'::regclass
+                  AND p.contype  = 'u')
+       AND c.conname IN ('archival_batches_tenant_agent_fkey',
+                         'audit_logs_tenant_agent_fkey',
+                         'entities_tenant_agent_fkey',
+                         'memory_graph_tenant_agent_fkey',
+                         'rmk_policies_tenant_agent_fkey');
 
     IF remaining IS NOT NULL OR constraints IS NOT NULL THEN
         RAISE EXCEPTION
@@ -93,6 +101,50 @@ BEGIN
             COALESCE(remaining, 'none'),
             COALESCE(constraints, 'none')
             USING ERRCODE = 'dependent_objects_still_exist';
+    END IF;
+END $$;
+
+-- Refuse if a bridged table has been renamed out from under this script.
+--
+-- Every DROP TRIGGER and DROP COLUMN below names its table literally, so a
+-- renamed child turns this rollback into a bare "relation ... does not exist"
+-- partway through -- after the block that retires completion evidence has
+-- already run. The enclosing transaction makes that atomic rather than
+-- corrupting, but it leaves the operator holding a raw catalog error instead of
+-- a next action, and it is indistinguishable from the script being broken.
+--
+-- The rename-proof handle is the bridge trigger: `pg_trigger.tgrelid` is an OID,
+-- and `ALTER TABLE ... RENAME` does not rename triggers. Resolving each expected
+-- trigger name to the table it is actually on, and comparing that against the
+-- table this script names, catches the rename before anything is touched.
+DO $$
+DECLARE
+    moved TEXT;
+BEGIN
+    SELECT string_agg(format('%s is on %s (expected public.%s)',
+                             t.tgname, t.tgrelid::regclass, expected.tbl),
+                      ', ' ORDER BY t.tgname)
+      INTO moved
+      FROM (VALUES
+              ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
+              ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
+              ('trg_entities_tenancy_bridge',         'entities'),
+              ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
+              ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
+           ) AS expected(trg, tbl)
+      JOIN pg_catalog.pg_trigger t
+        ON t.tgname = expected.trg
+       AND NOT t.tgisinternal
+     WHERE t.tgrelid IS DISTINCT FROM to_regclass(format('public.%I', expected.tbl));
+
+    IF moved IS NOT NULL THEN
+        RAISE EXCEPTION
+            'a tranche 1 bridge trigger is on a table this script does not name: %. The table was '
+            'renamed after migration 0032 was applied, so the DROP TRIGGER and DROP COLUMN '
+            'statements below would not reach it. Nothing has been changed. Rename the table back '
+            'to what migration 0032 created, then re-run.',
+            moved
+            USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 END $$;
 
