@@ -2448,3 +2448,109 @@ async fn an_overloaded_bridge_function_name_does_not_block_step_one_rollback(poo
         "the rollback must have run, not just declined to fail"
     );
 }
+
+/// A wrong-shaped index must not be adopted as the tranche's unique key.
+///
+/// `ADD CONSTRAINT ... UNIQUE USING INDEX` takes the constraint's columns from
+/// whatever index it is handed. Migrations 0038-0040 build with `IF NOT EXISTS`,
+/// so a pre-existing index already holding a reserved name is skipped and never
+/// replaced — and 0041 would then adopt it, producing a constraint that is not
+/// the promised key while sqlx records version 41 as applied. Measured before the
+/// check: `archival_batches_id_tenant_id_key ON (id, agent_uuid)` was adopted as
+/// `UNIQUE (id, agent_uuid)` without complaint.
+///
+/// The identity test elsewhere in 0041 cannot catch this: it only runs when a
+/// CONSTRAINT already exists, and here only an index does.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_wrong_shaped_index_is_not_adopted_as_the_unique_key(pool: PgPool) {
+    for stmt in [
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+        "CREATE UNIQUE INDEX archival_batches_id_tenant_id_key \
+         ON archival_batches (id, agent_uuid)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_UP, "wrong-shaped index").await;
+    assert_eq!(code, "55000", "{message}");
+    assert!(
+        message.contains("its columns are '{id,agent_uuid}', expected '{id,tenant_id}'"),
+        "the refusal must name the shape that differs: {message}"
+    );
+
+    let adopted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+         WHERE conname = 'archival_batches_id_tenant_id_key' AND contype = 'u'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        adopted, 0,
+        "the wrong-shaped index must not have become a constraint"
+    );
+}
+
+/// A renamed CONSTRAINT, as opposed to a renamed table, is also refused.
+///
+/// Renaming the constraint hides it from every guard that requires its original
+/// `conname` — and for a unique constraint PostgreSQL renames the backing index
+/// along with it, so there is no name left to find it by at all. Left undetected,
+/// rollback/0041 drops the others and retires ledger version 41 while the renamed
+/// object stays attached; 0033 then misses it too and clears 33-40; and 0032
+/// finally fails on the surviving column dependency.
+///
+/// The foreign key is found from the parent's unique key by OID. The unique
+/// constraint is found by shape: two columns over exactly (id, tenant_id) on a
+/// tranche table, not deferrable, not partition-inherited.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_renamed_constraint_is_refused_by_shape_not_missed_by_name(pool: PgPool) {
+    for (label, rename, expected_phrase) in [
+        (
+            "renamed foreign key",
+            "ALTER TABLE entities RENAME CONSTRAINT entities_tenant_agent_fkey TO zz_renamed_fk",
+            "zz_renamed_fk on entities is a tranche 1 ownership key under an unexpected name",
+        ),
+        (
+            "renamed unique constraint",
+            "ALTER TABLE entities RENAME CONSTRAINT entities_id_tenant_id_key TO zz_renamed_uq",
+            "zz_renamed_uq on entities is a tranche 1 unique key under an unexpected name",
+        ),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(rename.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+
+        let (code, message) = expect_refusal(&pool, CONSTRAINTS_DOWN_SQL, label).await;
+        assert_eq!(code, "55000", "{label}: {message}");
+        assert!(
+            message.contains(expected_phrase),
+            "{label}: the refusal must identify it by shape and report its current name \
+             (expected {expected_phrase:?}): {message}"
+        );
+        assert!(
+            message.contains("Nothing has been dropped"),
+            "{label}: {message}"
+        );
+
+        let ledger: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 41")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger, 1, "{label}: version 41 must not be retired");
+    }
+
+    // Both renamed objects survived both refusals.
+    let survivors: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname IN ('zz_renamed_fk', 'zz_renamed_uq')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(survivors, 2, "neither renamed constraint may be dropped");
+}
