@@ -2426,75 +2426,59 @@ mod invariants {
     fn bridges_are_authority_aware_and_match_the_backfill() {
         for (table, strategy) in TRANSITION {
             let authority = backfill_authority_for(table);
-            match strategy {
+            // The parents each strategy claims to resolve through. `None` means
+            // the bridge resolves straight from the row's own agent and must
+            // declare no backfill authority at all.
+            let claimed: Option<BTreeSet<&str>> = match strategy {
                 TransitionalWrite::AgentBridge { .. }
-                | TransitionalWrite::ConditionalAgentBridge { .. } => {
-                    assert!(
-                        authority.is_none(),
-                        "`{table}` resolves straight from agents at write time but declares a \
-                         backfill authority; the two would disagree"
-                    );
-                }
-                TransitionalWrite::SessionBridge { .. } => {
-                    let authority = authority.unwrap_or_else(|| {
-                        panic!(
-                            "`{table}` bridges through sessions but declares no backfill \
-                                authority"
-                        )
-                    });
-                    assert!(
-                        authority.source.contains("sessions"),
-                        "`{table}` bridges through sessions but backfills from `{}`",
-                        authority.source
-                    );
-                }
-                TransitionalWrite::MemoryBridge { .. } => {
-                    let authority = authority.unwrap_or_else(|| {
-                        panic!(
-                            "`{table}` bridges through memories but declares no backfill \
-                                authority"
-                        )
-                    });
-                    assert!(
-                        authority.source.contains("memories"),
-                        "`{table}` bridges through memories but backfills from `{}`",
-                        authority.source
-                    );
-                }
+                | TransitionalWrite::ConditionalAgentBridge { .. } => None,
+                TransitionalWrite::SessionBridge { .. } => Some(BTreeSet::from(["sessions"])),
+                TransitionalWrite::MemoryBridge { .. } => Some(BTreeSet::from(["memories"])),
                 TransitionalWrite::MultiPathBridge { parents, .. } => {
-                    let authority = authority.unwrap_or_else(|| {
-                        panic!(
-                            "`{table}` has multiple ownership paths but declares no backfill \
-                                authority"
-                        )
-                    });
-                    assert!(
-                        authority.agreement.is_some(),
-                        "`{table}` bridges multiple paths but its backfill has no agreement \
-                         predicate"
-                    );
-                    assert!(
-                        parents.len() >= 2,
-                        "`{table}` declares a multi-path bridge over fewer than two parents"
-                    );
-                    let declared: BTreeSet<&str> = parents.iter().copied().collect();
-                    assert_eq!(
-                        declared.len(),
-                        parents.len(),
-                        "`{table}` lists a parent twice"
-                    );
-                    // Exact in both directions. A one-way containment check
-                    // cannot notice a parent the bridge forgot, which is the
-                    // direction that lets write-time and backfill-time assign
-                    // different owners to the same row.
-                    assert_eq!(
-                        declared,
-                        authority_parents(authority),
-                        "`{table}`'s bridge and its backfill authority disagree about which \
-                         parents are consulted"
-                    );
+                    Some(parents.iter().copied().collect())
                 }
+            };
+
+            let Some(claimed) = claimed else {
+                assert!(
+                    authority.is_none(),
+                    "`{table}` resolves straight from agents at write time but declares a \
+                     backfill authority; the two would disagree"
+                );
+                continue;
+            };
+
+            let authority = authority.unwrap_or_else(|| {
+                panic!("`{table}` resolves through a parent but declares no backfill authority")
+            });
+            assert!(
+                authority.agreement.is_some(),
+                "`{table}` resolves through a parent but its backfill has no agreement predicate"
+            );
+            if let TransitionalWrite::MultiPathBridge { parents, .. } = strategy {
+                assert!(
+                    parents.len() >= 2,
+                    "`{table}` declares a multi-path bridge over fewer than two parents"
+                );
+                assert_eq!(
+                    claimed.len(),
+                    parents.len(),
+                    "`{table}` lists a parent twice"
+                );
             }
+
+            // Exact, in both directions, for *every* parent-resolving strategy
+            // — not only the multi-path one. A containment check cannot notice
+            // a parent the bridge forgot: if a single-parent authority later
+            // grew a second source, SessionBridge and MemoryBridge would still
+            // pass while resolving from the smaller set, and write-time and
+            // backfill-time would assign different owners to the same row.
+            assert_eq!(
+                claimed,
+                authority_parents(authority),
+                "`{table}`'s bridge and its backfill authority disagree about which parents are \
+                 consulted"
+            );
         }
     }
 
