@@ -158,8 +158,15 @@ ALTER TABLE public.rmk_policies     DROP COLUMN IF EXISTS tenant_id;
 --
 --     DROP TABLE IF EXISTS public.tenancy_backfill_checkpoints;
 --
--- Leaving it in place is harmless: nothing reads it unless a FINALIZE runs, and
--- a FINALIZE cannot run while the columns it validates no longer exist.
+-- Leaving it in place is safe because the block above already retired this
+-- tranche's completions to ABANDONED.  It is worth being exact about why that
+-- block is what makes retention safe, rather than the absence of the columns:
+-- this script deletes migration version 32, so the very next `sqlx migrate run`
+-- recreates every ownership column with historical rows NULL again.  A retained
+-- COMPLETED row would at that point describe ownership that no longer exists,
+-- and a FINALIZE guard reading it would validate constraints over a table
+-- nobody had backfilled.  "The columns are gone, so nothing can validate them"
+-- is true only until the next migrate, which is why it is not the argument.
 
 DO $$
 BEGIN
