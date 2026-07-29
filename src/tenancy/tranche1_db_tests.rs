@@ -1061,7 +1061,11 @@ async fn a_partially_unwound_0041_still_blocks_the_indexes_rollback(pool: PgPool
     sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
     drop(conn);
     let db = error.as_database_error().expect("a database error");
-    assert_eq!(db.code().as_deref(), Some("2BP01"), "{error}");
+    assert_eq!(
+        db.code().as_deref(),
+        Some("2BP01"),
+        "must be dependent_objects_still_exist, got {error}"
+    );
     assert!(
         db.message().contains("tenant_agent_fkey"),
         "the surviving foreign keys must be what blocks it: {}",
