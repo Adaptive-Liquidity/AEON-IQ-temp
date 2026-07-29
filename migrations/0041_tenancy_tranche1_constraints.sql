@@ -56,9 +56,13 @@
 -- The guard lives here rather than with the builds because this is the file
 -- that ADOPTS them: an INVALID unique index must never become a constraint.
 -- Recovery is NOT "drop the index and re-run its build migration". By the time
--- this guard fires, sqlx has already recorded versions 0033-0040 in
--- `_sqlx_migrations`: a failed CONCURRENTLY build leaves the index behind
--- INVALID, and the next `sqlx migrate run` re-executes that file, whose
+-- this guard fires, sqlx has typically recorded versions 0033-0040 in
+-- `_sqlx_migrations` -- though not necessarily all of them, since a crash can
+-- leave a built index with no ledger row. This guard reads
+-- `pg_index.indisvalid` directly and is ledger-state-agnostic, so it fires
+-- either way. What the ledger decides is whether re-running helps: a failed
+-- CONCURRENTLY build leaves the index behind INVALID, and `sqlx migrate run`
+-- re-executes any file it has NOT recorded, whose
 -- `IF NOT EXISTS` skips the broken index with a notice and lets the migration
 -- succeed. The version is then recorded over an index that enforces nothing,
 -- and sqlx will never run that file again.
@@ -102,8 +106,9 @@ BEGIN
     IF broken IS NOT NULL THEN
         RAISE EXCEPTION
             'tranche 1 concurrent index build left INVALID indexes: %. '
-            'Re-running the build migration will NOT fix this: sqlx has already '
-            'recorded versions 33-40, and those files skip an existing index. '
+            'Re-running the build migration will NOT fix this: sqlx may already '
+            'have recorded some of versions 33-40, and those files skip an '
+            'existing index. '
             'Run rollback/0033_tenancy_tranche1_indexes_down.sql (it drops all '
             'eight indexes and deletes ledger versions 33-40), then re-run '
             'sqlx migrate. An INVALID unique index enforces nothing and must '
