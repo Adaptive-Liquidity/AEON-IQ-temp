@@ -42,7 +42,7 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Unit tests (skip DB integration)
-        run: cargo test -- --skip memory::store::tests --skip rmk_worker::tests --skip archival::tests::persist_archival --skip tenancy::db_tests --skip credentials::db_tests --skip credentials::grants::db_tests --skip tenancy::audit_db_tests
+        run: cargo test -- --skip memory::store::tests --skip rmk_worker::tests --skip archival::tests::persist_archival --skip tenancy::db_tests --skip credentials::db_tests --skip credentials::grants::db_tests --skip tenancy::audit_db_tests --skip tenancy::tranche1_db_tests
 
   # ── Full integration tests (pgvector Postgres required) ─────────────────────
   integration:

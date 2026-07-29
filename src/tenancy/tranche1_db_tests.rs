@@ -1,8 +1,11 @@
 //! Tranche 1 PREPARE behaviour, measured against a live database.
 //!
 //! Split from `audit_db_tests.rs` for the same reason that file was split from
-//! `audit.rs`: the no-database CI path skips `tenancy::*_db_tests` by name, and
-//! the integration job runs `cargo test` unfiltered.
+//! `audit.rs`: the no-database CI job skips DB-backed modules and the
+//! integration job runs `cargo test` unfiltered. That skip list is an explicit
+//! enumeration in `.github/workflows/ci.yml`, not a wildcard — adding a module
+//! here without adding it there turns the no-database job red, which is exactly
+//! what happened when this file was introduced.
 //!
 //! These tests exist because tranche 1 installs five `BEFORE INSERT OR UPDATE`
 //! triggers that are live from the moment the migration applies. Everything
@@ -502,4 +505,301 @@ async fn the_step_one_rollback_refuses_while_the_bridges_are_installed(pool: PgP
     .await
     .unwrap();
     assert!(still_there, "agents.tenant_id must survive the refusal");
+}
+
+// ── Rollback must retire completion evidence, not just retain it ────────────
+
+const TRANCHE_1: &str = "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN";
+
+async fn insert_completed_checkpoint(pool: &PgPool, digest: &str) {
+    sqlx::query(
+        "INSERT INTO tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, \
+            blocking_count, completed_at) \
+         VALUES ($1, $2, 'COMPLETED', 7, 7, 0, NOW())",
+    )
+    .bind(TRANCHE_1)
+    .bind(digest)
+    .execute(pool)
+    .await
+    .expect("a clean completion must be recordable");
+}
+
+/// PREPARE, complete a backfill, roll the tranche back, reapply PREPARE.
+///
+/// The checkpoint table is deliberately retained across the rollback, which is
+/// what made this sequence dangerous: the rollback drops every ownership value
+/// the backfill wrote AND deletes migration version 32, so reapplying recreates
+/// the columns with historical rows NULL again. A COMPLETED row surviving that
+/// describes ownership which no longer exists, and a FINALIZE guard reading it
+/// would validate constraints over a table nobody backfilled.
+///
+/// The rollback therefore transitions those rows to ABANDONED — the schema's
+/// own word for "superseded, retained for history, never treated as
+/// completion". This proves the authority is gone and the history is not.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_rollback_retires_completion_evidence_it_invalidates(pool: PgPool) {
+    const CONSTRAINTS_DOWN: &str =
+        include_str!("../../rollback/0041_tenancy_tranche1_constraints_down.sql");
+    const INDEXES_DOWN: &str =
+        include_str!("../../rollback/0033_tenancy_tranche1_indexes_down.sql");
+    const PREPARE_DOWN: &str =
+        include_str!("../../rollback/0032_tenancy_tranche1_prepare_down.sql");
+    const PREPARE_UP: &str = include_str!("../../migrations/0032_tenancy_tranche1_prepare.sql");
+
+    let digest = crate::tenancy::report::inventory_digest();
+    insert_completed_checkpoint(&pool, &digest).await;
+
+    // A second completion for THIS tranche at a superseded digest. The partial
+    // unique index permits it, and the rollback destroys the ownership both
+    // rows describe, so both must be retired. Scoping the transition to the
+    // current digest would leave this one authoritative — the original defect,
+    // relocated rather than fixed.
+    insert_completed_checkpoint(&pool, "sha256:superseded-digest").await;
+
+    // Neighbours that must NOT be touched, so a future edit that widens or
+    // drops the WHERE clause fails here rather than silently retiring evidence
+    // about ownership this rollback never had any authority over.
+    sqlx::query(
+        "INSERT INTO tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, \
+            blocking_count, completed_at) \
+         VALUES ('TRANCHE_2_SESSIONS', $1, 'COMPLETED', 3, 3, 0, NOW())",
+    )
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .expect("another tranche's completion");
+    sqlx::query(
+        "INSERT INTO tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, \
+            blocking_count, resume_cursor) \
+         VALUES ($1, 'sha256:in-flight', 'IN_PROGRESS', 9, 4, 0, 'cursor-42')",
+    )
+    .bind(TRANCHE_1)
+    .execute(&pool)
+    .await
+    .expect("an in-flight attempt for this tranche");
+
+    // Sanity: before the rollback this row is exactly what FINALIZE looks for.
+    let authoritative: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints \
+         WHERE tranche = $1 AND contract_digest = $2 AND status = 'COMPLETED' \
+           AND blocking_count = 0",
+    )
+    .bind(TRANCHE_1)
+    .bind(&digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(authoritative, 1, "the precondition must start satisfied");
+
+    for (label, script) in [
+        ("0041", CONSTRAINTS_DOWN),
+        ("0033-0040", INDEXES_DOWN),
+        ("0032", PREPARE_DOWN),
+    ] {
+        sqlx::raw_sql(script)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label} rollback: {e}"));
+    }
+
+    // Reapply PREPARE, exactly as `sqlx migrate run` would after the rollback
+    // deleted version 32.
+    sqlx::raw_sql(PREPARE_UP)
+        .execute(&pool)
+        .await
+        .expect("PREPARE must reapply cleanly");
+
+    // The guard's own predicate must now match nothing.
+    let still_authoritative: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints \
+         WHERE tranche = $1 AND contract_digest = $2 AND status = 'COMPLETED' \
+           AND blocking_count = 0",
+    )
+    .bind(TRANCHE_1)
+    .bind(&digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_authoritative, 0,
+        "a rolled-back tranche must not leave evidence that can authorize FINALIZE"
+    );
+
+    // History survives, with its counts and digest intact.
+    let row = sqlx::query(
+        "SELECT status, rows_total, rows_backfilled, completed_at \
+           FROM tenancy_backfill_checkpoints WHERE tranche = $1 AND contract_digest = $2",
+    )
+    .bind(TRANCHE_1)
+    .bind(&digest)
+    .fetch_one(&pool)
+    .await
+    .expect("the checkpoint row must be retained for diagnosis");
+    assert_eq!(row.get::<String, _>("status"), "ABANDONED");
+    assert_eq!(row.get::<i64, _>("rows_total"), 7, "counts are diagnostic");
+    assert_eq!(row.get::<i64, _>("rows_backfilled"), 7);
+    assert!(
+        row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("completed_at")
+            .is_none(),
+        "an ABANDONED row cannot carry a completion time"
+    );
+
+    // Every tranche-1 completion is retired, not just the current-digest one.
+    let superseded: String = sqlx::query_scalar(
+        "SELECT status FROM tenancy_backfill_checkpoints \
+         WHERE tranche = $1 AND contract_digest = 'sha256:superseded-digest'",
+    )
+    .bind(TRANCHE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        superseded, "ABANDONED",
+        "a completion at a superseded digest describes the same destroyed ownership and must \
+         also be retired"
+    );
+
+    // The neighbours are untouched. Scoping is a real decision, so a future
+    // edit that widens the WHERE clause has to fail here.
+    let other_tranche: String = sqlx::query_scalar(
+        "SELECT status FROM tenancy_backfill_checkpoints WHERE tranche = 'TRANCHE_2_SESSIONS'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        other_tranche, "COMPLETED",
+        "this rollback destroys no tranche-2 ownership, so retiring its evidence would be a lie"
+    );
+    let in_flight: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, resume_cursor FROM tenancy_backfill_checkpoints \
+         WHERE tranche = $1 AND contract_digest = 'sha256:in-flight'",
+    )
+    .bind(TRANCHE_1)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        in_flight,
+        ("IN_PROGRESS".to_string(), Some("cursor-42".to_string())),
+        "an in-flight attempt was never authoritative, so it is left exactly as it was"
+    );
+
+    // And a fresh backfill can record new completion evidence for the same
+    // tranche and digest: the retained row no longer occupies the partial
+    // unique index, which it would have if it had stayed COMPLETED.
+    insert_completed_checkpoint(&pool, &digest).await;
+    let fresh: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints \
+         WHERE tranche = $1 AND contract_digest = $2 AND status = 'COMPLETED'",
+    )
+    .bind(TRANCHE_1)
+    .bind(&digest)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh, 1,
+        "exactly one authoritative completion, the new one"
+    );
+}
+
+// ── The declared partial predicate is verified, not merely permitted ────────
+
+/// Replace the checkpoint completion index with `definition`, then report what
+/// the audit says about `tenancy_backfill_checkpoints`.
+async fn contract_status_with_index(pool: &PgPool, definition: &str) -> (String, Vec<String>) {
+    sqlx::query("DROP INDEX IF EXISTS public.tenancy_backfill_checkpoints_completed_key")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(definition.to_owned()))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let report = crate::tenancy::audit::run(pool, None)
+        .await
+        .expect("audit runs");
+    let status = report
+        .classified_tables
+        .iter()
+        .find(|t| t.table == "tenancy_backfill_checkpoints")
+        .and_then(|t| t.contract_status)
+        .map(|s| s.as_str().to_string())
+        .unwrap_or_else(|| "MISSING".to_string());
+    let drift: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|f| f.table_name == "tenancy_backfill_checkpoints")
+        .map(|f| f.diagnostic.clone())
+        .collect();
+    (status, drift)
+}
+
+/// `require_non_partial: false` only ever *permitted* a partial index. It could
+/// not require one, and said nothing about which rows the predicate selects.
+/// Both gaps admitted a schema the audit called satisfied:
+///
+///   * a total unique index forbids the retry the partial scope exists to
+///     allow, because an ABANDONED attempt would collide with a later one;
+///   * a drifted predicate can admit two rows a FINALIZE guard would both read
+///     as authoritative.
+///
+/// Each shape below is rejected, and the correct one still passes.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_checkpoint_completion_index_predicate_is_verified_exactly(pool: PgPool) {
+    let wrong = [
+        (
+            "total unique index",
+            "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+             ON tenancy_backfill_checkpoints (tranche, contract_digest)",
+        ),
+        (
+            "wrong predicate value",
+            "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+             ON tenancy_backfill_checkpoints (tranche, contract_digest) \
+             WHERE status = 'ABANDONED'",
+        ),
+        (
+            "negated predicate",
+            "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+             ON tenancy_backfill_checkpoints (tranche, contract_digest) \
+             WHERE status <> 'COMPLETED'",
+        ),
+        (
+            "logically unrelated predicate",
+            "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+             ON tenancy_backfill_checkpoints (tranche, contract_digest) \
+             WHERE rows_total > 0",
+        ),
+    ];
+
+    for (label, definition) in wrong {
+        let (status, drift) = contract_status_with_index(&pool, definition).await;
+        assert_eq!(
+            status, "DRIFTED",
+            "{label}: the audit must reject this index, drift was {drift:?}"
+        );
+        assert!(
+            drift.iter().any(|d| d.contains("partial on")),
+            "{label}: the finding must name the required predicate: {drift:?}"
+        );
+    }
+
+    // The shape the migration actually creates still satisfies the contract.
+    let (status, drift) = contract_status_with_index(
+        &pool,
+        "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+         ON tenancy_backfill_checkpoints (tranche, contract_digest) \
+         WHERE status = 'COMPLETED'",
+    )
+    .await;
+    assert_eq!(
+        status, "SATISFIED",
+        "the correctly declared index must pass: {drift:?}"
+    );
 }

@@ -1,6 +1,6 @@
 {
-  "schema_version": "step4b0.2",
-  "inventory_digest": "sha256:64ca90d6176e5d15ec5cb3febab834c3956d600c2de117483e5c082b1919c8ce",
+  "schema_version": "step4b0.3",
+  "inventory_digest": "sha256:20760f999053e31c8ac50401ed5872421ec20f2bf01b9aa32a74234714ae836e",
   "reason_codes": [
     {
       "code": "UNCLASSIFIED_TABLE",
@@ -1675,7 +1675,9 @@
           "require_unique": true,
           "require_valid": true,
           "require_ready": true,
-          "require_non_partial": true,
+          "predicate": {
+            "predicate": "TOTAL"
+          },
           "require_no_expressions": true
         },
         {
@@ -1767,7 +1769,10 @@
           "require_unique": true,
           "require_valid": true,
           "require_ready": true,
-          "require_non_partial": false,
+          "predicate": {
+            "predicate": "EXACTLY",
+            "normalized": "(status = 'COMPLETED'::text)"
+          },
           "require_no_expressions": true
         }
       ],

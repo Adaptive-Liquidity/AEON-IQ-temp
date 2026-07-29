@@ -2,8 +2,8 @@
 
 Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry is the source of truth and a test regenerates this file and compares it.
 
-- schema version: `step4b0.2`
-- inventory digest: `sha256:64ca90d6176e5d15ec5cb3febab834c3956d600c2de117483e5c082b1919c8ce`
+- schema version: `step4b0.3`
+- inventory digest: `sha256:20760f999053e31c8ac50401ed5872421ec20f2bf01b9aa32a74234714ae836e`
 - tables classified: 23
 
 ## Classification summary
@@ -850,7 +850,7 @@ constraints — not from whether the column happens to be NULL-able.
 - **row identity**: `id` (surrogate, emitted as-is)
 - **REQUIRED_CURRENT_SCHEMA_CONTRACT** — *verified against the live catalog on every audit run; per-run status is in the machine report, not here.*
   - `tenancy_backfill_checkpoints_pkey` PRIMARY KEY (id), validated
-  - `tenancy_backfill_checkpoints_completed_key` INDEX (tranche, contract_digest) - unique, valid, ready, partial, no expressions
+  - `tenancy_backfill_checkpoints_completed_key` INDEX (tranche, contract_digest) - unique, valid, ready, partial on (status = 'COMPLETED'::text), no expressions
 - **canonical path**: *(none — SYSTEM_GLOBAL)*
 - **global-scope evidence**: Evidence about migration *runs*, not about tenant data. Each row records that a named tranche was backfilled against a named contract digest, and is written only by the operator's backfill command and read only by the FINALIZE guard. It is on no request path and carries no tenant-shaped column at all: `tranche` and `contract_digest` describe the migration, not an owner. Giving these rows a tenant would misrepresent an operator action as tenant data, and would additionally make the FINALIZE guard tenant-scoped, which would let one tenant's backfill authorise a schema change for every tenant.
 - **planned objects**: *(none — this table owes no DDL)*
