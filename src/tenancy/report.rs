@@ -318,7 +318,20 @@ pub struct Step4bContract {
     pub transitional_write_rationale: &'static str,
     pub transitional_write_guarantee: &'static str,
     pub planned_objects: Vec<PlannedObjectDoc>,
+    /// Tables Step 4B creates outright, rather than columns added to existing
+    /// ones. Currently just the per-tranche backfill checkpoint table, which the
+    /// FINALIZE guard asserts against.
+    pub planned_tables: Vec<plan::PlannedTable>,
+    /// The four conditions FINALIZE checks before validating anything.
+    pub finalize_precondition: plan::FinalizePrecondition,
+    pub checkpoint_statuses: Vec<&'static str>,
+    /// Application changes that must ship and drain before the owning tranche's
+    /// PREPARE may be scheduled.
+    pub compatibility_prerequisites: Vec<plan::CompatibilityPrerequisite>,
     pub backfill_authority: Vec<plan::BackfillAuthority>,
+    /// How each planned unique tuple relates to the one it replaces. No entry
+    /// may be a NARROWING without a collision probe.
+    pub uniqueness_transitions: Vec<plan::PlannedUniquenessTransition>,
     /// Required-zero codes that cannot currently fire, and why.
     pub structurally_unreachable: Vec<plan::UnreachableCode>,
 }
@@ -334,17 +347,32 @@ pub struct LockProfileDoc {
 pub struct PlannedObjectDoc {
     pub table: &'static str,
     pub name: &'static str,
-    pub creating_tranche: Tranche,
-    pub validating_tranche: Tranche,
+    /// The tranche this object is filed under, whether or not anything is built.
+    pub declared_in: Tranche,
+    /// False for a unique target the live schema already provides. Such an
+    /// object has no creating tranche and no creation lock, and must never
+    /// reach a PREPARE worklist.
+    pub requires_creation: bool,
+    pub creating_tranche: Option<Tranche>,
+    pub validating_tranche: Option<Tranche>,
     pub local_columns: &'static [&'static str],
     pub referenced_table: Option<&'static str>,
     pub referenced_columns: &'static [&'static str],
     pub unique: bool,
     pub not_valid_permitted: bool,
     pub concurrent_build_required: bool,
-    pub creation_lock: plan::LockProfile,
+    pub creation_lock: Option<plan::LockProfile>,
     pub validation_lock: Option<plan::LockProfile>,
     pub nullability: Option<plan::Nullability>,
+    /// Whether a NULL in the local key leaves rows unchecked. `None` for
+    /// anything that is not a foreign key.
+    pub unenforced_when_null: Option<bool>,
+    /// The `MATCH SIMPLE` consequence as a value, so a consumer never has to
+    /// substring-match `rendered` to discover it.
+    pub match_semantics: Option<plan::MatchSemantics>,
+    /// Exactly which local columns can contain NULL, keyed on `(table, column)`
+    /// rather than on the column name.
+    pub nullable_local_columns: Vec<&'static str>,
     pub rendered: String,
 }
 
@@ -373,6 +401,8 @@ pub fn step_4b_contract() -> Step4bContract {
                 PlannedObjectDoc {
                     table: o.table(),
                     name: o.name(),
+                    declared_in: o.declared_in(),
+                    requires_creation: o.requires_creation(),
                     creating_tranche: o.creating_tranche(),
                     validating_tranche: o.validating_tranche(),
                     local_columns: o.local_columns(),
@@ -384,11 +414,22 @@ pub fn step_4b_contract() -> Step4bContract {
                     creation_lock: o.creation_lock(),
                     validation_lock: o.validation_lock(),
                     nullability: o.nullability(),
+                    unenforced_when_null: o.unenforced_when_null(),
+                    match_semantics: o.match_semantics(),
+                    nullable_local_columns: o.nullable_local_columns(),
                     rendered: o.describe(),
                 }
             })
             .collect(),
+        planned_tables: plan::PLANNED_TABLES.to_vec(),
+        finalize_precondition: plan::FINALIZE_PRECONDITION,
+        checkpoint_statuses: plan::CheckpointStatus::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect(),
+        compatibility_prerequisites: plan::COMPATIBILITY_PREREQUISITES.to_vec(),
         backfill_authority: plan::BACKFILL_AUTHORITY.to_vec(),
+        uniqueness_transitions: plan::UNIQUENESS_TRANSITIONS.to_vec(),
         structurally_unreachable: plan::UNREACHABLE_REQUIRED_ZERO.to_vec(),
     }
 }
@@ -605,11 +646,83 @@ pub fn render_inventory_markdown() -> String {
         }
         let _ = writeln!(out, "#### {}", tranche.as_str());
         let _ = writeln!(out);
+        // PREPARE builds only what needs creating. An already-current target is
+        // declared under a tranche but built by nothing, and emitting DDL for it
+        // would fail against the object that already exists.
+        let worklist = plan::prepare_worklist(*tranche);
+        let _ = writeln!(
+            out,
+            "PREPARE builds {} of the {} objects declared here.",
+            worklist.len(),
+            objects.len()
+        );
+        for blocker in plan::prepare_blockers(*tranche) {
+            let _ = writeln!(
+                out,
+                "- **PREPARE blocked**: `{}` — {}",
+                blocker.planned_object, blocker.blocker
+            );
+        }
+        let _ = writeln!(out);
         for object in objects {
-            let _ = writeln!(out, "- {}", object.describe());
+            let _ = writeln!(
+                out,
+                "- {}{}",
+                object.describe(),
+                if object.requires_creation() {
+                    ""
+                } else {
+                    " *(nothing is built; retained only as a dependency prerequisite)*"
+                }
+            );
         }
         let _ = writeln!(out);
     }
+
+    let _ = writeln!(out, "### Uniqueness transitions");
+    let _ = writeln!(out);
+    for shape in plan::UniquenessTransition::ALL {
+        let planned: Vec<&str> = plan::UNIQUENESS_TRANSITIONS
+            .iter()
+            .filter(|t| t.shape() == *shape)
+            .map(|t| t.table)
+            .collect();
+        let _ = writeln!(
+            out,
+            "- `{}` — {}{}",
+            shape.as_str(),
+            if planned.is_empty() {
+                "none planned".to_string()
+            } else {
+                planned
+                    .iter()
+                    .map(|t| format!("`{t}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            if shape.can_collide() {
+                " *(requires a collision probe before creation)*"
+            } else {
+                ""
+            }
+        );
+    }
+    let _ = writeln!(out);
+    for transition in plan::UNIQUENESS_TRANSITIONS {
+        let _ = writeln!(
+            out,
+            "- `{}`: ({}) → ({}) — **{}**. {}",
+            transition.table,
+            transition.from.join(", "),
+            transition.to.join(", "),
+            transition.shape().as_str(),
+            transition.reason
+        );
+        if let Some(probe) = transition.collision_probe() {
+            let _ = writeln!(out, "  - **collision probe**: `{probe}`");
+        }
+    }
+    let _ = writeln!(out);
 
     let _ = writeln!(out, "### Structurally unreachable required-zero codes");
     let _ = writeln!(out);
@@ -729,6 +842,16 @@ pub fn render_inventory_markdown() -> String {
         if let Some(consistency) = entry.consistency {
             let _ = writeln!(out, "- **consistency**: {consistency}");
         }
+        if let Some(transition) = plan::uniqueness_transition_for(entry.table) {
+            let _ = writeln!(
+                out,
+                "- **uniqueness transition**: `{}` — ({}) → ({}). {}",
+                transition.shape().as_str(),
+                transition.from.join(", "),
+                transition.to.join(", "),
+                transition.reason
+            );
+        }
         if let Some(evidence) = entry.global_scope_evidence {
             let _ = writeln!(out, "- **global-scope evidence**: {evidence}");
         }
@@ -746,9 +869,25 @@ pub fn render_inventory_markdown() -> String {
                 let _ = writeln!(
                     out,
                     "  - [{}] {}",
-                    object.creating_tranche().as_str(),
+                    object.declared_in().as_str(),
                     object.describe()
                 );
+                // The MATCH consequence is emitted as a labelled value, so a
+                // consumer reading this file never has to parse the sentence
+                // above it.
+                if let Some(semantics) = object.match_semantics() {
+                    let nullable = object.nullable_local_columns();
+                    let _ = writeln!(
+                        out,
+                        "    - **match semantics**: `{}`{}",
+                        semantics.as_str(),
+                        if nullable.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — NULL-able local columns: `{}`", nullable.join("`, `"))
+                        }
+                    );
+                }
             }
         }
         if let Some(strategy) = plan::transition_for(entry.table) {
@@ -757,10 +896,34 @@ pub fn render_inventory_markdown() -> String {
                 "- **transitional writes**: `{}`{}",
                 strategy.as_str(),
                 match strategy {
-                    plan::TransitionalWrite::BridgeTrigger { trigger, .. } =>
-                        format!(" — `{trigger}` installed in PREPARE, before any backfill"),
-                    plan::TransitionalWrite::OwnershipMayRemainNull { reason } =>
-                        format!(" — {reason}"),
+                    plan::TransitionalWrite::ConditionalAgentBridge {
+                        trigger, reason, ..
+                    } => format!(
+                        " — `{trigger}` installed in PREPARE, before any backfill; resolves \
+                         conditionally ({}) — {reason}",
+                        plan::ConditionalOwnership::ALL
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    plan::TransitionalWrite::MultiPathBridge {
+                        trigger, parents, ..
+                    } => format!(
+                        " — `{trigger}` installed in PREPARE, before any backfill; writes only \
+                         when {} agree, and never picks a side",
+                        parents.join(" and ")
+                    ),
+                    other => format!(
+                        " — `{}` (`{}`) installed in PREPARE, before any backfill{}",
+                        other.trigger(),
+                        other.function(),
+                        if other.resolves_through_a_parent() {
+                            ", resolving through the parent its backfill authority names"
+                        } else {
+                            ""
+                        }
+                    ),
                 }
             );
         }
@@ -849,6 +1012,101 @@ mod tests {
         // stop meaning "a decision changed".
         assert_eq!(inventory_digest(), inventory_digest());
         assert!(inventory_digest().starts_with("sha256:"));
+    }
+
+    /// The schema version is pinned to a literal.
+    ///
+    /// Comparing `report.schema_version` against `REPORT_SCHEMA_VERSION` — as
+    /// the report tests do — is comparing the field with the constant it was
+    /// assigned from, which passes for any string. Step 4B-0 changed the
+    /// serialized shape, so a consumer pinned to `step4a.1` must be refused;
+    /// that only holds if the value is actually the new one.
+    #[test]
+    fn the_report_schema_version_is_pinned_to_the_step_4b0_shape() {
+        assert_eq!(
+            super::super::audit::REPORT_SCHEMA_VERSION,
+            "step4b0.1",
+            "the Step 4B-0 contract changed the payload shape; reverting the version would let a \
+             Step 4A consumer read a report it cannot understand"
+        );
+        assert_eq!(
+            canonical_inventory_payload().schema_version,
+            "step4b0.1",
+            "the payload must carry the bumped version, not merely define it"
+        );
+    }
+
+    /// The typed null semantics reach `PlannedObjectDoc` intact.
+    ///
+    /// The artifact snapshot cannot catch a mapping bug here: it is generated
+    /// by, and compared against, this same code path, so a swapped or dropped
+    /// field would be baked into both sides at once. These expectations are
+    /// stated independently of the mapping.
+    #[test]
+    fn planned_object_docs_carry_the_typed_null_semantics() {
+        let contract = step_4b_contract();
+        let doc = |name: &str| {
+            contract
+                .planned_objects
+                .iter()
+                .find(|d| d.name == name)
+                .unwrap_or_else(|| panic!("`{name}` must appear in the contract"))
+        };
+
+        // A foreign key whose local key contains a pre-existing NULL-able
+        // column: MATCH SIMPLE leaves those rows unchecked.
+        let unchecked = doc("memories_archival_batch_tenant_fkey");
+        assert_eq!(unchecked.unenforced_when_null, Some(true));
+        assert_eq!(
+            unchecked.match_semantics,
+            Some(plan::MatchSemantics::NullKeyRowsUnchecked)
+        );
+        assert_eq!(unchecked.nullable_local_columns, vec!["archival_batch_id"]);
+
+        // A foreign key whose local columns are all NOT NULL once created.
+        let checked = doc("memory_versions_memory_tenant_fkey");
+        assert_eq!(checked.unenforced_when_null, Some(false));
+        assert_eq!(
+            checked.match_semantics,
+            Some(plan::MatchSemantics::AllRowsChecked)
+        );
+        assert!(checked.nullable_local_columns.is_empty());
+
+        // A non-foreign-key object has no MATCH question to answer.
+        let index = doc("idx_memories_tenant");
+        assert_eq!(index.unenforced_when_null, None);
+        assert_eq!(index.match_semantics, None);
+
+        // Every doc must agree with itself about whether anything is created.
+        for doc in &contract.planned_objects {
+            assert_eq!(
+                doc.requires_creation,
+                doc.creating_tranche.is_some(),
+                "`{}` disagrees with itself about being created",
+                doc.name
+            );
+            assert_eq!(
+                doc.requires_creation,
+                doc.creation_lock.is_some(),
+                "`{}` disagrees with itself about taking a creation lock",
+                doc.name
+            );
+            // …and the derived flag must match the columns it was derived from.
+            assert_eq!(
+                doc.unenforced_when_null,
+                doc.match_semantics
+                    .map(|s| s == plan::MatchSemantics::NullKeyRowsUnchecked),
+                "`{}` disagrees with itself about MATCH semantics",
+                doc.name
+            );
+            if doc.unenforced_when_null == Some(true) {
+                assert!(
+                    !doc.nullable_local_columns.is_empty(),
+                    "`{}` is marked unenforced but names no NULL-able column",
+                    doc.name
+                );
+            }
+        }
     }
 
     #[test]

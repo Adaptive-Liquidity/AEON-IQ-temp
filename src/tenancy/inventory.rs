@@ -698,6 +698,29 @@ const LINEAGE_CODES: &[ReasonCode] = &[
     ReasonCode::OwnershipPathDisagreement,
 ];
 
+/// For `co_access_edges`, the one lineage child with no agent column at all.
+///
+/// `ORPHANED_AGENT_REFERENCE` is deliberately **absent** on top of the omission
+/// [`LINEAGE_CODES`] already makes. That code is produced only by the audit's
+/// `orphan_reason` for an `AgentText` or `AgentUuid` path, and this table has
+/// neither: its canonical and secondary paths are both `Memory`,
+/// so a missing parent there raises `ORPHANED_MEMORY_REFERENCE` instead. Keeping
+/// it made the gate look stricter than it was.
+///
+/// `LEGACY_UNMAPPED` and `UNMAPPED_AGENT` stay. They are not agent-column codes:
+/// they come off the canonical chain, which for this table runs
+/// `memory_a -> memories.agent_id -> agents.tenant_id`. An edge whose memory
+/// belongs to an agent with a NULL `tenant_id` still fires `UNMAPPED_AGENT`
+/// transitively, so those gates can and do fail.
+const CO_ACCESS_CODES: &[ReasonCode] = &[
+    ReasonCode::LegacyUnmapped,
+    ReasonCode::UnmappedAgent,
+    ReasonCode::UnresolvableOwner,
+    ReasonCode::NullOwnershipLink,
+    ReasonCode::CrossTenantParentChild,
+    ReasonCode::OwnershipPathDisagreement,
+];
+
 const WORKER_PATHS: &[&str] = &["rmk_worker", "extraction_worker", "hnsw_maintenance"];
 const ARCHIVAL_PATHS: &[&str] = &["archival worker", "POST /memories", "GET /memories"];
 
@@ -918,7 +941,9 @@ pub const REGISTRY: &[TableEntry] = &[
             "UPDATE archival_batches b SET agent_uuid = a.id, tenant_id = a.tenant_id \
              FROM agents a WHERE a.agent_id = b.agent_id",
             "VALIDATE CONSTRAINT after backfill",
-            "ADD COLUMN NULL is metadata-only; the FK validation takes SHARE ROW EXCLUSIVE",
+            "ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE ROW \
+             EXCLUSIVE on this table and on agents, and VALIDATE takes the weaker SHARE UPDATE \
+             EXCLUSIVE here with ROW SHARE on agents",
             &["memories (memories.archival_batch_id references this table)"],
             ARCHIVAL_PATHS,
         ),
@@ -1003,11 +1028,12 @@ pub const REGISTRY: &[TableEntry] = &[
             initial_nullability: NULLABLE_THEN_TIGHTENED,
             backfill_source: "UPDATE co_access_edges e SET tenant_id = m.tenant_id FROM memories \
                               m WHERE m.id = e.memory_a, only where memory_a and memory_b agree",
-            required_zero_codes: LINEAGE_CODES,
+            required_zero_codes: CO_ACCESS_CODES,
             validate_step: Some("VALIDATE both constraints after backfill"),
             future_uniqueness: None,
             future_unique_columns: None,
-            lock_profile: "two FK validations, each SHARE ROW EXCLUSIVE on memories",
+            lock_profile: "two FK validations, each SHARE UPDATE EXCLUSIVE on co_access_edges \
+                           with ROW SHARE on memories — concurrent DML continues throughout",
             rollback_dependencies: &["memories (tranche 3)"],
             inactive_paths: &["co-access edge maintenance", "retrieval scoring"],
         },
@@ -1181,7 +1207,9 @@ pub const REGISTRY: &[TableEntry] = &[
                  omission.",
             ),
             future_unique_columns: None,
-            lock_profile: "ADD COLUMN NULL is metadata-only; validation is SHARE ROW EXCLUSIVE",
+            lock_profile: "ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE \
+                           ROW EXCLUSIVE on this table and on agents, and VALIDATE takes the \
+                           weaker SHARE UPDATE EXCLUSIVE here with ROW SHARE on agents",
             rollback_dependencies: &["memory_entity_links (tranche 4)"],
             inactive_paths: &["extraction_worker", "POST /entities"],
         },

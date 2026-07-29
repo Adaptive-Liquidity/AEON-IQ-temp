@@ -80,10 +80,13 @@ impl std::fmt::Display for Stage {
 /// rather than in an external runner, so it holds however the migration is
 /// invoked.
 pub const FINALIZE_GUARD: &str = "FINALIZE migrations open with a guard that raises unless \
-     agent_tenancy_migrations records a completed backfill checkpoint for the tranche. \
-     `sqlx migrate run` therefore cannot advance PREPARE straight into FINALIZE: on a fresh \
-     database the guard fires because no backfill ran, and on a live database it fires until \
-     the operator's backfill command records completion.";
+     tenancy_backfill_checkpoints records a COMPLETED checkpoint for *this* tranche against the \
+     current contract digest with blocking_count = 0. `sqlx migrate run` therefore cannot advance \
+     PREPARE straight into FINALIZE: on a fresh database the guard fires because no backfill ran, \
+     and on a live database it fires until the operator's backfill command records completion. \
+     agent_tenancy_migrations cannot serve as that evidence — it has no tranche, no digest, no \
+     cursor and no status column — so Step 4B-1 must create the checkpoint table before the first \
+     backfill runs.";
 
 /// `CREATE INDEX CONCURRENTLY` cannot run inside a transaction block, and sqlx
 /// wraps each migration in one by default.
@@ -91,6 +94,222 @@ pub const CONCURRENT_BUILD_MECHANISM: &str = "A migration containing CREATE INDE
      must carry `-- no-transaction` as its first line so sqlx runs it unwrapped. A concurrent \
      build that fails leaves an INVALID index behind, which the Step 4A verifier already \
      reports as drift, so a failed build cannot be mistaken for a healthy one.";
+
+// ── Backfill checkpoint evidence ────────────────────────────────────────────
+
+/// What a checkpoint row is worth as evidence.
+///
+/// `Completed` is the only status FINALIZE accepts, and it is not a free-text
+/// label: the guard compares it, so it has to be a value rather than a string
+/// some future writer can spell differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckpointStatus {
+    /// Batches are still running. The cursor is meaningful; the completion is
+    /// not.
+    InProgress,
+    /// Every batch for the tranche finished and the audit reported zero blocking
+    /// findings for it. This is the only status FINALIZE accepts.
+    Completed,
+    /// Superseded — the contract digest moved, or an operator restarted the
+    /// tranche. Retained for history and never treated as completion.
+    Abandoned,
+}
+
+impl CheckpointStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "IN_PROGRESS",
+            Self::Completed => "COMPLETED",
+            Self::Abandoned => "ABANDONED",
+        }
+    }
+
+    pub const ALL: &'static [CheckpointStatus] =
+        &[Self::InProgress, Self::Completed, Self::Abandoned];
+}
+
+/// Why a checkpoint column exists, so the invariant can check the table covers
+/// every category the protocol depends on rather than counting columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckpointColumnRole {
+    Identity,
+    /// Which tranche this checkpoint is evidence for.
+    Tranche,
+    /// The contract the backfill ran against. A checkpoint recorded against a
+    /// superseded plan is not evidence for the current one.
+    ContractDigest,
+    Status,
+    /// Where a stopped backfill resumes. Without it BACKFILL is restartable only
+    /// by starting over.
+    ResumableCursor,
+    RowCount,
+    /// Blocking audit findings outstanding for the tranche. FINALIZE requires
+    /// zero.
+    BlockingCount,
+    Timestamp,
+}
+
+/// One column of a table Step 4B-1 must create.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlannedTableColumn {
+    pub name: &'static str,
+    pub sql_type: &'static str,
+    pub nullable: bool,
+    pub role: CheckpointColumnRole,
+}
+
+const fn ckpt(
+    name: &'static str,
+    sql_type: &'static str,
+    nullable: bool,
+    role: CheckpointColumnRole,
+) -> PlannedTableColumn {
+    PlannedTableColumn {
+        name,
+        sql_type,
+        nullable,
+        role,
+    }
+}
+
+/// A table Step 4B intends to create outright, as opposed to a column added to
+/// an existing one.
+///
+/// There is exactly one, and it exists because the protocol asserts against
+/// evidence that has nowhere to live today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlannedTable {
+    pub name: &'static str,
+    pub purpose: &'static str,
+    pub columns: &'static [PlannedTableColumn],
+    /// The tuple on which at most one authoritative completion may exist.
+    pub unique_completion: &'static [&'static str],
+    /// The status the uniqueness is *scoped to*, making it a partial unique
+    /// index rather than a plain constraint.
+    ///
+    /// The scope is load-bearing and cannot be left implicit. A plain
+    /// `UNIQUE (tranche, contract_digest)` would reject the second row an
+    /// operator creates when restarting a tranche against the same digest —
+    /// but [`CheckpointStatus::Abandoned`] exists precisely so that the
+    /// superseded attempt is *retained* rather than overwritten. Only
+    /// `WHERE status = 'COMPLETED'` gives "at most one authoritative
+    /// completion" while leaving the history alone.
+    pub unique_completion_when: CheckpointStatus,
+    pub creating_tranche: Tranche,
+    /// What has to land in the same change, so the new table cannot be created
+    /// outside the contract that describes it.
+    pub joins_contract: &'static str,
+}
+
+/// The per-tranche checkpoint table.
+///
+/// `agent_tenancy_migrations` cannot serve this purpose. Measured against a
+/// pg16 with all 31 migrations applied, its columns are exactly `id`, `mode`,
+/// `legacy_tenant_id`, `agents_total`, `agents_assigned`, `agents_unmapped` and
+/// `applied_at`. There is no tranche, no digest, no cursor and no status — so it
+/// can record *that* a one-shot agent assignment happened, but not *which*
+/// tranche completed, *against which contract*, or *where to resume*. A FINALIZE
+/// guard reading it would assert against the wrong evidence and pass.
+pub const TENANCY_BACKFILL_CHECKPOINTS: PlannedTable = PlannedTable {
+    name: "tenancy_backfill_checkpoints",
+    purpose: "Per-tranche, per-contract backfill evidence. BACKFILL writes progress here and \
+              FINALIZE refuses to proceed without a COMPLETED row for its own tranche against \
+              the current contract digest with zero blocking findings.",
+    columns: &[
+        ckpt("id", "UUID", false, CheckpointColumnRole::Identity),
+        ckpt("tranche", "TEXT", false, CheckpointColumnRole::Tranche),
+        ckpt(
+            "contract_digest",
+            "TEXT",
+            false,
+            CheckpointColumnRole::ContractDigest,
+        ),
+        ckpt("status", "TEXT", false, CheckpointColumnRole::Status),
+        // NULL once the tranche completes: there is nothing left to resume.
+        ckpt(
+            "resume_cursor",
+            "TEXT",
+            true,
+            CheckpointColumnRole::ResumableCursor,
+        ),
+        ckpt(
+            "rows_total",
+            "BIGINT",
+            false,
+            CheckpointColumnRole::RowCount,
+        ),
+        ckpt(
+            "rows_backfilled",
+            "BIGINT",
+            false,
+            CheckpointColumnRole::RowCount,
+        ),
+        ckpt(
+            "blocking_count",
+            "BIGINT",
+            false,
+            CheckpointColumnRole::BlockingCount,
+        ),
+        ckpt(
+            "started_at",
+            "TIMESTAMPTZ",
+            false,
+            CheckpointColumnRole::Timestamp,
+        ),
+        ckpt(
+            "updated_at",
+            "TIMESTAMPTZ",
+            false,
+            CheckpointColumnRole::Timestamp,
+        ),
+        ckpt(
+            "completed_at",
+            "TIMESTAMPTZ",
+            true,
+            CheckpointColumnRole::Timestamp,
+        ),
+    ],
+    unique_completion: &["tranche", "contract_digest"],
+    unique_completion_when: CheckpointStatus::Completed,
+    creating_tranche: Tranche::RootsAndDirectAgentChildren,
+    joins_contract: "Created in the PREPARE of the first tranche, before any backfill runs. The \
+                     same change registers it in the Step 4A inventory REGISTRY and the \
+                     current-schema contract, so the table cannot exist as an unregistered \
+                     side-table the verifier reports as drift.",
+};
+
+pub const PLANNED_TABLES: &[PlannedTable] = &[TENANCY_BACKFILL_CHECKPOINTS];
+
+/// What FINALIZE checks before it validates anything.
+///
+/// Typed rather than prose because the guard is the whole reason PREPARE cannot
+/// run straight into FINALIZE, and "a completed backfill checkpoint" left three
+/// questions unanswered: completed for *which* tranche, against *which*
+/// contract, and with how many blocking findings outstanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FinalizePrecondition {
+    pub required_status: CheckpointStatus,
+    /// The checkpoint's tranche must equal the finalizing tranche exactly. A
+    /// later tranche's completion is not evidence for an earlier one, and a
+    /// tranche-agnostic "any completion" check is how FINALIZE would validate a
+    /// table nobody backfilled.
+    pub tranche_must_match_exactly: bool,
+    /// The checkpoint's digest must equal the current contract digest. A
+    /// backfill that ran against a superseded plan proves nothing about this
+    /// one.
+    pub digest_must_match_current: bool,
+    /// Outstanding blocking findings permitted at FINALIZE.
+    pub max_blocking_count: i64,
+}
+
+pub const FINALIZE_PRECONDITION: FinalizePrecondition = FinalizePrecondition {
+    required_status: CheckpointStatus::Completed,
+    tranche_must_match_exactly: true,
+    digest_must_match_current: true,
+    max_blocking_count: 0,
+};
 
 // ── Lock profiles ───────────────────────────────────────────────────────────
 
@@ -115,6 +334,16 @@ pub enum LockProfile {
     /// Blocks writes to both for the duration of the catalog change, which with
     /// `NOT VALID` is brief because no rows are examined.
     AddForeignKeyNotValid,
+    /// `ACCESS EXCLUSIVE` on the table alone, and brief: a CHECK constraint
+    /// added `NOT VALID` examines no rows and names no parent.
+    ///
+    /// Separate from [`Self::AddForeignKeyNotValid`] because the two differ on
+    /// both axes that matter operationally. A CHECK takes the *stronger* lock —
+    /// `ACCESS EXCLUSIVE` blocks reads, `SHARE ROW EXCLUSIVE` does not — but
+    /// takes it on one table instead of two. Describing a CHECK with the
+    /// foreign-key profile would promise a lock that permits concurrent reads
+    /// and would name a referenced table that does not exist.
+    AddCheckNotValid,
     /// `SHARE UPDATE EXCLUSIVE` on the child and `ROW SHARE` on the referenced
     /// table. Scans every row, but concurrent DML continues throughout.
     ValidateConstraint,
@@ -132,7 +361,8 @@ impl LockProfile {
         match self {
             Self::AddColumnNullable => "ADD COLUMN NULL",
             Self::CreateIndexConcurrently => "CREATE INDEX CONCURRENTLY",
-            Self::AddForeignKeyNotValid => "ADD CONSTRAINT ... NOT VALID",
+            Self::AddForeignKeyNotValid => "ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID",
+            Self::AddCheckNotValid => "ADD CONSTRAINT ... CHECK ... NOT VALID",
             Self::ValidateConstraint => "VALIDATE CONSTRAINT",
             Self::SetNotNull => "SET NOT NULL",
             Self::TableRewrite => "table rewrite",
@@ -150,6 +380,10 @@ impl LockProfile {
             Self::AddForeignKeyNotValid => {
                 "SHARE ROW EXCLUSIVE on the child AND on the referenced table"
             }
+            Self::AddCheckNotValid => {
+                "ACCESS EXCLUSIVE on the table alone, brief — no row scan, and no parent is \
+                 locked alongside it"
+            }
             Self::ValidateConstraint => {
                 "SHARE UPDATE EXCLUSIVE on the child, ROW SHARE on the referenced table"
             }
@@ -163,6 +397,7 @@ impl LockProfile {
         Self::AddColumnNullable,
         Self::CreateIndexConcurrently,
         Self::AddForeignKeyNotValid,
+        Self::AddCheckNotValid,
         Self::ValidateConstraint,
         Self::SetNotNull,
         Self::TableRewrite,
@@ -194,14 +429,75 @@ impl Nullability {
     }
 }
 
+/// Columns the live schema already permits to be NULL, as `(table, column)`.
+///
+/// Keyed on the pair and never on the name alone, because the same name has
+/// different nullability on different tables: `memory_id` is NOT NULL on
+/// `memory_versions` and `memory_entity_links` but NULL-able on
+/// `retrieval_feedback`; `memory_a`/`memory_b` are NOT NULL on
+/// `co_access_edges` and NULL-able on `memory_conflicts`. A name-keyed list got
+/// this wrong in both directions at once — it marked keys unenforced that are
+/// fully enforced, and left keys enforced that `MATCH SIMPLE` silently skips.
+///
+/// Measured against a pg16 with all 31 migrations applied.
+pub const PRE_EXISTING_NULLABLE: &[(&str, &str)] = &[
+    ("memories", "archival_batch_id"),
+    ("memory_conflicts", "memory_a"),
+    ("memory_conflicts", "memory_b"),
+    ("retrieval_feedback", "memory_id"),
+    ("rmk_episodes", "policy_id"),
+];
+
+/// How a foreign key treats rows whose local key contains a NULL.
+///
+/// Typed so a consumer can branch on it. Previously the only statement of this
+/// was a clause appended to the rendered description — so anything that needed
+/// to know had to substring-match English prose, which is exactly the kind of
+/// second, drifting copy this module exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MatchSemantics {
+    /// No local column can be NULL, so the constraint checks every row and the
+    /// key really is evidence that they are owned.
+    AllRowsChecked,
+    /// The default `MATCH SIMPLE`: a row with *any* NULL in the key is not
+    /// checked against the parent at all. The key is therefore not evidence of
+    /// ownership for those rows — the audit is.
+    NullKeyRowsUnchecked,
+}
+
+impl MatchSemantics {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllRowsChecked => "ALL_ROWS_CHECKED",
+            Self::NullKeyRowsUnchecked => "MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED",
+        }
+    }
+}
+
 /// Whether a unique target already exists or has to be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TargetStatus {
     /// Present in the live schema today and verified by the Step 4A audit.
+    ///
+    /// This is an operational statement, not a note. Nothing creates it: it has
+    /// no creating tranche, takes no creation lock, and must never reach a
+    /// PREPARE worklist. It stays in the plan solely so that a foreign key
+    /// depending on it can prove its parent tuple is covered — a dependency
+    /// prerequisite, not a unit of work. Emitting `CREATE UNIQUE INDEX
+    /// CONCURRENTLY` for it would fail against the index that already exists.
     AlreadyCurrent,
     /// Created by Step 4B in its owning tranche.
     CreatedByStep4b,
+}
+
+impl TargetStatus {
+    /// Whether Step 4B has to build this, or the live schema already provides
+    /// it.
+    pub const fn requires_creation(self) -> bool {
+        matches!(self, Self::CreatedByStep4b)
+    }
 }
 
 /// The kind of a planned non-key constraint.
@@ -335,7 +631,24 @@ impl PlannedObject {
         }
     }
 
-    pub const fn creating_tranche(&self) -> Tranche {
+    /// Whether Step 4B has to build this object at all.
+    ///
+    /// False only for a unique target the live schema already provides.
+    pub const fn requires_creation(&self) -> bool {
+        match self {
+            Self::UniqueTarget { status, .. } => status.requires_creation(),
+            _ => true,
+        }
+    }
+
+    /// The tranche this object is declared under, whether or not anything is
+    /// built for it.
+    ///
+    /// Used for grouping and for dependency ordering. Distinct from
+    /// [`Self::creating_tranche`], which is `None` when nothing is created —
+    /// keeping the two apart is what stops an already-current target being
+    /// scheduled as work simply because it is filed under a tranche.
+    pub const fn declared_in(&self) -> Tranche {
         match self {
             Self::Column {
                 creating_tranche, ..
@@ -355,18 +668,75 @@ impl PlannedObject {
         }
     }
 
+    /// The tranche that creates this object, or `None` when the live schema
+    /// already provides it and there is nothing to create.
+    pub const fn creating_tranche(&self) -> Option<Tranche> {
+        if self.requires_creation() {
+            Some(self.declared_in())
+        } else {
+            None
+        }
+    }
+
     /// The tranche whose FINALIZE stage validates this object. Equal to the
-    /// creating tranche for everything that is not deliberately deferred.
-    pub const fn validating_tranche(&self) -> Tranche {
+    /// creating tranche for everything that is not deliberately deferred, and
+    /// `None` for an object nothing creates — there is nothing to validate.
+    pub const fn validating_tranche(&self) -> Option<Tranche> {
         match self {
             Self::ForeignKey {
                 validating_tranche, ..
             }
             | Self::Constraint {
                 validating_tranche, ..
-            } => *validating_tranche,
+            } => Some(*validating_tranche),
             _ => self.creating_tranche(),
         }
+    }
+
+    /// Whether a NULL in this object's local key leaves rows unchecked.
+    ///
+    /// `None` for anything that is not a foreign key — the question does not
+    /// apply.
+    pub const fn unenforced_when_null(&self) -> Option<bool> {
+        match self {
+            Self::ForeignKey {
+                unenforced_when_null,
+                ..
+            } => Some(*unenforced_when_null),
+            _ => None,
+        }
+    }
+
+    /// The `MATCH SIMPLE` consequence, as a value rather than a clause appended
+    /// to rendered prose.
+    pub const fn match_semantics(&self) -> Option<MatchSemantics> {
+        match self.unenforced_when_null() {
+            Some(true) => Some(MatchSemantics::NullKeyRowsUnchecked),
+            Some(false) => Some(MatchSemantics::AllRowsChecked),
+            None => None,
+        }
+    }
+
+    /// Which of this object's local columns can actually contain NULL.
+    ///
+    /// Two sources: a column the live schema already permits to be NULL, and a
+    /// column Step 4B plans as permanently NULL-able. A `NullableThenTightened`
+    /// column does not count — it is NULL only during the transition, and
+    /// FUTURE STEP 7 closes it.
+    pub fn nullable_local_columns(&self) -> Vec<&'static str> {
+        let table = self.table();
+        self.local_columns()
+            .iter()
+            .copied()
+            .filter(|column| {
+                PRE_EXISTING_NULLABLE.contains(&(table, column))
+                    || PLANNED_OBJECTS.iter().any(|p| {
+                        p.table() == table
+                            && p.name() == *column
+                            && p.nullability() == Some(Nullability::RemainsNullable)
+                    })
+            })
+            .collect()
     }
 
     /// Whether this object may be added `NOT VALID` and validated later.
@@ -379,19 +749,32 @@ impl PlannedObject {
     }
 
     /// Whether the build must run outside a transaction block.
+    ///
+    /// An already-current target is not built, so it dictates nothing about any
+    /// migration file's `-- no-transaction` header.
     pub const fn concurrent_build_required(&self) -> bool {
-        matches!(self, Self::Index { .. } | Self::UniqueTarget { .. })
+        self.requires_creation() && matches!(self, Self::Index { .. } | Self::UniqueTarget { .. })
     }
 
-    /// The lock this object's creation takes.
-    pub const fn creation_lock(&self) -> LockProfile {
+    /// The lock this object's creation takes, or `None` when nothing is created.
+    pub const fn creation_lock(&self) -> Option<LockProfile> {
+        if !self.requires_creation() {
+            return None;
+        }
+        Some(self.creation_lock_kind())
+    }
+
+    const fn creation_lock_kind(&self) -> LockProfile {
         match self {
             Self::Column { .. } => LockProfile::AddColumnNullable,
             // A unique target is built CONCURRENTLY and attached with
             // `ADD CONSTRAINT ... USING INDEX`, so the strong lock is held only
             // for the attach rather than for the whole build.
             Self::Index { .. } | Self::UniqueTarget { .. } => LockProfile::CreateIndexConcurrently,
-            Self::ForeignKey { .. } | Self::Constraint { .. } => LockProfile::AddForeignKeyNotValid,
+            Self::ForeignKey { .. } => LockProfile::AddForeignKeyNotValid,
+            // A CHECK names no parent, so it locks one table rather than two —
+            // but it locks it more strongly.
+            Self::Constraint { .. } => LockProfile::AddCheckNotValid,
         }
     }
 
@@ -488,26 +871,160 @@ impl PlannedObject {
 /// writer that knows nothing about the new columns. Without an answer the
 /// backfill converges on zero and then immediately diverges again, and the `SET
 /// NOT NULL` in step 7 fails against rows created in the interval.
+/// What a conditional bridge does with one incoming row.
+///
+/// "Ownership may remain NULL" was one answer to four different questions. It
+/// described agentless events correctly and everything else wrongly: a row that
+/// names a resolvable agent should be owned, a row that names an agent nothing
+/// can resolve should keep NULL ownership so the audit reports it, and a row
+/// that asserts a tenant contradicting `agents` should be refused rather than
+/// believed. Collapsing those into one blanket meant the third case looked
+/// identical to the first, which is precisely the case the audit exists to
+/// surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ConditionalOwnership {
+    /// The row names no agent at all. Legitimate: startup, configuration
+    /// change, administrative action. Ownership stays NULL and nothing is
+    /// reported, because there is nothing wrong.
+    AgentlessAllowed,
+    /// The row names an agent that resolves to a tenant. The bridge populates
+    /// both ownership columns from `agents` and verifies them against it.
+    ResolvedAndVerified,
+    /// The row names an agent that does not resolve — no such agent, or an
+    /// agent whose own `tenant_id` is NULL. The row is written with NULL
+    /// ownership rather than rejected, so the audit reports
+    /// `ORPHANED_AGENT_REFERENCE` or `UNMAPPED_AGENT` against it. Losing audit
+    /// history is a worse outcome than an unowned audit row, and a silently
+    /// dropped event is worse than both.
+    PreservedUnresolved,
+    /// The row supplies ownership that contradicts what `agents` says for its
+    /// own agent. Refused. A contradicted audit row is not evidence of
+    /// anything, and accepting it would let a caller write history under
+    /// another tenant.
+    ContradictionRejected,
+}
+
+impl ConditionalOwnership {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentlessAllowed => "AGENTLESS_ALLOWED",
+            Self::ResolvedAndVerified => "RESOLVED_AND_VERIFIED",
+            Self::PreservedUnresolved => "PRESERVED_UNRESOLVED",
+            Self::ContradictionRejected => "CONTRADICTION_REJECTED",
+        }
+    }
+
+    /// Every state a conditional bridge has to decide between. A bridge that
+    /// declares fewer has left a case undefined, and an undefined case in a
+    /// `BEFORE` trigger resolves to "write whatever arrived".
+    pub const ALL: &'static [ConditionalOwnership] = &[
+        Self::AgentlessAllowed,
+        Self::ResolvedAndVerified,
+        Self::PreservedUnresolved,
+        Self::ContradictionRejected,
+    ];
+}
+
+/// How a table's new ownership columns stay populated, and from which authority.
+///
+/// The original model had one bridge shape and assumed `agents` was always the
+/// answer. It is not: `working_memory` resolves through `sessions`,
+/// `memory_versions` and `co_access_edges` through `memories`, and five tables
+/// have more than one parent that must agree first. A single agents-shaped
+/// bridge on those tables would resolve from whichever parent it happened to
+/// join — which is exactly how a cross-tenant link becomes permanent, and it is
+/// the same failure the backfill's `agreement` predicate exists to prevent.
+///
+/// Each variant therefore names its authority, and an invariant checks that the
+/// authority matches the table's [`BackfillAuthority`]. Write-time and
+/// backfill-time must not be able to disagree about who owns a row.
+// The shared `Bridge` suffix is the point rather than an accident: every
+// variant *is* a bridge, and what distinguishes them is which authority they
+// resolve ownership from. Dropping the suffix would leave `Agent`, `Session`
+// and `Memory` as variants of a type whose name says nothing about bridging.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "strategy", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransitionalWrite {
-    /// A `BEFORE INSERT OR UPDATE` trigger that resolves the ownership columns
-    /// from `agents` whenever they arrive NULL, and raises when they arrive
-    /// contradicting the legacy identifier.
-    BridgeTrigger {
+    /// Ownership resolves from `agents` using the row's own legacy `agent_id`,
+    /// which is mandatory on this table. Raises on contradiction.
+    AgentBridge {
         trigger: &'static str,
         function: &'static str,
     },
-    /// Ownership may legitimately be absent, so no bridge is installed.
-    OwnershipMayRemainNull { reason: &'static str },
+    /// Ownership resolves from `agents`, but the agent reference is optional,
+    /// so the bridge decides between outcomes rather than having only one.
+    ///
+    /// The outcomes are [`ConditionalOwnership::ALL`] and are not carried as a
+    /// field: a per-bridge list would let a future conditional bridge declare
+    /// three of the four and compile, leaving the fourth case to resolve as
+    /// "write whatever arrived".
+    ConditionalAgentBridge {
+        trigger: &'static str,
+        function: &'static str,
+        reason: &'static str,
+    },
+    /// Ownership resolves through `sessions`, not through `agents` directly.
+    SessionBridge {
+        trigger: &'static str,
+        function: &'static str,
+    },
+    /// Ownership resolves through `memories`. Where the row references two
+    /// memories, both must agree before anything is written.
+    MemoryBridge {
+        trigger: &'static str,
+        function: &'static str,
+    },
+    /// More than one authority can answer "who owns this row", so the bridge
+    /// writes only when they agree and refuses when they do not. It never picks
+    /// a side.
+    MultiPathBridge {
+        trigger: &'static str,
+        function: &'static str,
+        parents: &'static [&'static str],
+    },
 }
 
 impl TransitionalWrite {
     pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::BridgeTrigger { .. } => "DATABASE_BRIDGE_TRIGGER",
-            Self::OwnershipMayRemainNull { .. } => "OWNERSHIP_MAY_REMAIN_NULL",
+            Self::AgentBridge { .. } => "AGENT_BRIDGE_TRIGGER",
+            Self::ConditionalAgentBridge { .. } => "CONDITIONAL_AGENT_BRIDGE_TRIGGER",
+            Self::SessionBridge { .. } => "SESSION_BRIDGE_TRIGGER",
+            Self::MemoryBridge { .. } => "MEMORY_BRIDGE_TRIGGER",
+            Self::MultiPathBridge { .. } => "MULTI_PATH_BRIDGE_TRIGGER",
         }
+    }
+
+    pub const fn trigger(&self) -> &'static str {
+        match self {
+            Self::AgentBridge { trigger, .. }
+            | Self::ConditionalAgentBridge { trigger, .. }
+            | Self::SessionBridge { trigger, .. }
+            | Self::MemoryBridge { trigger, .. }
+            | Self::MultiPathBridge { trigger, .. } => trigger,
+        }
+    }
+
+    pub const fn function(&self) -> &'static str {
+        match self {
+            Self::AgentBridge { function, .. }
+            | Self::ConditionalAgentBridge { function, .. }
+            | Self::SessionBridge { function, .. }
+            | Self::MemoryBridge { function, .. }
+            | Self::MultiPathBridge { function, .. } => function,
+        }
+    }
+
+    /// Whether this bridge resolves ownership from somewhere other than the
+    /// row's own agent — in which case the table must also declare a
+    /// [`BackfillAuthority`], and the two must agree.
+    pub const fn resolves_through_a_parent(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionBridge { .. } | Self::MemoryBridge { .. } | Self::MultiPathBridge { .. }
+        )
     }
 }
 
@@ -539,8 +1056,28 @@ pub const TRANSITIONAL_WRITE_GUARANTEE: &str = "After historical backfill comple
 
 // ── Per-table transitional strategy ─────────────────────────────────────────
 
-const fn bridge(trigger: &'static str, function: &'static str) -> TransitionalWrite {
-    TransitionalWrite::BridgeTrigger { trigger, function }
+const fn agent_bridge(trigger: &'static str, function: &'static str) -> TransitionalWrite {
+    TransitionalWrite::AgentBridge { trigger, function }
+}
+
+const fn session_bridge(trigger: &'static str, function: &'static str) -> TransitionalWrite {
+    TransitionalWrite::SessionBridge { trigger, function }
+}
+
+const fn memory_bridge(trigger: &'static str, function: &'static str) -> TransitionalWrite {
+    TransitionalWrite::MemoryBridge { trigger, function }
+}
+
+const fn multi_path_bridge(
+    trigger: &'static str,
+    function: &'static str,
+    parents: &'static [&'static str],
+) -> TransitionalWrite {
+    TransitionalWrite::MultiPathBridge {
+        trigger,
+        function,
+        parents,
+    }
 }
 
 /// Every table receiving ownership columns, and how its new writes stay owned.
@@ -548,36 +1085,42 @@ pub const TRANSITION: &[(&str, TransitionalWrite)] = &[
     // ── Tranche 1 ──
     (
         "archival_batches",
-        bridge(
+        agent_bridge(
             "trg_archival_batches_tenancy_bridge",
             "fn_archival_batches_tenancy_bridge",
         ),
     ),
     (
         "audit_logs",
-        TransitionalWrite::OwnershipMayRemainNull {
+        TransitionalWrite::ConditionalAgentBridge {
+            trigger: "trg_audit_logs_tenancy_bridge",
+            function: "fn_audit_logs_tenancy_bridge",
             reason: "audit_logs records agentless events — startup, configuration change, \
-                     administrative action — which are valid rows with no owning agent. A bridge \
-                     that forced ownership would either invent an owner or reject the event, and \
-                     losing audit history is a worse outcome than an unowned audit row. Its \
-                     ownership columns stay NULL-able permanently, and LEGACY_UNMAPPED is \
-                     deliberately absent from its required-zero set.",
+                     administrative action — which are valid rows with no owning agent, so its \
+                     ownership columns stay NULL-able permanently and LEGACY_UNMAPPED is \
+                     deliberately absent from its required-zero set. That is not a reason to \
+                     install no bridge. Declining to resolve ownership at all also declines it \
+                     for the rows that *do* name a resolvable agent, which then stay NULL for no \
+                     reason and are indistinguishable from genuinely agentless ones. The bridge \
+                     is therefore conditional rather than absent: it owns what it can resolve, \
+                     leaves what it cannot so the audit reports it, and refuses a row that \
+                     contradicts agents outright.",
         },
     ),
     (
         "entities",
-        bridge("trg_entities_tenancy_bridge", "fn_entities_tenancy_bridge"),
+        agent_bridge("trg_entities_tenancy_bridge", "fn_entities_tenancy_bridge"),
     ),
     (
         "memory_graph",
-        bridge(
+        agent_bridge(
             "trg_memory_graph_tenancy_bridge",
             "fn_memory_graph_tenancy_bridge",
         ),
     ),
     (
         "rmk_policies",
-        bridge(
+        agent_bridge(
             "trg_rmk_policies_tenancy_bridge",
             "fn_rmk_policies_tenancy_bridge",
         ),
@@ -585,11 +1128,11 @@ pub const TRANSITION: &[(&str, TransitionalWrite)] = &[
     // ── Tranche 2 ──
     (
         "sessions",
-        bridge("trg_sessions_tenancy_bridge", "fn_sessions_tenancy_bridge"),
+        agent_bridge("trg_sessions_tenancy_bridge", "fn_sessions_tenancy_bridge"),
     ),
     (
         "working_memory",
-        bridge(
+        session_bridge(
             "trg_working_memory_tenancy_bridge",
             "fn_working_memory_tenancy_bridge",
         ),
@@ -597,75 +1140,83 @@ pub const TRANSITION: &[(&str, TransitionalWrite)] = &[
     // ── Tranche 3 ──
     (
         "memories",
-        bridge("trg_memories_tenancy_bridge", "fn_memories_tenancy_bridge"),
+        multi_path_bridge(
+            "trg_memories_tenancy_bridge",
+            "fn_memories_tenancy_bridge",
+            &["agents", "archival_batches"],
+        ),
     ),
     (
         "extraction_jobs",
-        bridge(
+        agent_bridge(
             "trg_extraction_jobs_tenancy_bridge",
             "fn_extraction_jobs_tenancy_bridge",
         ),
     ),
     (
         "memory_retrieval_logs",
-        bridge(
+        agent_bridge(
             "trg_memory_retrieval_logs_tenancy_bridge",
             "fn_memory_retrieval_logs_tenancy_bridge",
         ),
     ),
     (
         "cognitive_hypervisor_timeline",
-        bridge("trg_cht_tenancy_bridge", "fn_cht_tenancy_bridge"),
+        agent_bridge("trg_cht_tenancy_bridge", "fn_cht_tenancy_bridge"),
     ),
     // ── Tranche 4 ──
     (
         "memory_versions",
-        bridge(
+        memory_bridge(
             "trg_memory_versions_tenancy_bridge",
             "fn_memory_versions_tenancy_bridge",
         ),
     ),
     (
         "memory_entity_links",
-        bridge(
+        multi_path_bridge(
             "trg_memory_entity_links_tenancy_bridge",
             "fn_memory_entity_links_tenancy_bridge",
+            &["memories", "entities", "agents"],
         ),
     ),
     (
         "co_access_edges",
-        bridge(
+        memory_bridge(
             "trg_co_access_edges_tenancy_bridge",
             "fn_co_access_edges_tenancy_bridge",
         ),
     ),
     (
         "memory_conflicts",
-        bridge(
+        multi_path_bridge(
             "trg_memory_conflicts_tenancy_bridge",
             "fn_memory_conflicts_tenancy_bridge",
+            &["agents", "memories"],
         ),
     ),
     (
         "retrieval_feedback",
-        bridge(
+        multi_path_bridge(
             "trg_retrieval_feedback_tenancy_bridge",
             "fn_retrieval_feedback_tenancy_bridge",
+            &["agents", "memories"],
         ),
     ),
     // ── Tranche 5 ──
     (
         "amp_controller_state",
-        bridge(
+        agent_bridge(
             "trg_amp_controller_state_tenancy_bridge",
             "fn_amp_controller_state_tenancy_bridge",
         ),
     ),
     (
         "rmk_episodes",
-        bridge(
+        multi_path_bridge(
             "trg_rmk_episodes_tenancy_bridge",
             "fn_rmk_episodes_tenancy_bridge",
+            &["agents", "rmk_policies"],
         ),
     ),
 ];
@@ -1199,11 +1750,110 @@ pub fn planned_for(table: &str) -> Vec<&'static PlannedObject> {
         .collect()
 }
 
-/// Every planned object created by one tranche.
+/// Every planned object declared under one tranche, including any the live
+/// schema already provides.
 pub fn planned_in(tranche: Tranche) -> Vec<&'static PlannedObject> {
     PLANNED_OBJECTS
         .iter()
-        .filter(|o| o.creating_tranche() == tranche)
+        .filter(|o| o.declared_in() == tranche)
+        .collect()
+}
+
+/// The objects a tranche's PREPARE actually has to build.
+///
+/// Distinct from [`planned_in`] because an already-current unique target is
+/// declared under a tranche but created by nothing. Handing the full list to a
+/// migration generator would emit `CREATE UNIQUE INDEX CONCURRENTLY` for an
+/// index that already exists, which fails.
+pub fn prepare_worklist(tranche: Tranche) -> Vec<&'static PlannedObject> {
+    PLANNED_OBJECTS
+        .iter()
+        .filter(|o| o.creating_tranche() == Some(tranche))
+        .collect()
+}
+
+// ── Compatibility prerequisites ─────────────────────────────────────────────
+
+/// A code change that must be deployed, and its incompatible predecessors
+/// drained, before a planned object may be created at all.
+///
+/// `NOT VALID` is commonly read as "the constraint is not in force yet". It does
+/// not mean that. It means *existing rows are not scanned*; every `INSERT` and
+/// `UPDATE` after the constraint lands is checked in full. A foreign key added
+/// `NOT VALID` in PREPARE is therefore live against new writes from the instant
+/// the catalog change commits — so a writer that inserts the child before the
+/// parent starts failing at PREPARE, not at FINALIZE and not at FUTURE STEP 7.
+///
+/// This is the one place where the contract constrains application code rather
+/// than schema, which is why it is recorded as data: PREPARE for the owning
+/// tranche cannot be scheduled while the prerequisite is outstanding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CompatibilityPrerequisite {
+    /// The planned object that cannot be created until this is satisfied.
+    pub planned_object: &'static str,
+    /// The writer that is incompatible today, and what breaks.
+    pub blocker: &'static str,
+    /// The order the writer must use, parent first.
+    pub required_write_order: &'static [&'static str],
+    /// Both writes must land in one transaction. Correct ordering alone is not
+    /// enough: between two autocommit statements a concurrent reader sees a
+    /// session with no working memory, and a crash between them leaves the pair
+    /// half-written with no rollback.
+    pub single_transaction: bool,
+    /// The stage by which compatible writers must already be serving. `Prepare`
+    /// means deployed *before* PREPARE runs, not during it.
+    pub writers_deployed_before: Stage,
+    /// Old binaries keep the old order, so deploying the fix is not sufficient
+    /// while a previous release is still serving traffic.
+    pub drain_incompatible_binaries: bool,
+    /// What a rollback costs once the constraint exists.
+    pub rollback: &'static str,
+}
+
+/// Prerequisites outstanding at ff16d96.
+///
+/// Measured, not assumed: `upsert_working_memory` in `src/memory/store.rs`
+/// issues its `working_memory` INSERT first and mirrors into `sessions`
+/// second, as two separate statements executed on the pool rather than inside
+/// one transaction. Step 4B-0 does not change that code — it records that
+/// Step 4B-1 cannot schedule tranche 2's PREPARE until it has.
+pub const COMPATIBILITY_PREREQUISITES: &[CompatibilityPrerequisite] =
+    &[CompatibilityPrerequisite {
+        planned_object: "working_memory_session_fkey",
+        blocker: "upsert_working_memory inserts into working_memory first and mirrors into \
+                  sessions second, as two separate autocommit statements on the pool. Once \
+                  working_memory_session_fkey exists the first statement references a sessions \
+                  row the second has not written yet, so the first turn of every new session \
+                  fails. NOT VALID does not defer this: it exempts historical rows, never new \
+                  ones.",
+        required_write_order: &["sessions", "working_memory"],
+        single_transaction: true,
+        writers_deployed_before: Stage::Prepare,
+        drain_incompatible_binaries: true,
+        rollback: "Once the foreign key exists, rolling the application back to a release with \
+                   the old write order reintroduces the failure. A rollback therefore requires \
+                   either dropping working_memory_session_fkey or keeping a bridge that \
+                   materialises the parent session row before the child write. Rolling back the \
+                   binary alone is not a recovery path.",
+    }];
+
+/// The prerequisite blocking one planned object, if it has one.
+pub fn compatibility_prerequisite_for(object: &str) -> Option<&'static CompatibilityPrerequisite> {
+    COMPATIBILITY_PREREQUISITES
+        .iter()
+        .find(|p| p.planned_object == object)
+}
+
+/// Whether a tranche's PREPARE may be scheduled, or what blocks it.
+///
+/// The answer is a value rather than a comment so that a scheduler cannot start
+/// a tranche whose prerequisites are outstanding simply by not knowing about
+/// them.
+pub fn prepare_blockers(tranche: Tranche) -> Vec<&'static CompatibilityPrerequisite> {
+    PLANNED_OBJECTS
+        .iter()
+        .filter(|o| o.creating_tranche() == Some(tranche))
+        .filter_map(|o| compatibility_prerequisite_for(o.name()))
         .collect()
 }
 
@@ -1314,6 +1964,143 @@ pub fn backfill_authority_for(table: &str) -> Option<&'static BackfillAuthority>
     BACKFILL_AUTHORITY.iter().find(|b| b.table == table)
 }
 
+// ── Uniqueness transitions ──────────────────────────────────────────────────
+
+/// How a planned unique tuple relates to the one it replaces.
+///
+/// `future_unique_columns` is `None` on every table, so the pre-check query
+/// never runs. That is correct today and explains nothing: it records the
+/// conclusion without the reasoning that produced it. The reasoning is that
+/// only one of the three shapes below can turn two rows the schema currently
+/// permits into a collision. Naming all three makes the claim checkable, and
+/// makes it impossible to add a narrowing tuple later without also adding the
+/// probe that would have caught the collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UniquenessTransition {
+    /// The new tuple is already implied by a constraint that exists. Nothing
+    /// changes, so nothing can collide.
+    AlreadyImplied,
+    /// The new tuple distinguishes at least as finely as the old one. Rows that
+    /// are distinct today stay distinct, so no collision is possible.
+    Relaxation,
+    /// The new tuple distinguishes *less* finely. Rows the schema permits today
+    /// may collide under it, so a probe must prove they do not before the
+    /// constraint is created. This is the only shape that can fail.
+    Narrowing,
+}
+
+impl UniquenessTransition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyImplied => "ALREADY_IMPLIED",
+            Self::Relaxation => "RELAXATION",
+            Self::Narrowing => "NARROWING",
+        }
+    }
+
+    /// Whether this shape can produce a collision that does not exist today.
+    pub const fn can_collide(self) -> bool {
+        matches!(self, Self::Narrowing)
+    }
+
+    /// All three shapes. `Narrowing` has no instance in the current contract —
+    /// that is the finding, not an omission — so the taxonomy is published in
+    /// full rather than inferred from the entries that happen to exist.
+    pub const ALL: &'static [UniquenessTransition] =
+        &[Self::AlreadyImplied, Self::Relaxation, Self::Narrowing];
+}
+
+/// A uniqueness change together with the evidence its shape requires.
+///
+/// The probe is carried *inside* `Narrowing` rather than beside it as an
+/// `Option`. With two independent fields, `Narrowing` with no probe is
+/// representable, and the first contributor to add a real narrowing tuple by
+/// copying an existing entry — every one of which has no probe, because none of
+/// them narrows — would ship a compiling plan that skips the only check that
+/// can catch the collision. Here that pairing is unconstructable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "transition", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UniquenessChange {
+    AlreadyImplied,
+    Relaxation,
+    /// Deliberately has no instance in the current contract — that is the
+    /// finding, not an oversight, and
+    /// `the_current_contract_plans_no_narrowing` asserts it. The variant exists
+    /// so the shape is nameable and so the first real narrowing tuple cannot be
+    /// written without its probe.
+    #[allow(dead_code)]
+    Narrowing {
+        /// The query that proves no rows collide, run before the constraint is
+        /// created.
+        collision_probe: &'static str,
+    },
+}
+
+impl UniquenessChange {
+    /// The shape alone, for grouping and display.
+    pub const fn shape(&self) -> UniquenessTransition {
+        match self {
+            Self::AlreadyImplied => UniquenessTransition::AlreadyImplied,
+            Self::Relaxation => UniquenessTransition::Relaxation,
+            Self::Narrowing { .. } => UniquenessTransition::Narrowing,
+        }
+    }
+
+    pub const fn collision_probe(&self) -> Option<&'static str> {
+        match self {
+            Self::Narrowing { collision_probe } => Some(collision_probe),
+            _ => None,
+        }
+    }
+}
+
+/// One table's uniqueness change, classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlannedUniquenessTransition {
+    pub table: &'static str,
+    pub from: &'static [&'static str],
+    pub to: &'static [&'static str],
+    pub change: UniquenessChange,
+    pub reason: &'static str,
+}
+
+impl PlannedUniquenessTransition {
+    pub const fn shape(&self) -> UniquenessTransition {
+        self.change.shape()
+    }
+
+    pub const fn collision_probe(&self) -> Option<&'static str> {
+        self.change.collision_probe()
+    }
+}
+
+pub const UNIQUENESS_TRANSITIONS: &[PlannedUniquenessTransition] = &[
+    PlannedUniquenessTransition {
+        table: "sessions",
+        from: &["agent_id", "session_id"],
+        to: SESSION_IDENTITY,
+        change: UniquenessChange::Relaxation,
+        reason: "agent_uuid is a one-for-one re-identification of the legacy agent_id, and \
+                 tenant_id is added rather than substituted for anything. Two rows distinguished \
+                 by (agent_id, session_id) remain distinguished by (tenant_id, agent_uuid, \
+                 session_id), so nothing legal today can collide under the new tuple.",
+    },
+    PlannedUniquenessTransition {
+        table: "agents",
+        from: &[TENANT_ID, "external_agent_id"],
+        to: &[TENANT_ID, "external_agent_id"],
+        change: UniquenessChange::AlreadyImplied,
+        reason: "UNIQUE (tenant_id, external_agent_id) already exists. Step 4B adds no uniqueness \
+                 to agents, so the tuple is unchanged.",
+    },
+];
+
+/// The uniqueness transition planned for one table, if any.
+pub fn uniqueness_transition_for(table: &str) -> Option<&'static PlannedUniquenessTransition> {
+    UNIQUENESS_TRANSITIONS.iter().find(|t| t.table == table)
+}
+
 // ── Reason codes that are structurally unreachable ──────────────────────────
 
 /// A required-zero code that cannot currently fire, with the reason.
@@ -1357,6 +2144,18 @@ pub const UNREACHABLE_REQUIRED_ZERO: &[UnreachableCode] = &[
                  under drift and the drift is what blocks.",
     },
     UnreachableCode {
+        table: "co_access_edges",
+        code: ReasonCode::OrphanedAgentReference,
+        reason: "co_access_edges is the only table in the schema with no agent column. The audit \
+                 derives an orphan code from the path kind, and both of this table's paths — \
+                 memory_a and memory_b — are Memory paths, so a missing parent raises \
+                 ORPHANED_MEMORY_REFERENCE and never ORPHANED_AGENT_REFERENCE. Requiring it to be \
+                 zero was requiring zero of something that cannot be produced. LEGACY_UNMAPPED and \
+                 UNMAPPED_AGENT are *not* removed with it: those come off the canonical chain \
+                 memory_a -> memories.agent_id -> agents.tenant_id and remain reachable \
+                 transitively, so they stay in the required-zero set.",
+    },
+    UnreachableCode {
         table: "agents",
         code: ReasonCode::FutureTenantUniquenessCollision,
         reason: "a consequence of keeping session identity agent-scoped. No table in the plan \
@@ -1376,6 +2175,23 @@ pub const UNREACHABLE_REQUIRED_ZERO: &[UnreachableCode] = &[
 mod invariants {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The parent tables a backfill authority actually consults.
+    ///
+    /// Derived from the authority's own SQL rather than restated beside it, and
+    /// matched against the registry's table names so the vocabulary is closed —
+    /// an arbitrary substring search would happily "find" a parent in a column
+    /// name. Returning a set makes the comparison against a bridge's declared
+    /// parents exact in both directions, rather than a one-way containment
+    /// check that cannot notice a parent the bridge forgot.
+    fn authority_parents(authority: &BackfillAuthority) -> BTreeSet<&'static str> {
+        let sql = format!("{} {}", authority.source, authority.agreement.unwrap_or(""));
+        super::super::inventory::REGISTRY
+            .iter()
+            .map(|entry| entry.table)
+            .filter(|table| *table != authority.table && sql.contains(table))
+            .collect()
+    }
 
     fn unique_target_for(parent: &str, referenced: &[&str]) -> Option<&'static PlannedObject> {
         PLANNED_OBJECTS.iter().find(|candidate| {
@@ -1419,13 +2235,21 @@ mod invariants {
             };
             let target = unique_target_for(parent, referenced)
                 .expect("covered by every_planned_foreign_key_has_a_matching_unique_target");
+            let creating = object
+                .creating_tranche()
+                .expect("a referencing object is always created by a tranche");
+            // A target the live schema already provides is available from the
+            // start, so it can never be the later half of a dependency. This is
+            // the one thing an AlreadyCurrent target is retained for.
+            let Some(target_tranche) = target.creating_tranche() else {
+                continue;
+            };
             assert!(
-                target.creating_tranche() <= object.creating_tranche(),
-                "`{}` is created in {} but its target `{}` is not created until {}",
+                target_tranche <= creating,
+                "`{}` is created in {creating} but its target `{}` is not created until \
+                 {target_tranche}",
                 object.name(),
-                object.creating_tranche(),
-                target.name(),
-                target.creating_tranche()
+                target.name()
             );
         }
     }
@@ -1459,6 +2283,11 @@ mod invariants {
             if matches!(object, PlannedObject::Column { .. }) {
                 continue;
             }
+            // An object nothing creates cannot use a column too early: it is
+            // already in the live schema, and so are the columns it names.
+            let Some(used_at) = object.creating_tranche() else {
+                continue;
+            };
             for column in object.local_columns() {
                 let is_ownership_column = matches!(*column, "agent_uuid" | "tenant_id");
                 if !is_ownership_column {
@@ -1482,11 +2311,13 @@ mod invariants {
                             object.table()
                         )
                     });
+                let owner_tranche = owner
+                    .creating_tranche()
+                    .expect("a planned column is always created by a tranche");
                 assert!(
-                    owner.creating_tranche() <= object.creating_tranche(),
-                    "`{}` uses `{column}`, which is not created until {}",
-                    object.name(),
-                    owner.creating_tranche()
+                    owner_tranche <= used_at,
+                    "`{}` uses `{column}`, which is not created until {owner_tranche}",
+                    object.name()
                 );
             }
         }
@@ -1534,10 +2365,182 @@ mod invariants {
         assert!(
             matches!(
                 transition_for("audit_logs"),
-                Some(TransitionalWrite::OwnershipMayRemainNull { .. })
+                Some(TransitionalWrite::ConditionalAgentBridge { .. })
             ),
-            "audit_logs must declare that its ownership may remain NULL"
+            "audit_logs must declare a conditional bridge: its ownership may remain NULL, but \
+             only for the rows that genuinely have no owner"
         );
+    }
+
+    /// `audit_logs` must decide all four cases, not one.
+    ///
+    /// A blanket "ownership may remain NULL" answered the agentless case and
+    /// silently gave the same answer to three others — including a row that
+    /// contradicts `agents`, which must be refused rather than stored.
+    #[test]
+    fn audit_logs_declares_all_four_conditional_states() {
+        let Some(TransitionalWrite::ConditionalAgentBridge { reason, .. }) =
+            transition_for("audit_logs")
+        else {
+            panic!("audit_logs must declare a conditional bridge");
+        };
+        // The four states are not a per-bridge list any more — the variant
+        // means all of them — so what is left to check is that the taxonomy
+        // itself stays complete and duplicate-free.
+        let distinct: BTreeSet<ConditionalOwnership> =
+            ConditionalOwnership::ALL.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            ConditionalOwnership::ALL.len(),
+            "the conditional-ownership taxonomy lists a state twice"
+        );
+        // The two outcomes that are easiest to conflate: a row that cannot be
+        // resolved is kept so the audit reports it, a row that contradicts is
+        // refused. Collapsing either into the agentless case is the original
+        // defect.
+        for required in [
+            ConditionalOwnership::AgentlessAllowed,
+            ConditionalOwnership::ResolvedAndVerified,
+            ConditionalOwnership::PreservedUnresolved,
+            ConditionalOwnership::ContradictionRejected,
+        ] {
+            assert!(
+                distinct.contains(&required),
+                "{required:?} is missing from the taxonomy; an undefined case in a BEFORE trigger \
+                 resolves to writing whatever arrived"
+            );
+        }
+        assert!(
+            reason.contains("conditional rather than absent"),
+            "the reason must say why a bridge is installed at all"
+        );
+    }
+
+    /// A bridge that resolves through a parent must agree with the backfill.
+    ///
+    /// Write-time and backfill-time cannot be allowed to disagree about who owns
+    /// a row: if the trigger resolves from `agents` while the backfill resolves
+    /// through `sessions`, the same row gets two different owners depending on
+    /// which one reached it first.
+    #[test]
+    fn bridges_are_authority_aware_and_match_the_backfill() {
+        for (table, strategy) in TRANSITION {
+            let authority = backfill_authority_for(table);
+            match strategy {
+                TransitionalWrite::AgentBridge { .. }
+                | TransitionalWrite::ConditionalAgentBridge { .. } => {
+                    assert!(
+                        authority.is_none(),
+                        "`{table}` resolves straight from agents at write time but declares a \
+                         backfill authority; the two would disagree"
+                    );
+                }
+                TransitionalWrite::SessionBridge { .. } => {
+                    let authority = authority.unwrap_or_else(|| {
+                        panic!(
+                            "`{table}` bridges through sessions but declares no backfill \
+                                authority"
+                        )
+                    });
+                    assert!(
+                        authority.source.contains("sessions"),
+                        "`{table}` bridges through sessions but backfills from `{}`",
+                        authority.source
+                    );
+                }
+                TransitionalWrite::MemoryBridge { .. } => {
+                    let authority = authority.unwrap_or_else(|| {
+                        panic!(
+                            "`{table}` bridges through memories but declares no backfill \
+                                authority"
+                        )
+                    });
+                    assert!(
+                        authority.source.contains("memories"),
+                        "`{table}` bridges through memories but backfills from `{}`",
+                        authority.source
+                    );
+                }
+                TransitionalWrite::MultiPathBridge { parents, .. } => {
+                    let authority = authority.unwrap_or_else(|| {
+                        panic!(
+                            "`{table}` has multiple ownership paths but declares no backfill \
+                                authority"
+                        )
+                    });
+                    assert!(
+                        authority.agreement.is_some(),
+                        "`{table}` bridges multiple paths but its backfill has no agreement \
+                         predicate"
+                    );
+                    assert!(
+                        parents.len() >= 2,
+                        "`{table}` declares a multi-path bridge over fewer than two parents"
+                    );
+                    let declared: BTreeSet<&str> = parents.iter().copied().collect();
+                    assert_eq!(
+                        declared.len(),
+                        parents.len(),
+                        "`{table}` lists a parent twice"
+                    );
+                    // Exact in both directions. A one-way containment check
+                    // cannot notice a parent the bridge forgot, which is the
+                    // direction that lets write-time and backfill-time assign
+                    // different owners to the same row.
+                    assert_eq!(
+                        declared,
+                        authority_parents(authority),
+                        "`{table}`'s bridge and its backfill authority disagree about which \
+                         parents are consulted"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No bridge may pick a parent when its sources disagree.
+    ///
+    /// This is the property the whole authority-aware model exists for. A bridge
+    /// that resolves from whichever parent it joined first turns a cross-tenant
+    /// link into a permanent one, and does it at write time where no backfill
+    /// audit will ever see it.
+    #[test]
+    fn no_bridge_picks_a_side_when_parents_disagree() {
+        for (table, strategy) in TRANSITION {
+            if !strategy.resolves_through_a_parent() {
+                continue;
+            }
+            let authority =
+                backfill_authority_for(table).expect("checked by bridges_are_authority_aware");
+            assert!(
+                authority.agreement.is_some(),
+                "`{table}` resolves through a parent with no agreement predicate"
+            );
+            let on_disagreement = authority.on_disagreement;
+            assert!(
+                on_disagreement.contains("left NULL") && on_disagreement.contains("reported"),
+                "`{table}` must leave disagreeing rows NULL and report them, never choose: {}",
+                on_disagreement
+            );
+        }
+    }
+
+    /// Trigger and function names follow the schema's convention, so a bridge
+    /// cannot be half-declared.
+    #[test]
+    fn every_bridge_names_a_trigger_and_a_function() {
+        for (table, strategy) in TRANSITION {
+            assert!(
+                strategy.trigger().starts_with("trg_"),
+                "`{table}` names a trigger that breaks the convention: {}",
+                strategy.trigger()
+            );
+            assert!(
+                strategy.function().starts_with("fn_"),
+                "`{table}` names a function that breaks the convention: {}",
+                strategy.function()
+            );
+        }
     }
 
     /// Session identity stays agent-scoped. A tenant-scoped session key would
@@ -1636,47 +2639,132 @@ mod invariants {
     #[test]
     fn nullable_foreign_keys_are_marked_unenforced() {
         // Nullability is a property of (table, column), never of a column name.
-        // `memory_id` is NOT NULL on memory_versions and memory_entity_links but
-        // NULL-able on retrieval_feedback; `memory_a`/`memory_b` are NOT NULL on
-        // co_access_edges and NULL-able on memory_conflicts. Measured against a
-        // pg16 with all 31 migrations applied — a name-keyed list got this wrong
-        // in both directions.
-        const PRE_EXISTING_NULLABLE: &[(&str, &str)] = &[
-            ("memories", "archival_batch_id"),
-            ("memory_conflicts", "memory_a"),
-            ("memory_conflicts", "memory_b"),
-            ("retrieval_feedback", "memory_id"),
-            ("rmk_episodes", "policy_id"),
-        ];
+        // The measured pairs now live in `PRE_EXISTING_NULLABLE` at module
+        // level, so consumers get the same data the invariant checks.
         for object in PLANNED_OBJECTS {
-            let PlannedObject::ForeignKey {
-                table,
-                local_columns,
-                unenforced_when_null,
-                ..
-            } = object
-            else {
+            let Some(unenforced_when_null) = object.unenforced_when_null() else {
                 continue;
             };
-            // Two sources of NULL. A pre-existing column the schema already
-            // allows to be NULL, and a column Step 4B plans as permanently
-            // NULL-able — `audit_logs`, whose agentless events are valid rows
-            // with no owner. A NullableThenTightened column does not count: it
-            // is NULL only during the transition, and FUTURE STEP 7 closes it.
-            let has_nullable = local_columns.iter().any(|c| {
-                PRE_EXISTING_NULLABLE.contains(&(table, c))
-                    || PLANNED_OBJECTS.iter().any(|p| {
-                        p.table() == *table
-                            && p.name() == *c
-                            && p.nullability() == Some(Nullability::RemainsNullable)
-                    })
-            });
+            let nullable = object.nullable_local_columns();
             assert_eq!(
-                *unenforced_when_null,
-                has_nullable,
-                "`{}` disagrees with the live schema about whether its key can contain NULL; \
-                 MATCH SIMPLE leaves such rows unchecked, so the flag decides whether this key \
-                 is evidence of ownership",
+                unenforced_when_null,
+                !nullable.is_empty(),
+                "`{}` disagrees with the live schema about whether its key can contain NULL \
+                 (nullable local columns: {nullable:?}); MATCH SIMPLE leaves such rows unchecked, \
+                 so the flag decides whether this key is evidence of ownership",
+                object.name()
+            );
+            // The typed semantics and the flag are two views of one fact and
+            // may never disagree.
+            let expected = if unenforced_when_null {
+                MatchSemantics::NullKeyRowsUnchecked
+            } else {
+                MatchSemantics::AllRowsChecked
+            };
+            assert_eq!(object.match_semantics(), Some(expected));
+        }
+        // Every measured pair must name a table the registry knows, or the
+        // list has drifted from the schema it claims to describe.
+        for (table, _) in PRE_EXISTING_NULLABLE {
+            assert!(
+                super::super::inventory::entry(table).is_some(),
+                "`{table}` is recorded as having a NULL-able column but is not a registered table"
+            );
+        }
+        // A non-foreign-key object has no MATCH semantics to report.
+        for object in PLANNED_OBJECTS {
+            if object.referenced().is_none() {
+                assert_eq!(object.match_semantics(), None);
+                assert_eq!(object.unenforced_when_null(), None);
+            }
+        }
+    }
+
+    /// An already-current target is a dependency prerequisite, not a unit of
+    /// work.
+    ///
+    /// `AlreadyCurrent` used to be a label with no operational consequence: the
+    /// object still reported a creating tranche and a concurrent-build lock, so
+    /// anything generating DDL from a tranche's object list would emit `CREATE
+    /// UNIQUE INDEX CONCURRENTLY agents_tenant_id_id_key` — against the index
+    /// that already exists, which fails. It has to be excluded from the
+    /// worklist while staying in the plan, because fifteen foreign keys rely on
+    /// it to prove their parent tuple is covered.
+    #[test]
+    fn already_current_targets_are_never_scheduled_as_work() {
+        let target = PLANNED_OBJECTS
+            .iter()
+            .find(|o| o.name() == "agents_tenant_id_id_key")
+            .expect("agents declares the target its dependants rely on");
+
+        assert!(!target.requires_creation());
+        assert_eq!(target.creating_tranche(), None, "nothing creates it");
+        assert_eq!(target.creation_lock(), None, "nothing locks it");
+        assert_eq!(target.validating_tranche(), None, "nothing validates it");
+        assert!(
+            !target.concurrent_build_required(),
+            "nothing is built, so it dictates no `-- no-transaction` header"
+        );
+
+        // Excluded from every PREPARE worklist, in every tranche.
+        for tranche in Tranche::ALL {
+            assert!(
+                !prepare_worklist(*tranche)
+                    .iter()
+                    .any(|o| o.name() == target.name()),
+                "`{}` reached {}'s PREPARE worklist; generating DDL for it would fail against \
+                 the object already in the schema",
+                target.name(),
+                tranche
+            );
+        }
+
+        // Retained, though — and retained *for* something. If nothing depended
+        // on it, keeping it would be dead weight rather than a prerequisite.
+        assert!(
+            planned_in(target.declared_in())
+                .iter()
+                .any(|o| o.name() == target.name()),
+            "the target must stay in the plan so dependants can find it"
+        );
+        let dependants = PLANNED_OBJECTS
+            .iter()
+            .filter(|o| o.referenced() == Some(("agents", target.local_columns())))
+            .count();
+        assert!(
+            dependants > 0,
+            "`{}` is retained as a dependency prerequisite, but nothing depends on it",
+            target.name()
+        );
+
+        // Status and behaviour may never disagree.
+        for object in PLANNED_OBJECTS {
+            let PlannedObject::UniqueTarget { status, .. } = object else {
+                continue;
+            };
+            assert_eq!(
+                object.creating_tranche().is_some(),
+                status.requires_creation(),
+                "`{}` disagrees with its own status about whether it is created",
+                object.name()
+            );
+            assert_eq!(
+                object.creation_lock().is_some(),
+                status.requires_creation(),
+                "`{}` disagrees with its own status about whether it takes a lock",
+                object.name()
+            );
+        }
+
+        // Everything else in the plan is real work.
+        for object in PLANNED_OBJECTS {
+            if object.name() == target.name() {
+                continue;
+            }
+            assert!(
+                object.requires_creation(),
+                "`{}` is not created by anything; if that is deliberate, it needs a status that \
+                 says so",
                 object.name()
             );
         }
@@ -1687,10 +2775,13 @@ mod invariants {
     #[test]
     fn step_4b_plans_no_rewrite_and_no_blocking_scan() {
         for object in PLANNED_OBJECTS {
-            if object.creating_tranche() == Tranche::FinalConstraintTightening {
+            // Nothing is created, so nothing is locked.
+            let Some(lock) = object.creation_lock() else {
+                continue;
+            };
+            if object.creating_tranche() == Some(Tranche::FinalConstraintTightening) {
                 continue;
             }
-            let lock = object.creation_lock();
             assert!(
                 !matches!(
                     lock,
@@ -1734,19 +2825,122 @@ mod invariants {
         }
     }
 
+    /// A CHECK added `NOT VALID` is not a foreign key and may not borrow its
+    /// lock profile.
+    ///
+    /// The two differ on both axes an operator plans around. The foreign-key
+    /// profile promises `SHARE ROW EXCLUSIVE`, which still permits reads, and
+    /// names a referenced table that is locked alongside the child. A CHECK
+    /// takes `ACCESS EXCLUSIVE` — briefly, and scanning nothing — on one table
+    /// and no other. Describing a CHECK with the foreign-key profile understates
+    /// the lock and invents a second table.
+    #[test]
+    fn check_constraints_declare_their_own_lock_profile() {
+        let check = LockProfile::AddCheckNotValid.locks();
+        assert!(
+            check.contains("ACCESS EXCLUSIVE"),
+            "a CHECK takes the stronger lock: {check}"
+        );
+        assert!(
+            !check.contains("referenced table"),
+            "a CHECK names no parent, so no referenced table is locked: {check}"
+        );
+        assert!(
+            check.contains("no row scan"),
+            "NOT VALID is what makes it brief: {check}"
+        );
+        assert!(LockProfile::ALL.contains(&LockProfile::AddCheckNotValid));
+
+        for object in PLANNED_OBJECTS {
+            match object {
+                PlannedObject::Constraint { .. } => assert_eq!(
+                    object.creation_lock(),
+                    Some(LockProfile::AddCheckNotValid),
+                    "`{}` is a CHECK and must declare the CHECK profile",
+                    object.name()
+                ),
+                PlannedObject::ForeignKey { .. } => assert_eq!(
+                    object.creation_lock(),
+                    Some(LockProfile::AddForeignKeyNotValid),
+                    "`{}` is a foreign key and must declare the foreign-key profile",
+                    object.name()
+                ),
+                _ => {}
+            }
+            // Whichever of the two it is, validation stays separate and weaker.
+            if object.not_valid_permitted() {
+                assert_eq!(
+                    object.validation_lock(),
+                    Some(LockProfile::ValidateConstraint)
+                );
+                assert_ne!(
+                    object.creation_lock(),
+                    Some(LockProfile::ValidateConstraint),
+                    "`{}` must not conflate declaring a constraint with validating it",
+                    object.name()
+                );
+            }
+        }
+    }
+
+    /// No table's prose may claim that *validation* takes the creation lock.
+    ///
+    /// Three registry entries said "the FK validation takes SHARE ROW
+    /// EXCLUSIVE". That is the lock `ADD CONSTRAINT ... NOT VALID` takes, held
+    /// briefly while nothing is scanned; `VALIDATE CONSTRAINT` takes the weaker
+    /// `SHARE UPDATE EXCLUSIVE` on the child with `ROW SHARE` on the parent, and
+    /// the difference is the entire reason the two are split. `SHARE ROW
+    /// EXCLUSIVE` conflicts with `ROW EXCLUSIVE`, so the old wording promised
+    /// that the long scan blocks ordinary writes — the opposite of what the
+    /// design achieves, and the same class of error the typed
+    /// [`LockProfile`] exists to prevent. Checked here so the prose cannot
+    /// drift back while the type stays right.
+    #[test]
+    fn no_lock_profile_prose_confuses_validation_with_creation() {
+        for entry in super::super::inventory::REGISTRY {
+            let prose = entry.plan.lock_profile;
+            let lowered = prose.to_ascii_lowercase();
+            if !lowered.contains("validat") {
+                continue;
+            }
+            // A sentence that mentions validation and names SHARE ROW
+            // EXCLUSIVE must also name the weaker lock validation really takes,
+            // or it is describing the creation lock as if it were validation's.
+            if lowered.contains("share row exclusive") {
+                assert!(
+                    lowered.contains("share update exclusive"),
+                    "`{}` describes validation as taking SHARE ROW EXCLUSIVE without naming the \
+                     weaker lock VALIDATE actually takes; that overstates the impact and \
+                     contradicts LockProfile::ValidateConstraint: {prose:?}",
+                    entry.table
+                );
+            }
+        }
+        // The typed profiles remain the authority the prose is checked against.
+        assert!(LockProfile::ValidateConstraint
+            .locks()
+            .contains("SHARE UPDATE EXCLUSIVE"));
+        assert!(LockProfile::AddForeignKeyNotValid
+            .locks()
+            .contains("SHARE ROW EXCLUSIVE"));
+    }
+
     /// A concurrent build must be flagged, because it dictates the migration
     /// file's `-- no-transaction` header.
     #[test]
     fn concurrently_built_objects_are_flagged() {
         for object in PLANNED_OBJECTS {
             let concurrent = object.concurrent_build_required();
-            let is_index = matches!(
+            // An index-shaped object needs a concurrent build only if it is
+            // built at all: an already-current target dictates no migration
+            // file's header, because it has no migration file.
+            let is_built_index = matches!(
                 object,
                 PlannedObject::Index { .. } | PlannedObject::UniqueTarget { .. }
-            );
+            ) && object.requires_creation();
             assert_eq!(
                 concurrent,
-                is_index,
+                is_built_index,
                 "`{}` disagrees with itself about needing a concurrent build",
                 object.name()
             );
@@ -1766,6 +2960,101 @@ mod invariants {
                 object.name()
             );
         }
+    }
+
+    /// A narrowing tuple must carry the probe that would catch its collisions;
+    /// the other two shapes must not pretend to.
+    #[test]
+    fn narrowing_transitions_declare_a_collision_probe() {
+        for transition in UNIQUENESS_TRANSITIONS {
+            assert!(
+                !transition.reason.is_empty(),
+                "`{}` classifies its uniqueness transition with no reason",
+                transition.table
+            );
+            // Probe-or-not is now decided by the type: `Narrowing` carries its
+            // probe, and the other two shapes have nowhere to put one. What is
+            // still checkable is that the accessor agrees with the shape, and
+            // that a probe, where required, is not blank.
+            match transition.change {
+                UniquenessChange::AlreadyImplied => {
+                    assert_eq!(transition.collision_probe(), None);
+                    assert_eq!(
+                        transition.from, transition.to,
+                        "`{}` claims its tuple is already implied, but the tuple changes",
+                        transition.table
+                    );
+                }
+                UniquenessChange::Relaxation => {
+                    assert_eq!(transition.collision_probe(), None);
+                    assert!(
+                        transition.to.len() >= transition.from.len(),
+                        "`{}` claims a relaxation while dropping columns from the tuple; a \
+                         shorter tuple distinguishes less finely, which is a narrowing",
+                        transition.table
+                    );
+                }
+                UniquenessChange::Narrowing { collision_probe } => {
+                    assert!(
+                        !collision_probe.trim().is_empty(),
+                        "`{}` narrows its uniqueness tuple and declares a blank collision probe",
+                        transition.table
+                    );
+                }
+            }
+            assert_eq!(
+                transition.change.shape().can_collide(),
+                transition.collision_probe().is_some(),
+                "`{}` disagrees with itself about whether a collision is possible",
+                transition.table
+            );
+        }
+    }
+
+    /// The current contract plans no narrowing anywhere.
+    ///
+    /// This is what makes `future_unique_columns = None` a conclusion rather
+    /// than an omission, and it is why the pre-check query never runs. The
+    /// reason code stays in the catalogue regardless: a future narrowing tuple
+    /// makes it fire again.
+    #[test]
+    fn the_current_contract_plans_no_narrowing() {
+        let narrowing: Vec<&str> = UNIQUENESS_TRANSITIONS
+            .iter()
+            .filter(|t| t.shape().can_collide())
+            .map(|t| t.table)
+            .collect();
+        assert!(
+            narrowing.is_empty(),
+            "{narrowing:?} narrow a uniqueness tuple, so future_unique_columns can no longer be \
+             None for them and the pre-check has to run"
+        );
+        for entry in super::super::inventory::REGISTRY {
+            assert!(
+                entry.plan.future_unique_columns.is_none(),
+                "`{}` declares future_unique_columns while no table narrows; either the pre-check \
+                 has nothing to check, or a narrowing transition is missing from the register",
+                entry.table
+            );
+        }
+        assert!(
+            ReasonCode::ALL.contains(&ReasonCode::FutureTenantUniquenessCollision),
+            "the reason code is a stable contract and stays in the catalogue even while \
+             unreachable"
+        );
+
+        // The classified `to` tuple must be the one the plan actually creates,
+        // or the classification is about a constraint nobody is building.
+        let sessions = uniqueness_transition_for("sessions").expect("sessions changes its tuple");
+        let target = PLANNED_OBJECTS
+            .iter()
+            .find(|o| o.name() == "sessions_tenant_agent_session_key")
+            .expect("sessions declares its identity target");
+        assert_eq!(
+            target.local_columns(),
+            sessions.to,
+            "the uniqueness transition describes a tuple the plan does not create"
+        );
     }
 
     /// The unreachable-code register may only name real tables, and must give a
@@ -1821,6 +3110,61 @@ mod invariants {
         }
     }
 
+    /// A table may only require zero `ORPHANED_AGENT_REFERENCE` if it has a
+    /// path that can produce one.
+    ///
+    /// Stated structurally rather than as a list, so it holds for tables added
+    /// later. The audit derives the orphan code from the path kind: only an
+    /// `AgentText` or `AgentUuid` path yields `ORPHANED_AGENT_REFERENCE`. A
+    /// table with neither — `co_access_edges` is the only one today — was
+    /// requiring zero of something structurally impossible, which reads as a
+    /// gate and is not one.
+    #[test]
+    fn orphaned_agent_reference_is_gated_only_where_an_agent_path_exists() {
+        use super::super::inventory::PathKind;
+        for entry in super::super::inventory::REGISTRY {
+            let has_agent_path = entry
+                .canonical_path
+                .iter()
+                .chain(entry.secondary_paths.iter())
+                .any(|path| {
+                    matches!(
+                        path.kind,
+                        PathKind::AgentText { .. } | PathKind::AgentUuid { .. }
+                    )
+                });
+            let gates_it = entry
+                .plan
+                .required_zero_codes
+                .contains(&ReasonCode::OrphanedAgentReference);
+            assert!(
+                has_agent_path || !gates_it,
+                "`{}` requires zero ORPHANED_AGENT_REFERENCE but has no AgentText or AgentUuid \
+                 path; the audit can never produce that code for it, so the gate cannot fail",
+                entry.table
+            );
+        }
+        // The one table this applies to today must be recorded, so the removal
+        // is documented rather than merely done.
+        assert!(
+            UNREACHABLE_REQUIRED_ZERO
+                .iter()
+                .any(|u| u.table == "co_access_edges"
+                    && u.code == ReasonCode::OrphanedAgentReference),
+            "co_access_edges' removal of ORPHANED_AGENT_REFERENCE must be recorded with a reason"
+        );
+        // …and the two codes that remain reachable through its memory chain
+        // must not have been dropped along with it.
+        let entry = super::super::inventory::entry("co_access_edges").expect("registered");
+        for still_reachable in [ReasonCode::LegacyUnmapped, ReasonCode::UnmappedAgent] {
+            assert!(
+                entry.plan.required_zero_codes.contains(&still_reachable),
+                "`co_access_edges` dropped {still_reachable}, which is still reachable \
+                 transitively through memory_a -> memories.agent_id -> agents.tenant_id"
+            );
+        }
+    }
+
     /// `audit_logs` must never acquire LEGACY_UNMAPPED. Agentless events are
     /// valid rows, and a tranche-wide union of required-zero codes is exactly
     /// how that gate would get reintroduced.
@@ -1864,10 +3208,178 @@ mod invariants {
     /// backfilled.
     #[test]
     fn the_finalize_guard_names_its_evidence() {
-        assert!(FINALIZE_GUARD.contains("agent_tenancy_migrations"));
+        assert!(FINALIZE_GUARD.contains("tenancy_backfill_checkpoints"));
         assert!(FINALIZE_GUARD.contains("sqlx migrate run"));
         assert_eq!(Stage::ALL.len(), 3);
         assert_eq!(Stage::Prepare.to_string(), "PREPARE");
+    }
+
+    /// The guard may not name `agent_tenancy_migrations` as its evidence.
+    ///
+    /// That table has no tranche, no digest, no cursor and no status column, so
+    /// a guard reading it cannot distinguish "tranche 3 completed against the
+    /// current contract" from "somebody once ran the agent assignment".
+    ///
+    /// This test checks only that the contract *says* so. The claim about the
+    /// live schema is a claim about a database, so it is proven against one —
+    /// see `agent_tenancy_migrations_cannot_carry_checkpoint_evidence` in
+    /// `audit_db_tests`. A hardcoded column list here would keep passing
+    /// forever if a migration added the very column it denies.
+    #[test]
+    fn the_finalize_guard_does_not_rely_on_agent_tenancy_migrations() {
+        assert!(
+            FINALIZE_GUARD.contains("agent_tenancy_migrations cannot serve"),
+            "the guard must say why the existing table is not the evidence, or a later reader \
+             will point it back at the wrong table"
+        );
+        for absent in ["tranche", "digest", "cursor", "status"] {
+            assert!(
+                FINALIZE_GUARD.contains(absent),
+                "the guard must name `{absent}` as something the existing table lacks, so the \
+                 reason is specific rather than an assertion of inadequacy"
+            );
+        }
+    }
+
+    /// The checkpoint table must cover every category the protocol asserts on.
+    ///
+    /// Checking roles rather than column names means renaming a column cannot
+    /// silently remove the thing FINALIZE depends on.
+    #[test]
+    fn the_checkpoint_table_covers_every_required_role() {
+        let table = TENANCY_BACKFILL_CHECKPOINTS;
+        for required in [
+            CheckpointColumnRole::Tranche,
+            CheckpointColumnRole::ContractDigest,
+            CheckpointColumnRole::Status,
+            CheckpointColumnRole::ResumableCursor,
+            CheckpointColumnRole::RowCount,
+            CheckpointColumnRole::BlockingCount,
+            CheckpointColumnRole::Timestamp,
+        ] {
+            assert!(
+                table.columns.iter().any(|c| c.role == required),
+                "`{}` declares no column for {required:?}; the protocol asserts on it",
+                table.name
+            );
+        }
+        // The tuple that makes a completion authoritative must be columns the
+        // table actually has, or the unique index cannot be created.
+        for column in table.unique_completion {
+            assert!(
+                table.columns.iter().any(|c| c.name == *column),
+                "`{}` keys its authoritative completion on `{column}`, which it does not declare",
+                table.name
+            );
+        }
+        // Neither half of the completion key may be NULL-able: a NULL in a
+        // unique tuple does not collide, so two NULL-digest completions would
+        // both be accepted.
+        for column in table.columns {
+            if table.unique_completion.contains(&column.name) {
+                assert!(
+                    !column.nullable,
+                    "`{}` is part of the authoritative-completion key and must be NOT NULL; NULLs \
+                     do not collide, so duplicates would be admitted",
+                    column.name
+                );
+            }
+        }
+        // Pinned, not merely well-formed. A generic "the named columns exist"
+        // check would pass just as happily for `["tranche"]` alone, which is a
+        // different and wrong guarantee: it would make a completion unique per
+        // tranche regardless of which contract it was recorded against.
+        assert_eq!(
+            table.unique_completion,
+            &["tranche", "contract_digest"],
+            "authoritative completion must be keyed on the tranche *and* the contract it ran \
+             against"
+        );
+        // …and scoped to COMPLETED. A plain UNIQUE would reject the row an
+        // operator writes when restarting a tranche against the same digest,
+        // which is exactly what ABANDONED exists to preserve.
+        assert_eq!(
+            table.unique_completion_when,
+            CheckpointStatus::Completed,
+            "the uniqueness must be partial on COMPLETED, or retained ABANDONED history collides \
+             with the live attempt"
+        );
+        assert_eq!(
+            table.unique_completion_when, FINALIZE_PRECONDITION.required_status,
+            "the status the uniqueness is scoped to and the status FINALIZE accepts must be the \
+             same one, or the index guarantees uniqueness of something the guard does not read"
+        );
+        // Roles the ruling states in the plural must actually be plural: one
+        // row count cannot express progress, and one timestamp cannot express
+        // both when a tranche started and when it finished.
+        for (role, least) in [
+            (CheckpointColumnRole::RowCount, 2),
+            (CheckpointColumnRole::Timestamp, 2),
+        ] {
+            let found = table.columns.iter().filter(|c| c.role == role).count();
+            assert!(
+                found >= least,
+                "`{}` declares {found} column(s) for {role:?}; at least {least} are needed",
+                table.name
+            );
+        }
+    }
+
+    /// FINALIZE's precondition must be exact on all four axes.
+    ///
+    /// Any one of them relaxed reintroduces the failure the three-stage split
+    /// exists to prevent: validating a constraint over rows nobody backfilled.
+    #[test]
+    fn the_finalize_precondition_is_exact() {
+        // Checked as one value rather than four assertions, so relaxing any
+        // single axis fails here with the whole expected shape in the output.
+        assert_eq!(
+            FINALIZE_PRECONDITION,
+            FinalizePrecondition {
+                required_status: CheckpointStatus::Completed,
+                tranche_must_match_exactly: true,
+                digest_must_match_current: true,
+                max_blocking_count: 0,
+            },
+            "relaxing any axis of the FINALIZE precondition reintroduces validating a constraint \
+             over rows nobody backfilled"
+        );
+        assert_eq!(CheckpointStatus::Completed.as_str(), "COMPLETED");
+        // Exactly one status may satisfy the guard. If a second ever reads as
+        // "done", the guard stops being a gate.
+        let accepted = CheckpointStatus::ALL
+            .iter()
+            .filter(|s| **s == FINALIZE_PRECONDITION.required_status)
+            .count();
+        assert_eq!(
+            accepted, 1,
+            "exactly one checkpoint status may satisfy FINALIZE"
+        );
+    }
+
+    /// The checkpoint table has to exist before the first backfill records
+    /// anything, and it may not appear as an unregistered side-table.
+    #[test]
+    fn the_checkpoint_table_is_created_before_any_backfill_needs_it() {
+        let earliest = PLANNED_OBJECTS
+            .iter()
+            .map(|o| o.declared_in())
+            .min()
+            .expect("the plan is not empty");
+        for table in PLANNED_TABLES {
+            assert!(
+                table.creating_tranche <= earliest,
+                "`{}` is created in {} but a backfill needs it from {earliest} onward",
+                table.name,
+                table.creating_tranche
+            );
+            assert!(
+                table.joins_contract.contains("REGISTRY"),
+                "`{}` must join the Step 4A registry in the same change, or the verifier reports \
+                 it as drift",
+                table.name
+            );
+        }
     }
 
     /// The chosen transitional strategy must state the property it guarantees,
@@ -1877,5 +3389,131 @@ mod invariants {
         assert!(TRANSITIONAL_WRITE_RATIONALE.contains("dual-write"));
         assert!(TRANSITIONAL_WRITE_GUARANTEE.contains("resumed legacy writer"));
         assert!(TRANSITIONAL_WRITE_GUARANTEE.contains("UNMAPPED_AGENT"));
+    }
+
+    /// Every compatibility prerequisite names a planned object that exists, and
+    /// orders the parent before the child.
+    ///
+    /// A prerequisite naming an object the plan does not create would be a
+    /// blocker nothing can ever clear; one that ordered the child first would
+    /// re-specify the bug it exists to prevent.
+    #[test]
+    fn compatibility_prerequisites_order_the_parent_before_the_child() {
+        for prerequisite in COMPATIBILITY_PREREQUISITES {
+            let object = PLANNED_OBJECTS
+                .iter()
+                .find(|o| o.name() == prerequisite.planned_object)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{}` is a prerequisite for `{}`, which the plan never creates",
+                        prerequisite.planned_object, prerequisite.planned_object
+                    )
+                });
+            let (parent, _) = object
+                .referenced()
+                .expect("a compatibility prerequisite only makes sense for a referencing object");
+            let child = object.table();
+            let order = prerequisite.required_write_order;
+            let parent_at = order.iter().position(|t| *t == parent);
+            let child_at = order.iter().position(|t| *t == child);
+            let (Some(parent_at), Some(child_at)) = (parent_at, child_at) else {
+                panic!(
+                    "`{}` must order both `{parent}` and `{child}`; it orders {order:?}",
+                    prerequisite.planned_object
+                );
+            };
+            assert!(
+                parent_at < child_at,
+                "`{}` writes `{child}` before `{parent}`; the referenced row must exist first, or \
+                 the very first write after the key lands fails",
+                prerequisite.planned_object
+            );
+        }
+    }
+
+    /// A prerequisite must demand a transaction, a drain, and a rollback path.
+    ///
+    /// Ordering alone is not sufficient. Between two autocommit statements a
+    /// reader sees a session with no working memory and a crash leaves the pair
+    /// half-written; a deploy alone is not sufficient while an older binary is
+    /// still serving the old order; and once the key exists, rolling the code
+    /// back is not by itself a recovery path.
+    #[test]
+    fn compatibility_prerequisites_demand_transaction_drain_and_rollback() {
+        for prerequisite in COMPATIBILITY_PREREQUISITES {
+            assert!(
+                prerequisite.single_transaction,
+                "`{}` must require one transaction",
+                prerequisite.planned_object
+            );
+            assert!(
+                prerequisite.drain_incompatible_binaries,
+                "`{}` must require incompatible binaries to be drained; deploying the fix while \
+                 an older release still serves traffic leaves the old order running",
+                prerequisite.planned_object
+            );
+            assert_eq!(
+                prerequisite.writers_deployed_before,
+                Stage::Prepare,
+                "`{}` must have compatible writers serving before PREPARE, because NOT VALID \
+                 constrains new writes from the moment the catalog change commits",
+                prerequisite.planned_object
+            );
+            // Both alternatives, not either. The recovery path is "drop the
+            // key *or* keep a bridge"; losing one of them from the text leaves
+            // an operator with a single option presented as the only one.
+            let rollback = prerequisite.rollback;
+            for alternative in ["dropping", "bridge"] {
+                assert!(
+                    rollback.contains(alternative),
+                    "`{}` must state both rollback alternatives — removing the key and retaining \
+                     a bridge — but does not mention `{alternative}`: {rollback:?}",
+                    prerequisite.planned_object
+                );
+            }
+        }
+    }
+
+    /// PREPARE for the tranche that creates `working_memory_session_fkey` is
+    /// blocked while the prerequisite stands.
+    ///
+    /// This is the proof the ruling asked for: the blocker is reachable from the
+    /// tranche, so a scheduler consulting the plan cannot start that PREPARE
+    /// without seeing it.
+    #[test]
+    fn prepare_cannot_be_scheduled_while_a_prerequisite_is_outstanding() {
+        let fkey = PLANNED_OBJECTS
+            .iter()
+            .find(|o| o.name() == "working_memory_session_fkey")
+            .expect("working_memory must reference sessions");
+        let creating = fkey
+            .creating_tranche()
+            .expect("a foreign key is always created by a tranche");
+        let blockers = prepare_blockers(creating);
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.planned_object == "working_memory_session_fkey"),
+            "{creating} creates working_memory_session_fkey, so its PREPARE must report the \
+             writer prerequisite as a blocker"
+        );
+        // The prerequisite must name the writer it is about, so that clearing it
+        // is a specific piece of work rather than a judgement call.
+        let prerequisite =
+            compatibility_prerequisite_for("working_memory_session_fkey").expect("declared above");
+        assert!(
+            prerequisite.blocker.contains("upsert_working_memory"),
+            "the prerequisite must name the incompatible writer"
+        );
+        assert!(
+            prerequisite.blocker.contains("NOT VALID"),
+            "the prerequisite must say why NOT VALID does not defer the problem"
+        );
+        // Tranches with no outstanding prerequisite must not acquire one by
+        // accident — an empty list is the normal case and has to stay meaningful.
+        assert!(
+            prepare_blockers(Tranche::Memories).is_empty(),
+            "tranche 3 has no recorded writer prerequisite; if one is added, record why"
+        );
     }
 }

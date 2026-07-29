@@ -2,8 +2,8 @@
 
 Generated from `src/tenancy/inventory.rs`. Do not edit by hand — the registry is the source of truth and a test regenerates this file and compares it.
 
-- schema version: `step4a.1`
-- inventory digest: `sha256:3333053ec756d813515bb09ee57863c11174fe23f481a3265ecbcab6d51895fa`
+- schema version: `step4b0.1`
+- inventory digest: `sha256:56512cd95f687470a5c6a0504768e2a51798cd4c051e6bc3a1e55ad02630f681`
 - tables classified: 22
 
 ## Classification summary
@@ -39,7 +39,7 @@ Typed, not prose. Every planned column, index, unique target, foreign key and co
 1. **BACKFILL**
 1. **FINALIZE**
 
-FINALIZE migrations open with a guard that raises unless agent_tenancy_migrations records a completed backfill checkpoint for the tranche. `sqlx migrate run` therefore cannot advance PREPARE straight into FINALIZE: on a fresh database the guard fires because no backfill ran, and on a live database it fires until the operator's backfill command records completion.
+FINALIZE migrations open with a guard that raises unless tenancy_backfill_checkpoints records a COMPLETED checkpoint for *this* tranche against the current contract digest with blocking_count = 0. `sqlx migrate run` therefore cannot advance PREPARE straight into FINALIZE: on a fresh database the guard fires because no backfill ran, and on a live database it fires until the operator's backfill command records completion. agent_tenancy_migrations cannot serve as that evidence — it has no tranche, no digest, no cursor and no status column — so Step 4B-1 must create the checkpoint table before the first backfill runs.
 
 A migration containing CREATE INDEX CONCURRENTLY must carry `-- no-transaction` as its first line so sqlx runs it unwrapped. A concurrent build that fails leaves an INVALID index behind, which the Step 4A verifier already reports as drift, so a failed build cannot be mistaken for a healthy one.
 
@@ -49,7 +49,8 @@ A migration containing CREATE INDEX CONCURRENTLY must carry `-- no-transaction` 
 |---|---|
 | `ADD COLUMN NULL` | ACCESS EXCLUSIVE, catalog-only — no rewrite, no scan |
 | `CREATE INDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE; must run outside a transaction block |
-| `ADD CONSTRAINT ... NOT VALID` | SHARE ROW EXCLUSIVE on the child AND on the referenced table |
+| `ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID` | SHARE ROW EXCLUSIVE on the child AND on the referenced table |
+| `ADD CONSTRAINT ... CHECK ... NOT VALID` | ACCESS EXCLUSIVE on the table alone, brief — no row scan, and no parent is locked alongside it |
 | `VALIDATE CONSTRAINT` | SHARE UPDATE EXCLUSIVE on the child, ROW SHARE on the referenced table |
 | `SET NOT NULL` | ACCESS EXCLUSIVE; full scan unless a validated CHECK permits skip |
 | `table rewrite` | ACCESS EXCLUSIVE for the whole rewrite |
@@ -65,7 +66,9 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 
 #### TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN
 
-- agents UNIQUE (tenant_id, id) AS `agents_tenant_id_id_key` — already current
+PREPARE builds 23 of the 24 objects declared here.
+
+- agents UNIQUE (tenant_id, id) AS `agents_tenant_id_id_key` — already current *(nothing is built; retained only as a dependency prerequisite)*
 - ALTER TABLE archival_batches ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - ALTER TABLE archival_batches ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - CREATE INDEX CONCURRENTLY idx_archival_batches_tenant ON archival_batches (tenant_id, agent_uuid)
@@ -92,6 +95,9 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 
 #### TRANCHE_2_SESSIONS
 
+PREPARE builds 10 of the 10 objects declared here.
+- **PREPARE blocked**: `working_memory_session_fkey` — upsert_working_memory inserts into working_memory first and mirrors into sessions second, as two separate autocommit statements on the pool. Once working_memory_session_fkey exists the first statement references a sessions row the second has not written yet, so the first turn of every new session fails. NOT VALID does not defer this: it exempts historical rows, never new ones.
+
 - ALTER TABLE sessions ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - ALTER TABLE sessions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - CREATE INDEX CONCURRENTLY idx_sessions_tenant ON sessions (tenant_id, agent_uuid)
@@ -104,6 +110,8 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 - ALTER TABLE working_memory ADD CONSTRAINT working_memory_session_fkey FOREIGN KEY (tenant_id, agent_uuid, session_id) REFERENCES sessions (tenant_id, agent_uuid, session_id) NOT VALID
 
 #### TRANCHE_3_MEMORIES
+
+PREPARE builds 18 of the 18 objects declared here.
 
 - ALTER TABLE memories ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - ALTER TABLE memories ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
@@ -125,6 +133,8 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 - ALTER TABLE cognitive_hypervisor_timeline ADD CONSTRAINT cht_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
 
 #### TRANCHE_4_LINEAGE_AND_ARCHIVAL
+
+PREPARE builds 22 of the 22 objects declared here.
 
 - ALTER TABLE memory_versions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - CREATE INDEX CONCURRENTLY idx_memory_versions_tenant ON memory_versions (tenant_id)
@@ -151,6 +161,8 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 
 #### TRANCHE_5_OPERATIONS
 
+PREPARE builds 9 of the 9 objects declared here.
+
 - ALTER TABLE amp_controller_state ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - ALTER TABLE amp_controller_state ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
 - CREATE INDEX CONCURRENTLY idx_amp_controller_state_tenant ON amp_controller_state (tenant_id, agent_uuid)
@@ -163,7 +175,18 @@ After historical backfill completes, a resumed legacy writer cannot create a row
 
 #### FINAL_CONSTRAINT_TIGHTENING
 
+PREPARE builds 1 of the 1 objects declared here.
+
 - ALTER TABLE agents ADD CONSTRAINT agents_tenant_id_not_null_chk CHECK (tenant_id IS NOT NULL) NOT VALID
+
+### Uniqueness transitions
+
+- `ALREADY_IMPLIED` — `agents`
+- `RELAXATION` — `sessions`
+- `NARROWING` — none planned *(requires a collision probe before creation)*
+
+- `sessions`: (agent_id, session_id) → (tenant_id, agent_uuid, session_id) — **RELAXATION**. agent_uuid is a one-for-one re-identification of the legacy agent_id, and tenant_id is added rather than substituted for anything. Two rows distinguished by (agent_id, session_id) remain distinguished by (tenant_id, agent_uuid, session_id), so nothing legal today can collide under the new tuple.
+- `agents`: (tenant_id, external_agent_id) → (tenant_id, external_agent_id) — **ALREADY_IMPLIED**. UNIQUE (tenant_id, external_agent_id) already exists. Step 4B adds no uniqueness to agents, so the tuple is unchanged.
 
 ### Structurally unreachable required-zero codes
 
@@ -173,6 +196,7 @@ Recorded rather than silently dropped. The enum values stay — they are a stabl
 - `co_access_edges` / `ORPHANED_MEMORY_REFERENCE` — every memory reference is backed by a declared foreign key, so an orphan cannot exist while the contract holds; producing one means dropping that key, which is SCHEMA_RELATIONSHIP_DRIFT and blocks by a different code.
 - `memory_entity_links` / `ORPHANED_MEMORY_REFERENCE` — same structure as co_access_edges: FK-backed, so the orphan count is withheld under drift and the drift is what blocks.
 - `memory_versions` / `ORPHANED_MEMORY_REFERENCE` — same structure as co_access_edges: FK-backed, so the orphan count is withheld under drift and the drift is what blocks.
+- `co_access_edges` / `ORPHANED_AGENT_REFERENCE` — co_access_edges is the only table in the schema with no agent column. The audit derives an orphan code from the path kind, and both of this table's paths — memory_a and memory_b — are Memory paths, so a missing parent raises ORPHANED_MEMORY_REFERENCE and never ORPHANED_AGENT_REFERENCE. Requiring it to be zero was requiring zero of something that cannot be produced. LEGACY_UNMAPPED and UNMAPPED_AGENT are *not* removed with it: those come off the canonical chain memory_a -> memories.agent_id -> agents.tenant_id and remain reachable transitively, so they stay in the required-zero set.
 - `agents` / `FUTURE_TENANT_UNIQUENESS_COLLISION` — a consequence of keeping session identity agent-scoped. No table in the plan narrows a uniqueness rule: `sessions` moves from UNIQUE (agent_id, session_id) to UNIQUE (tenant_id, agent_uuid, session_id), which is a superset and cannot collide, and `agents` adds nothing because UNIQUE (tenant_id, external_agent_id) already exists. With no narrowing planned anywhere, the pre-check has nothing to pre-check, so `future_unique_columns` is None on every table and the query no longer runs. The reason code stays in the catalogue because a future narrowing tuple would make it fire again.
 
 ## Session semantics
@@ -264,6 +288,7 @@ constraints — not from whether the column happens to be NULL-able.
   - `agents_tenant_id_id_key` UNIQUE (tenant_id, id), validated
 - **canonical path**: `row.tenant_id (authoritative)`
 - **consistency**: `agents` is the authority: every other path in this registry terminates here. `tenant_id` is still NULL-able because step 1 deliberately leaves unmapped agents unreachable rather than inventing a tenant for them; every such row is reported as UNMAPPED_AGENT.
+- **uniqueness transition**: `ALREADY_IMPLIED` — (tenant_id, external_agent_id) → (tenant_id, external_agent_id). UNIQUE (tenant_id, external_agent_id) already exists. Step 4B adds no uniqueness to agents, so the tuple is unchanged.
 - **planned objects**:
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] agents UNIQUE (tenant_id, id) AS `agents_tenant_id_id_key` — already current
   - [FINAL_CONSTRAINT_TIGHTENING] ALTER TABLE agents ADD CONSTRAINT agents_tenant_id_not_null_chk CHECK (tenant_id IS NOT NULL) NOT VALID
@@ -290,7 +315,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_5_OPERATIONS] ALTER TABLE amp_controller_state ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_5_OPERATIONS] CREATE INDEX CONCURRENTLY idx_amp_controller_state_tenant ON amp_controller_state (tenant_id, agent_uuid)
   - [TRANCHE_5_OPERATIONS] ALTER TABLE amp_controller_state ADD CONSTRAINT amp_controller_state_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_amp_controller_state_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_amp_controller_state_tenancy_bridge` (`fn_amp_controller_state_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE amp_controller_state s SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = s.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -315,12 +341,13 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] CREATE INDEX CONCURRENTLY idx_archival_batches_tenant ON archival_batches (tenant_id, agent_uuid)
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] archival_batches UNIQUE (id, tenant_id) AS `archival_batches_id_tenant_id_key` — created by Step 4B as an FK target
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE archival_batches ADD CONSTRAINT archival_batches_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_archival_batches_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_archival_batches_tenancy_bridge` (`fn_archival_batches_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE archival_batches b SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = b.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
 - **validate step**: VALIDATE CONSTRAINT after backfill
-- **lock profile**: ADD COLUMN NULL is metadata-only; the FK validation takes SHARE ROW EXCLUSIVE
+- **lock profile**: ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE ROW EXCLUSIVE on this table and on agents, and VALIDATE takes the weaker SHARE UPDATE EXCLUSIVE here with ROW SHARE on agents
 - **rollback dependencies**: `memories (memories.archival_batch_id references this table)`
 - **must stay inactive**: `archival worker`, `POST /memories`, `GET /memories`
 
@@ -339,7 +366,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE audit_logs ADD COLUMN tenant_id UUID NULL — NULL-able, and stays NULL-able
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] CREATE INDEX CONCURRENTLY idx_audit_logs_tenant ON audit_logs (tenant_id, agent_uuid)
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
-- **transitional writes**: `OWNERSHIP_MAY_REMAIN_NULL` — audit_logs records agentless events — startup, configuration change, administrative action — which are valid rows with no owning agent. A bridge that forced ownership would either invent an owner or reject the event, and losing audit history is a worse outcome than an unowned audit row. Its ownership columns stay NULL-able permanently, and LEGACY_UNMAPPED is deliberately absent from its required-zero set.
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `tenant_id`, `agent_uuid`
+- **transitional writes**: `CONDITIONAL_AGENT_BRIDGE_TRIGGER` — `trg_audit_logs_tenancy_bridge` installed in PREPARE, before any backfill; resolves conditionally (AGENTLESS_ALLOWED, RESOLVED_AND_VERIFIED, PRESERVED_UNRESOLVED, CONTRADICTION_REJECTED) — audit_logs records agentless events — startup, configuration change, administrative action — which are valid rows with no owning agent, so its ownership columns stay NULL-able permanently and LEGACY_UNMAPPED is deliberately absent from its required-zero set. That is not a reason to install no bridge. Declining to resolve ownership at all also declines it for the rows that *do* name a resolvable agent, which then stay NULL for no reason and are indistinguishable from genuinely agentless ones. The bridge is therefore conditional rather than absent: it owns what it can resolve, leaves what it cannot so the audit reports it, and refuses a row that contradicts agents outright.
 - **initial nullability**: added NULL-able and **stays** NULL-able until the disposition of agent-less audit rows is decided
 - **backfill shape**: `UPDATE audit_logs l SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = l.agent_id`
 - **must be zero**: `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`
@@ -366,16 +394,18 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE co_access_edges ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] CREATE INDEX CONCURRENTLY idx_co_access_edges_tenant ON co_access_edges (tenant_id)
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_co_access_edges_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `MEMORY_BRIDGE_TRIGGER` — `trg_co_access_edges_tenancy_bridge` (`fn_co_access_edges_tenancy_bridge`) installed in PREPARE, before any backfill, resolving through the parent its backfill authority names
 - **backfill source**: `memories ma ON ma.id = e.memory_a, memories mb ON mb.id = e.memory_b`
 - **all paths must agree**: `ma.tenant_id IS NOT NULL AND ma.tenant_id = mb.tenant_id`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE co_access_edges e SET tenant_id = m.tenant_id FROM memories m WHERE m.id = e.memory_a, only where memory_a and memory_b agree`
-- **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`, `CROSS_TENANT_PARENT_CHILD`, `OWNERSHIP_PATH_DISAGREEMENT`
+- **must be zero**: `LEGACY_UNMAPPED`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`, `CROSS_TENANT_PARENT_CHILD`, `OWNERSHIP_PATH_DISAGREEMENT`
 - **validate step**: VALIDATE both constraints after backfill
-- **lock profile**: two FK validations, each SHARE ROW EXCLUSIVE on memories
+- **lock profile**: two FK validations, each SHARE UPDATE EXCLUSIVE on co_access_edges with ROW SHARE on memories — concurrent DML continues throughout
 - **rollback dependencies**: `memories (tranche 3)`
 - **must stay inactive**: `co-access edge maintenance`, `retrieval scoring`
 
@@ -395,7 +425,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_3_MEMORIES] ALTER TABLE cognitive_hypervisor_timeline ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_3_MEMORIES] CREATE INDEX CONCURRENTLY idx_cht_tenant ON cognitive_hypervisor_timeline (tenant_id, agent_uuid)
   - [TRANCHE_3_MEMORIES] ALTER TABLE cognitive_hypervisor_timeline ADD CONSTRAINT cht_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_cht_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_cht_tenancy_bridge` (`fn_cht_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE cognitive_hypervisor_timeline t SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = t.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -460,13 +491,14 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] CREATE INDEX CONCURRENTLY idx_entities_tenant ON entities (tenant_id, agent_uuid)
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] entities UNIQUE (id, tenant_id) AS `entities_id_tenant_id_key` — created by Step 4B as an FK target
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_entities_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_entities_tenancy_bridge` (`fn_entities_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE entities e SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = e.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
 - **validate step**: VALIDATE CONSTRAINT after backfill
 - **future uniqueness**: `entities_agent_id_name_key` is UNIQUE (agent_id, name) and stays agent-scoped: an entity belongs to one agent, and widening it to the tenant would merge two agents' entity namespaces. Recorded so the decision is explicit rather than an omission.
-- **lock profile**: ADD COLUMN NULL is metadata-only; validation is SHARE ROW EXCLUSIVE
+- **lock profile**: ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE ROW EXCLUSIVE on this table and on agents, and VALIDATE takes the weaker SHARE UPDATE EXCLUSIVE here with ROW SHARE on agents
 - **rollback dependencies**: `memory_entity_links (tranche 4)`
 - **must stay inactive**: `extraction_worker`, `POST /entities`
 
@@ -486,7 +518,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_3_MEMORIES] ALTER TABLE extraction_jobs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_3_MEMORIES] CREATE INDEX CONCURRENTLY idx_extraction_jobs_tenant ON extraction_jobs (tenant_id, agent_uuid)
   - [TRANCHE_3_MEMORIES] ALTER TABLE extraction_jobs ADD CONSTRAINT extraction_jobs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_extraction_jobs_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_extraction_jobs_tenancy_bridge` (`fn_extraction_jobs_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE extraction_jobs j SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = j.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -515,8 +548,10 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_3_MEMORIES] CREATE INDEX CONCURRENTLY idx_memories_tenant ON memories (tenant_id, agent_uuid)
   - [TRANCHE_3_MEMORIES] memories UNIQUE (id, tenant_id) AS `memories_id_tenant_id_key` — created by Step 4B as an FK target
   - [TRANCHE_3_MEMORIES] ALTER TABLE memories ADD CONSTRAINT memories_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_3_MEMORIES] ALTER TABLE memories ADD CONSTRAINT memories_archival_batch_tenant_fkey FOREIGN KEY (archival_batch_id, tenant_id) REFERENCES archival_batches (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memories_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `archival_batch_id`
+- **transitional writes**: `MULTI_PATH_BRIDGE_TRIGGER` — `trg_memories_tenancy_bridge` installed in PREPARE, before any backfill; writes only when agents and archival_batches agree, and never picks a side
 - **backfill source**: `agents a ON a.agent_id = m.agent_id`
 - **all paths must agree**: `a.tenant_id IS NOT NULL AND (m.archival_batch_id IS NULL OR EXISTS (SELECT 1 FROM archival_batches b WHERE b.id = m.archival_batch_id AND b.tenant_id = a.tenant_id))`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -549,9 +584,12 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_conflicts ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] CREATE INDEX CONCURRENTLY idx_memory_conflicts_tenant ON memory_conflicts (tenant_id, agent_uuid)
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `memory_a`
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memory_conflicts_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `memory_b`
+- **transitional writes**: `MULTI_PATH_BRIDGE_TRIGGER` — `trg_memory_conflicts_tenancy_bridge` installed in PREPARE, before any backfill; writes only when agents and memories agree, and never picks a side
 - **backfill source**: `agents a ON a.agent_id = c.agent_id`
 - **all paths must agree**: `a.tenant_id IS NOT NULL AND (c.memory_a IS NULL OR EXISTS (SELECT 1 FROM memories m WHERE m.id = c.memory_a AND m.tenant_id = a.tenant_id)) AND (c.memory_b IS NULL OR EXISTS (SELECT 1 FROM memories m WHERE m.id = c.memory_b AND m.tenant_id = a.tenant_id))`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -582,8 +620,10 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_entity_links ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] CREATE INDEX CONCURRENTLY idx_memory_entity_links_tenant ON memory_entity_links (tenant_id)
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_entity_tenant_fkey FOREIGN KEY (entity_id, tenant_id) REFERENCES entities (id, tenant_id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memory_entity_links_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `MULTI_PATH_BRIDGE_TRIGGER` — `trg_memory_entity_links_tenancy_bridge` installed in PREPARE, before any backfill; writes only when memories and entities and agents agree, and never picks a side
 - **backfill source**: `memories m ON m.id = l.memory_id, entities e ON e.id = l.entity_id, agents a ON a.agent_id = l.agent_id`
 - **all paths must agree**: `m.tenant_id IS NOT NULL AND m.tenant_id = e.tenant_id AND m.tenant_id = a.tenant_id`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -609,7 +649,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE memory_graph ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] CREATE INDEX CONCURRENTLY idx_memory_graph_tenant ON memory_graph (tenant_id, agent_uuid)
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE memory_graph ADD CONSTRAINT memory_graph_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memory_graph_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_memory_graph_tenancy_bridge` (`fn_memory_graph_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE memory_graph g SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = g.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -634,7 +675,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_3_MEMORIES] ALTER TABLE memory_retrieval_logs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_3_MEMORIES] CREATE INDEX CONCURRENTLY idx_memory_retrieval_logs_tenant ON memory_retrieval_logs (tenant_id, agent_uuid)
   - [TRANCHE_3_MEMORIES] ALTER TABLE memory_retrieval_logs ADD CONSTRAINT memory_retrieval_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memory_retrieval_logs_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_memory_retrieval_logs_tenancy_bridge` (`fn_memory_retrieval_logs_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE memory_retrieval_logs l SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = l.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -660,7 +702,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_versions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] CREATE INDEX CONCURRENTLY idx_memory_versions_tenant ON memory_versions (tenant_id)
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE memory_versions ADD CONSTRAINT memory_versions_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_memory_versions_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `MEMORY_BRIDGE_TRIGGER` — `trg_memory_versions_tenancy_bridge` (`fn_memory_versions_tenancy_bridge`) installed in PREPARE, before any backfill, resolving through the parent its backfill authority names
 - **backfill source**: `memories m ON m.id = v.memory_id`
 - **all paths must agree**: `m.tenant_id IS NOT NULL`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -691,8 +734,10 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE retrieval_feedback ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] CREATE INDEX CONCURRENTLY idx_retrieval_feedback_tenant ON retrieval_feedback (tenant_id, agent_uuid)
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_4_LINEAGE_AND_ARCHIVAL] ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_retrieval_feedback_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `memory_id`
+- **transitional writes**: `MULTI_PATH_BRIDGE_TRIGGER` — `trg_retrieval_feedback_tenancy_bridge` installed in PREPARE, before any backfill; writes only when agents and memories agree, and never picks a side
 - **backfill source**: `agents a ON a.agent_id = f.agent_id`
 - **all paths must agree**: `a.tenant_id IS NOT NULL AND (f.memory_id IS NULL OR EXISTS (SELECT 1 FROM memories m WHERE m.id = f.memory_id AND m.tenant_id = a.tenant_id))`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -723,8 +768,10 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_5_OPERATIONS] ALTER TABLE rmk_episodes ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_5_OPERATIONS] CREATE INDEX CONCURRENTLY idx_rmk_episodes_tenant ON rmk_episodes (tenant_id, agent_uuid)
   - [TRANCHE_5_OPERATIONS] ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_5_OPERATIONS] ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_policy_tenant_fkey FOREIGN KEY (policy_id, tenant_id) REFERENCES rmk_policies (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_rmk_episodes_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `MATCH_SIMPLE_NULL_KEY_ROWS_UNCHECKED` — NULL-able local columns: `policy_id`
+- **transitional writes**: `MULTI_PATH_BRIDGE_TRIGGER` — `trg_rmk_episodes_tenancy_bridge` installed in PREPARE, before any backfill; writes only when agents and rmk_policies agree, and never picks a side
 - **backfill source**: `agents a ON a.agent_id = e.agent_id`
 - **all paths must agree**: `a.tenant_id IS NOT NULL AND (e.policy_id IS NULL OR EXISTS (SELECT 1 FROM rmk_policies p WHERE p.id = e.policy_id AND p.tenant_id = a.tenant_id))`
 - **on disagreement**: left NULL and reported; the audit's blocking finding is the output, and no side is picked
@@ -751,7 +798,8 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] CREATE INDEX CONCURRENTLY idx_rmk_policies_tenant ON rmk_policies (tenant_id, agent_uuid)
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] rmk_policies UNIQUE (id, tenant_id) AS `rmk_policies_id_tenant_id_key` — created by Step 4B as an FK target
   - [TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN] ALTER TABLE rmk_policies ADD CONSTRAINT rmk_policies_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_rmk_policies_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_rmk_policies_tenancy_bridge` (`fn_rmk_policies_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE rmk_policies p SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = p.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -773,13 +821,15 @@ constraints — not from whether the column happens to be NULL-able.
   - `sessions_agent_id_fkey` FOREIGN KEY (agent_id) REFERENCES agents(agent_id), validated
 - **canonical path**: `row.agent_id -> agents.agent_id -> agents.id -> agents.tenant_id`
 - **consistency**: A session's owner is its agent. This table is a direct agent child, not a session child — it is the parent every session child resolves through.
+- **uniqueness transition**: `RELAXATION` — (agent_id, session_id) → (tenant_id, agent_uuid, session_id). agent_uuid is a one-for-one re-identification of the legacy agent_id, and tenant_id is added rather than substituted for anything. Two rows distinguished by (agent_id, session_id) remain distinguished by (tenant_id, agent_uuid, session_id), so nothing legal today can collide under the new tuple.
 - **planned objects**:
   - [TRANCHE_2_SESSIONS] ALTER TABLE sessions ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_2_SESSIONS] ALTER TABLE sessions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_2_SESSIONS] CREATE INDEX CONCURRENTLY idx_sessions_tenant ON sessions (tenant_id, agent_uuid)
   - [TRANCHE_2_SESSIONS] sessions UNIQUE (tenant_id, agent_uuid, session_id) AS `sessions_tenant_agent_session_key` — created by Step 4B as an FK target
   - [TRANCHE_2_SESSIONS] ALTER TABLE sessions ADD CONSTRAINT sessions_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_sessions_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `AGENT_BRIDGE_TRIGGER` — `trg_sessions_tenancy_bridge` (`fn_sessions_tenancy_bridge`) installed in PREPARE, before any backfill
 - **initial nullability**: added NULL-able; NOT NULL only in FINAL_CONSTRAINT_TIGHTENING, after backfill verification reports zero blocking findings
 - **backfill shape**: `UPDATE sessions s SET agent_uuid = a.id, tenant_id = a.tenant_id FROM agents a WHERE a.agent_id = s.agent_id`
 - **must be zero**: `LEGACY_UNMAPPED`, `ORPHANED_AGENT_REFERENCE`, `UNMAPPED_AGENT`, `UNRESOLVABLE_OWNER`, `NULL_OWNERSHIP_LINK`
@@ -808,8 +858,10 @@ constraints — not from whether the column happens to be NULL-able.
   - [TRANCHE_2_SESSIONS] ALTER TABLE working_memory ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7
   - [TRANCHE_2_SESSIONS] CREATE INDEX CONCURRENTLY idx_working_memory_tenant ON working_memory (tenant_id, agent_uuid)
   - [TRANCHE_2_SESSIONS] ALTER TABLE working_memory ADD CONSTRAINT working_memory_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID
+    - **match semantics**: `ALL_ROWS_CHECKED`
   - [TRANCHE_2_SESSIONS] ALTER TABLE working_memory ADD CONSTRAINT working_memory_session_fkey FOREIGN KEY (tenant_id, agent_uuid, session_id) REFERENCES sessions (tenant_id, agent_uuid, session_id) NOT VALID
-- **transitional writes**: `DATABASE_BRIDGE_TRIGGER` — `trg_working_memory_tenancy_bridge` installed in PREPARE, before any backfill
+    - **match semantics**: `ALL_ROWS_CHECKED`
+- **transitional writes**: `SESSION_BRIDGE_TRIGGER` — `trg_working_memory_tenancy_bridge` (`fn_working_memory_tenancy_bridge`) installed in PREPARE, before any backfill, resolving through the parent its backfill authority names
 - **backfill source**: `sessions s ON s.agent_id = w.agent_id AND s.session_id = w.session_id`
 - **all paths must agree**: `s.tenant_id IS NOT NULL AND s.agent_uuid IS NOT NULL`
 - **on disagreement**: left NULL and reported; sessions must be fully backfilled first, so a NULL here means either the session row does not exist yet or its own backfill has not run

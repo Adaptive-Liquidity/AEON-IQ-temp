@@ -62,7 +62,16 @@ pub const ROW_ID_DOMAIN: &str = "aeon-tenancy-audit-row-id-v1";
 /// The report's schema version. Bumped whenever the serialized shape changes,
 /// so a consumer can refuse a report it does not understand instead of
 /// misreading one.
-pub const REPORT_SCHEMA_VERSION: &str = "step4a.1";
+///
+/// `step4a.1` -> `step4b0.1`: Step 4B-0 added the typed migration contract to
+/// the payload, and a consumer pinned to the Step 4A shape cannot read it. The
+/// `step_4b_contract` block gained planned tables, the FINALIZE precondition,
+/// compatibility prerequisites and uniqueness transitions; every planned object
+/// gained `declared_in`, `requires_creation`, typed MATCH semantics and its
+/// NULL-able local columns; and `creating_tranche`, `validating_tranche` and
+/// `creation_lock` became nullable, because an already-current target is
+/// created by nothing.
+pub const REPORT_SCHEMA_VERSION: &str = "step4b0.1";
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 

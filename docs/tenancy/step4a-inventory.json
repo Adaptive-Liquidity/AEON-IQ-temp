@@ -1,6 +1,6 @@
 {
-  "schema_version": "step4a.1",
-  "inventory_digest": "sha256:3333053ec756d813515bb09ee57863c11174fe23f481a3265ecbcab6d51895fa",
+  "schema_version": "step4b0.1",
+  "inventory_digest": "sha256:56512cd95f687470a5c6a0504768e2a51798cd4c051e6bc3a1e55ad02630f681",
   "reason_codes": [
     {
       "code": "UNCLASSIFIED_TABLE",
@@ -367,7 +367,7 @@
         "validate_step": "VALIDATE CONSTRAINT after backfill",
         "future_uniqueness": null,
         "future_unique_columns": null,
-        "lock_profile": "ADD COLUMN NULL is metadata-only; the FK validation takes SHARE ROW EXCLUSIVE",
+        "lock_profile": "ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE ROW EXCLUSIVE on this table and on agents, and VALIDATE takes the weaker SHARE UPDATE EXCLUSIVE here with ROW SHARE on agents",
         "rollback_dependencies": [
           "memories (memories.archival_batch_id references this table)"
         ],
@@ -519,7 +519,6 @@
         "backfill_source": "UPDATE co_access_edges e SET tenant_id = m.tenant_id FROM memories m WHERE m.id = e.memory_a, only where memory_a and memory_b agree",
         "required_zero_codes": [
           "LEGACY_UNMAPPED",
-          "ORPHANED_AGENT_REFERENCE",
           "UNMAPPED_AGENT",
           "UNRESOLVABLE_OWNER",
           "NULL_OWNERSHIP_LINK",
@@ -529,7 +528,7 @@
         "validate_step": "VALIDATE both constraints after backfill",
         "future_uniqueness": null,
         "future_unique_columns": null,
-        "lock_profile": "two FK validations, each SHARE ROW EXCLUSIVE on memories",
+        "lock_profile": "two FK validations, each SHARE UPDATE EXCLUSIVE on co_access_edges with ROW SHARE on memories — concurrent DML continues throughout",
         "rollback_dependencies": [
           "memories (tranche 3)"
         ],
@@ -818,7 +817,7 @@
         "validate_step": "VALIDATE CONSTRAINT after backfill",
         "future_uniqueness": "`entities_agent_id_name_key` is UNIQUE (agent_id, name) and stays agent-scoped: an entity belongs to one agent, and widening it to the tenant would merge two agents' entity namespaces. Recorded so the decision is explicit rather than an omission.",
         "future_unique_columns": null,
-        "lock_profile": "ADD COLUMN NULL is metadata-only; validation is SHARE ROW EXCLUSIVE",
+        "lock_profile": "ADD COLUMN NULL is metadata-only; ADD CONSTRAINT NOT VALID takes SHARE ROW EXCLUSIVE on this table and on agents, and VALIDATE takes the weaker SHARE UPDATE EXCLUSIVE here with ROW SHARE on agents",
         "rollback_dependencies": [
           "memory_entity_links (tranche 4)"
         ],
@@ -1829,7 +1828,7 @@
       "BACKFILL",
       "FINALIZE"
     ],
-    "finalize_guard": "FINALIZE migrations open with a guard that raises unless agent_tenancy_migrations records a completed backfill checkpoint for the tranche. `sqlx migrate run` therefore cannot advance PREPARE straight into FINALIZE: on a fresh database the guard fires because no backfill ran, and on a live database it fires until the operator's backfill command records completion.",
+    "finalize_guard": "FINALIZE migrations open with a guard that raises unless tenancy_backfill_checkpoints records a COMPLETED checkpoint for *this* tranche against the current contract digest with blocking_count = 0. `sqlx migrate run` therefore cannot advance PREPARE straight into FINALIZE: on a fresh database the guard fires because no backfill ran, and on a live database it fires until the operator's backfill command records completion. agent_tenancy_migrations cannot serve as that evidence — it has no tranche, no digest, no cursor and no status column — so Step 4B-1 must create the checkpoint table before the first backfill runs.",
     "concurrent_build_mechanism": "A migration containing CREATE INDEX CONCURRENTLY must carry `-- no-transaction` as its first line so sqlx runs it unwrapped. A concurrent build that fails leaves an INVALID index behind, which the Step 4A verifier already reports as drift, so a failed build cannot be mistaken for a healthy one.",
     "lock_profiles": [
       {
@@ -1841,8 +1840,12 @@
         "locks": "SHARE UPDATE EXCLUSIVE; must run outside a transaction block"
       },
       {
-        "operation": "ADD CONSTRAINT ... NOT VALID",
+        "operation": "ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID",
         "locks": "SHARE ROW EXCLUSIVE on the child AND on the referenced table"
+      },
+      {
+        "operation": "ADD CONSTRAINT ... CHECK ... NOT VALID",
+        "locks": "ACCESS EXCLUSIVE on the table alone, brief — no row scan, and no parent is locked alongside it"
       },
       {
         "operation": "VALIDATE CONSTRAINT",
@@ -1867,8 +1870,10 @@
       {
         "table": "agents",
         "name": "agents_tenant_id_id_key",
-        "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
-        "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": false,
+        "creating_tranche": null,
+        "validating_tranche": null,
         "local_columns": [
           "tenant_id",
           "id"
@@ -1877,15 +1882,20 @@
         "referenced_columns": [],
         "unique": true,
         "not_valid_permitted": false,
-        "concurrent_build_required": true,
-        "creation_lock": "CREATE_INDEX_CONCURRENTLY",
+        "concurrent_build_required": false,
+        "creation_lock": null,
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "agents UNIQUE (tenant_id, id) AS `agents_tenant_id_id_key` — already current"
       },
       {
         "table": "archival_batches",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -1897,11 +1907,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE archival_batches ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "archival_batches",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -1913,11 +1928,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE archival_batches ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "archival_batches",
         "name": "idx_archival_batches_tenant",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -1932,11 +1952,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_archival_batches_tenant ON archival_batches (tenant_id, agent_uuid)"
       },
       {
         "table": "archival_batches",
         "name": "archival_batches_id_tenant_id_key",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -1951,11 +1976,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "archival_batches UNIQUE (id, tenant_id) AS `archival_batches_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
         "table": "archival_batches",
         "name": "archival_batches_tenant_agent_fkey",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -1973,11 +2003,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE archival_batches ADD CONSTRAINT archival_batches_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "audit_logs",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -1989,11 +2024,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "REMAINS_NULLABLE",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE audit_logs ADD COLUMN agent_uuid UUID NULL — NULL-able, and stays NULL-able"
       },
       {
         "table": "audit_logs",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2005,11 +2045,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "REMAINS_NULLABLE",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE audit_logs ADD COLUMN tenant_id UUID NULL — NULL-able, and stays NULL-able"
       },
       {
         "table": "audit_logs",
         "name": "idx_audit_logs_tenant",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2024,11 +2069,19 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_audit_logs_tenant ON audit_logs (tenant_id, agent_uuid)"
       },
       {
         "table": "audit_logs",
         "name": "audit_logs_tenant_agent_fkey",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2046,11 +2099,19 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "entities",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2062,11 +2123,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE entities ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "entities",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2078,11 +2144,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE entities ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "entities",
         "name": "idx_entities_tenant",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2097,11 +2168,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_entities_tenant ON entities (tenant_id, agent_uuid)"
       },
       {
         "table": "entities",
         "name": "entities_id_tenant_id_key",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2116,11 +2192,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "entities UNIQUE (id, tenant_id) AS `entities_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
         "table": "entities",
         "name": "entities_tenant_agent_fkey",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2138,11 +2219,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "memory_graph",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2154,11 +2240,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_graph ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_graph",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2170,11 +2261,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_graph ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_graph",
         "name": "idx_memory_graph_tenant",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2189,11 +2285,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_graph_tenant ON memory_graph (tenant_id, agent_uuid)"
       },
       {
         "table": "memory_graph",
         "name": "memory_graph_tenant_agent_fkey",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2211,11 +2312,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_graph ADD CONSTRAINT memory_graph_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "rmk_policies",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2227,11 +2333,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_policies ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "rmk_policies",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [],
@@ -2243,11 +2354,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_policies ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "rmk_policies",
         "name": "idx_rmk_policies_tenant",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2262,11 +2378,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_rmk_policies_tenant ON rmk_policies (tenant_id, agent_uuid)"
       },
       {
         "table": "rmk_policies",
         "name": "rmk_policies_id_tenant_id_key",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2281,11 +2402,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "rmk_policies UNIQUE (id, tenant_id) AS `rmk_policies_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
         "table": "rmk_policies",
         "name": "rmk_policies_tenant_agent_fkey",
+        "declared_in": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "validating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
         "local_columns": [
@@ -2303,11 +2429,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_policies ADD CONSTRAINT rmk_policies_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "sessions",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [],
@@ -2319,11 +2450,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE sessions ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "sessions",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [],
@@ -2335,11 +2471,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE sessions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "sessions",
         "name": "idx_sessions_tenant",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2354,11 +2495,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_sessions_tenant ON sessions (tenant_id, agent_uuid)"
       },
       {
         "table": "sessions",
         "name": "sessions_tenant_agent_session_key",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2374,11 +2520,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "sessions UNIQUE (tenant_id, agent_uuid, session_id) AS `sessions_tenant_agent_session_key` — created by Step 4B as an FK target"
       },
       {
         "table": "sessions",
         "name": "sessions_tenant_agent_fkey",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2396,11 +2547,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE sessions ADD CONSTRAINT sessions_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "working_memory",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [],
@@ -2412,11 +2568,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "working_memory",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [],
@@ -2428,11 +2589,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "working_memory",
         "name": "idx_working_memory_tenant",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2447,11 +2613,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_working_memory_tenant ON working_memory (tenant_id, agent_uuid)"
       },
       {
         "table": "working_memory",
         "name": "working_memory_tenant_agent_fkey",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2469,11 +2640,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD CONSTRAINT working_memory_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "working_memory",
         "name": "working_memory_session_fkey",
+        "declared_in": "TRANCHE_2_SESSIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_2_SESSIONS",
         "validating_tranche": "TRANCHE_2_SESSIONS",
         "local_columns": [
@@ -2493,11 +2669,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD CONSTRAINT working_memory_session_fkey FOREIGN KEY (tenant_id, agent_uuid, session_id) REFERENCES sessions (tenant_id, agent_uuid, session_id) NOT VALID"
       },
       {
         "table": "memories",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2509,11 +2690,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memories ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memories",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2525,11 +2711,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memories ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memories",
         "name": "idx_memories_tenant",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2544,11 +2735,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memories_tenant ON memories (tenant_id, agent_uuid)"
       },
       {
         "table": "memories",
         "name": "memories_id_tenant_id_key",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2563,11 +2759,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "memories UNIQUE (id, tenant_id) AS `memories_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
         "table": "memories",
         "name": "memories_tenant_agent_fkey",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2585,11 +2786,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memories ADD CONSTRAINT memories_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "memories",
         "name": "memories_archival_batch_tenant_fkey",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2607,11 +2813,18 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "archival_batch_id"
+        ],
         "rendered": "ALTER TABLE memories ADD CONSTRAINT memories_archival_batch_tenant_fkey FOREIGN KEY (archival_batch_id, tenant_id) REFERENCES archival_batches (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "extraction_jobs",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2623,11 +2836,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE extraction_jobs ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "extraction_jobs",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2639,11 +2857,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE extraction_jobs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "extraction_jobs",
         "name": "idx_extraction_jobs_tenant",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2658,11 +2881,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_extraction_jobs_tenant ON extraction_jobs (tenant_id, agent_uuid)"
       },
       {
         "table": "extraction_jobs",
         "name": "extraction_jobs_tenant_agent_fkey",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2680,11 +2908,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE extraction_jobs ADD CONSTRAINT extraction_jobs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "memory_retrieval_logs",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2696,11 +2929,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_retrieval_logs",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2712,11 +2950,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_retrieval_logs",
         "name": "idx_memory_retrieval_logs_tenant",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2731,11 +2974,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_retrieval_logs_tenant ON memory_retrieval_logs (tenant_id, agent_uuid)"
       },
       {
         "table": "memory_retrieval_logs",
         "name": "memory_retrieval_logs_tenant_agent_fkey",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2753,11 +3001,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD CONSTRAINT memory_retrieval_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "cognitive_hypervisor_timeline",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2769,11 +3022,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "cognitive_hypervisor_timeline",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [],
@@ -2785,11 +3043,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "cognitive_hypervisor_timeline",
         "name": "idx_cht_tenant",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2804,11 +3067,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_cht_tenant ON cognitive_hypervisor_timeline (tenant_id, agent_uuid)"
       },
       {
         "table": "cognitive_hypervisor_timeline",
         "name": "cht_tenant_agent_fkey",
+        "declared_in": "TRANCHE_3_MEMORIES",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_3_MEMORIES",
         "validating_tranche": "TRANCHE_3_MEMORIES",
         "local_columns": [
@@ -2826,11 +3094,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD CONSTRAINT cht_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "memory_versions",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -2842,11 +3115,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_versions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_versions",
         "name": "idx_memory_versions_tenant",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2860,11 +3138,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_versions_tenant ON memory_versions (tenant_id)"
       },
       {
         "table": "memory_versions",
         "name": "memory_versions_memory_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2882,11 +3165,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_versions ADD CONSTRAINT memory_versions_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
         "table": "memory_entity_links",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -2898,11 +3186,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_entity_links ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_entity_links",
         "name": "idx_memory_entity_links_tenant",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2916,11 +3209,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_entity_links_tenant ON memory_entity_links (tenant_id)"
       },
       {
         "table": "memory_entity_links",
         "name": "memory_entity_links_memory_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2938,11 +3236,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
         "table": "memory_entity_links",
         "name": "memory_entity_links_entity_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2960,11 +3263,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_entity_tenant_fkey FOREIGN KEY (entity_id, tenant_id) REFERENCES entities (id, tenant_id) NOT VALID"
       },
       {
         "table": "co_access_edges",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -2976,11 +3284,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE co_access_edges ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "co_access_edges",
         "name": "idx_co_access_edges_tenant",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -2994,11 +3307,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_co_access_edges_tenant ON co_access_edges (tenant_id)"
       },
       {
         "table": "co_access_edges",
         "name": "co_access_edges_memory_a_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3016,11 +3334,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
         "table": "co_access_edges",
         "name": "co_access_edges_memory_b_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3038,11 +3361,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
         "table": "memory_conflicts",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -3054,11 +3382,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_conflicts ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_conflicts",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -3070,11 +3403,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_conflicts ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "memory_conflicts",
         "name": "idx_memory_conflicts_tenant",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3089,11 +3427,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_conflicts_tenant ON memory_conflicts (tenant_id, agent_uuid)"
       },
       {
         "table": "memory_conflicts",
         "name": "memory_conflicts_tenant_agent_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3111,11 +3454,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "memory_conflicts",
         "name": "memory_conflicts_memory_a_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3133,11 +3481,18 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "memory_a"
+        ],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "memory_conflicts",
         "name": "memory_conflicts_memory_b_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3155,11 +3510,18 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "memory_b"
+        ],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "retrieval_feedback",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -3171,11 +3533,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE retrieval_feedback ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "retrieval_feedback",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [],
@@ -3187,11 +3554,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE retrieval_feedback ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "retrieval_feedback",
         "name": "idx_retrieval_feedback_tenant",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3206,11 +3578,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_retrieval_feedback_tenant ON retrieval_feedback (tenant_id, agent_uuid)"
       },
       {
         "table": "retrieval_feedback",
         "name": "retrieval_feedback_tenant_agent_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3228,11 +3605,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "retrieval_feedback",
         "name": "retrieval_feedback_memory_tenant_fkey",
+        "declared_in": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "validating_tranche": "TRANCHE_4_LINEAGE_AND_ARCHIVAL",
         "local_columns": [
@@ -3250,11 +3632,18 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "memory_id"
+        ],
         "rendered": "ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "amp_controller_state",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [],
@@ -3266,11 +3655,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE amp_controller_state ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "amp_controller_state",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [],
@@ -3282,11 +3676,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE amp_controller_state ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "amp_controller_state",
         "name": "idx_amp_controller_state_tenant",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [
@@ -3301,11 +3700,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_amp_controller_state_tenant ON amp_controller_state (tenant_id, agent_uuid)"
       },
       {
         "table": "amp_controller_state",
         "name": "amp_controller_state_tenant_agent_fkey",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [
@@ -3323,11 +3727,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE amp_controller_state ADD CONSTRAINT amp_controller_state_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "rmk_episodes",
         "name": "agent_uuid",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [],
@@ -3339,11 +3748,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_episodes ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "rmk_episodes",
         "name": "tenant_id",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [],
@@ -3355,11 +3769,16 @@
         "creation_lock": "ADD_COLUMN_NULLABLE",
         "validation_lock": null,
         "nullability": "NULLABLE_THEN_TIGHTENED",
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_episodes ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
         "table": "rmk_episodes",
         "name": "idx_rmk_episodes_tenant",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [
@@ -3374,11 +3793,16 @@
         "creation_lock": "CREATE_INDEX_CONCURRENTLY",
         "validation_lock": null,
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "CREATE INDEX CONCURRENTLY idx_rmk_episodes_tenant ON rmk_episodes (tenant_id, agent_uuid)"
       },
       {
         "table": "rmk_episodes",
         "name": "rmk_episodes_tenant_agent_fkey",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [
@@ -3396,11 +3820,16 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": false,
+        "match_semantics": "ALL_ROWS_CHECKED",
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
         "table": "rmk_episodes",
         "name": "rmk_episodes_policy_tenant_fkey",
+        "declared_in": "TRANCHE_5_OPERATIONS",
+        "requires_creation": true,
         "creating_tranche": "TRANCHE_5_OPERATIONS",
         "validating_tranche": "TRANCHE_5_OPERATIONS",
         "local_columns": [
@@ -3418,11 +3847,18 @@
         "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": true,
+        "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "nullable_local_columns": [
+          "policy_id"
+        ],
         "rendered": "ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_policy_tenant_fkey FOREIGN KEY (policy_id, tenant_id) REFERENCES rmk_policies (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
         "table": "agents",
         "name": "agents_tenant_id_not_null_chk",
+        "declared_in": "FINAL_CONSTRAINT_TIGHTENING",
+        "requires_creation": true,
         "creating_tranche": "FINAL_CONSTRAINT_TIGHTENING",
         "validating_tranche": "FINAL_CONSTRAINT_TIGHTENING",
         "local_columns": [
@@ -3433,10 +3869,119 @@
         "unique": false,
         "not_valid_permitted": true,
         "concurrent_build_required": false,
-        "creation_lock": "ADD_FOREIGN_KEY_NOT_VALID",
+        "creation_lock": "ADD_CHECK_NOT_VALID",
         "validation_lock": "VALIDATE_CONSTRAINT",
         "nullability": null,
+        "unenforced_when_null": null,
+        "match_semantics": null,
+        "nullable_local_columns": [],
         "rendered": "ALTER TABLE agents ADD CONSTRAINT agents_tenant_id_not_null_chk CHECK (tenant_id IS NOT NULL) NOT VALID"
+      }
+    ],
+    "planned_tables": [
+      {
+        "name": "tenancy_backfill_checkpoints",
+        "purpose": "Per-tranche, per-contract backfill evidence. BACKFILL writes progress here and FINALIZE refuses to proceed without a COMPLETED row for its own tranche against the current contract digest with zero blocking findings.",
+        "columns": [
+          {
+            "name": "id",
+            "sql_type": "UUID",
+            "nullable": false,
+            "role": "IDENTITY"
+          },
+          {
+            "name": "tranche",
+            "sql_type": "TEXT",
+            "nullable": false,
+            "role": "TRANCHE"
+          },
+          {
+            "name": "contract_digest",
+            "sql_type": "TEXT",
+            "nullable": false,
+            "role": "CONTRACT_DIGEST"
+          },
+          {
+            "name": "status",
+            "sql_type": "TEXT",
+            "nullable": false,
+            "role": "STATUS"
+          },
+          {
+            "name": "resume_cursor",
+            "sql_type": "TEXT",
+            "nullable": true,
+            "role": "RESUMABLE_CURSOR"
+          },
+          {
+            "name": "rows_total",
+            "sql_type": "BIGINT",
+            "nullable": false,
+            "role": "ROW_COUNT"
+          },
+          {
+            "name": "rows_backfilled",
+            "sql_type": "BIGINT",
+            "nullable": false,
+            "role": "ROW_COUNT"
+          },
+          {
+            "name": "blocking_count",
+            "sql_type": "BIGINT",
+            "nullable": false,
+            "role": "BLOCKING_COUNT"
+          },
+          {
+            "name": "started_at",
+            "sql_type": "TIMESTAMPTZ",
+            "nullable": false,
+            "role": "TIMESTAMP"
+          },
+          {
+            "name": "updated_at",
+            "sql_type": "TIMESTAMPTZ",
+            "nullable": false,
+            "role": "TIMESTAMP"
+          },
+          {
+            "name": "completed_at",
+            "sql_type": "TIMESTAMPTZ",
+            "nullable": true,
+            "role": "TIMESTAMP"
+          }
+        ],
+        "unique_completion": [
+          "tranche",
+          "contract_digest"
+        ],
+        "unique_completion_when": "COMPLETED",
+        "creating_tranche": "TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN",
+        "joins_contract": "Created in the PREPARE of the first tranche, before any backfill runs. The same change registers it in the Step 4A inventory REGISTRY and the current-schema contract, so the table cannot exist as an unregistered side-table the verifier reports as drift."
+      }
+    ],
+    "finalize_precondition": {
+      "required_status": "COMPLETED",
+      "tranche_must_match_exactly": true,
+      "digest_must_match_current": true,
+      "max_blocking_count": 0
+    },
+    "checkpoint_statuses": [
+      "IN_PROGRESS",
+      "COMPLETED",
+      "ABANDONED"
+    ],
+    "compatibility_prerequisites": [
+      {
+        "planned_object": "working_memory_session_fkey",
+        "blocker": "upsert_working_memory inserts into working_memory first and mirrors into sessions second, as two separate autocommit statements on the pool. Once working_memory_session_fkey exists the first statement references a sessions row the second has not written yet, so the first turn of every new session fails. NOT VALID does not defer this: it exempts historical rows, never new ones.",
+        "required_write_order": [
+          "sessions",
+          "working_memory"
+        ],
+        "single_transaction": true,
+        "writers_deployed_before": "PREPARE",
+        "drain_incompatible_binaries": true,
+        "rollback": "Once the foreign key exists, rolling the application back to a release with the old write order reintroduces the failure. A rollback therefore requires either dropping working_memory_session_fkey or keeping a bridge that materialises the parent session row before the child write. Rolling back the binary alone is not a recovery path."
       }
     ],
     "backfill_authority": [
@@ -3489,6 +4034,39 @@
         "on_disagreement": "left NULL and reported; sessions must be fully backfilled first, so a NULL here means either the session row does not exist yet or its own backfill has not run"
       }
     ],
+    "uniqueness_transitions": [
+      {
+        "table": "sessions",
+        "from": [
+          "agent_id",
+          "session_id"
+        ],
+        "to": [
+          "tenant_id",
+          "agent_uuid",
+          "session_id"
+        ],
+        "change": {
+          "transition": "RELAXATION"
+        },
+        "reason": "agent_uuid is a one-for-one re-identification of the legacy agent_id, and tenant_id is added rather than substituted for anything. Two rows distinguished by (agent_id, session_id) remain distinguished by (tenant_id, agent_uuid, session_id), so nothing legal today can collide under the new tuple."
+      },
+      {
+        "table": "agents",
+        "from": [
+          "tenant_id",
+          "external_agent_id"
+        ],
+        "to": [
+          "tenant_id",
+          "external_agent_id"
+        ],
+        "change": {
+          "transition": "ALREADY_IMPLIED"
+        },
+        "reason": "UNIQUE (tenant_id, external_agent_id) already exists. Step 4B adds no uniqueness to agents, so the tuple is unchanged."
+      }
+    ],
     "structurally_unreachable": [
       {
         "table": "memories",
@@ -3509,6 +4087,11 @@
         "table": "memory_versions",
         "code": "ORPHANED_MEMORY_REFERENCE",
         "reason": "same structure as co_access_edges: FK-backed, so the orphan count is withheld under drift and the drift is what blocks."
+      },
+      {
+        "table": "co_access_edges",
+        "code": "ORPHANED_AGENT_REFERENCE",
+        "reason": "co_access_edges is the only table in the schema with no agent column. The audit derives an orphan code from the path kind, and both of this table's paths — memory_a and memory_b — are Memory paths, so a missing parent raises ORPHANED_MEMORY_REFERENCE and never ORPHANED_AGENT_REFERENCE. Requiring it to be zero was requiring zero of something that cannot be produced. LEGACY_UNMAPPED and UNMAPPED_AGENT are *not* removed with it: those come off the canonical chain memory_a -> memories.agent_id -> agents.tenant_id and remain reachable transitively, so they stay in the required-zero set."
       },
       {
         "table": "agents",
