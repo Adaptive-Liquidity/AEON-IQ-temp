@@ -1027,6 +1027,30 @@ mod tests {
         assert!(inventory_digest().starts_with("sha256:"));
     }
 
+    /// The published lock-profile table lists every profile the plan defines.
+    ///
+    /// Both the JSON block and the Markdown table are built by mapping
+    /// `LockProfile::ALL`, so they cannot drift from the enum — but a filter
+    /// added to either would silently publish a shorter contract, and a reader
+    /// cannot tell a profile that was omitted from one that does not exist.
+    #[test]
+    fn every_lock_profile_reaches_the_published_contract() {
+        let published = step_4b_contract().lock_profiles;
+        assert_eq!(published.len(), plan::LockProfile::ALL.len());
+        for profile in plan::LockProfile::ALL {
+            assert!(
+                published.iter().any(|p| p.operation == profile.as_str()),
+                "`{}` is defined but never published",
+                profile.as_str()
+            );
+        }
+        // The two-phase build's second half is the reason this matters: it was
+        // the profile most recently missing from the rendered contract.
+        assert!(published
+            .iter()
+            .any(|p| p.operation == plan::LockProfile::AddUniqueUsingIndex.as_str()));
+    }
+
     /// The schema version is pinned to a literal.
     ///
     /// Comparing `report.schema_version` against `REPORT_SCHEMA_VERSION` — as
@@ -1109,6 +1133,16 @@ mod tests {
                 "`{}` disagrees with itself about taking a creation lock",
                 doc.name
             );
+            // An attach phase only exists for something that is built, and it
+            // is always the two-phase unique-target build.
+            if let Some(attach) = doc.attachment_lock {
+                assert!(
+                    doc.requires_creation,
+                    "`{}` publishes an attach lock for something nothing builds",
+                    doc.name
+                );
+                assert_eq!(attach, plan::LockProfile::AddUniqueUsingIndex);
+            }
             // …and the derived flag must match the columns it was derived from.
             assert_eq!(
                 doc.unenforced_when_null,
