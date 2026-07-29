@@ -346,7 +346,13 @@ pub enum LockProfile {
     AddCheckNotValid,
     /// `SHARE UPDATE EXCLUSIVE` on the child and `ROW SHARE` on the referenced
     /// table. Scans every row, but concurrent DML continues throughout.
+    ///
+    /// Foreign keys only — the referenced-table half is what makes it specific
+    /// to them. See [`Self::ValidateCheckConstraint`].
     ValidateConstraint,
+    /// `SHARE UPDATE EXCLUSIVE` on the table alone. Scans every row, concurrent
+    /// DML continues, and no parent is involved because a CHECK has none.
+    ValidateCheckConstraint,
     /// `ACCESS EXCLUSIVE`. Scans the table unless an already-validated CHECK
     /// lets PostgreSQL 12+ skip the scan.
     SetNotNull,
@@ -363,7 +369,8 @@ impl LockProfile {
             Self::CreateIndexConcurrently => "CREATE INDEX CONCURRENTLY",
             Self::AddForeignKeyNotValid => "ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID",
             Self::AddCheckNotValid => "ADD CONSTRAINT ... CHECK ... NOT VALID",
-            Self::ValidateConstraint => "VALIDATE CONSTRAINT",
+            Self::ValidateConstraint => "VALIDATE CONSTRAINT (foreign key)",
+            Self::ValidateCheckConstraint => "VALIDATE CONSTRAINT (CHECK)",
             Self::SetNotNull => "SET NOT NULL",
             Self::TableRewrite => "table rewrite",
             Self::DropColumn => "DROP COLUMN",
@@ -387,6 +394,9 @@ impl LockProfile {
             Self::ValidateConstraint => {
                 "SHARE UPDATE EXCLUSIVE on the child, ROW SHARE on the referenced table"
             }
+            Self::ValidateCheckConstraint => {
+                "SHARE UPDATE EXCLUSIVE on the table alone — a CHECK has no parent to lock"
+            }
             Self::SetNotNull => "ACCESS EXCLUSIVE; full scan unless a validated CHECK permits skip",
             Self::TableRewrite => "ACCESS EXCLUSIVE for the whole rewrite",
             Self::DropColumn => "ACCESS EXCLUSIVE, brief — catalog update only",
@@ -399,6 +409,7 @@ impl LockProfile {
         Self::AddForeignKeyNotValid,
         Self::AddCheckNotValid,
         Self::ValidateConstraint,
+        Self::ValidateCheckConstraint,
         Self::SetNotNull,
         Self::TableRewrite,
         Self::DropColumn,
@@ -464,6 +475,19 @@ pub enum MatchSemantics {
     /// checked against the parent at all. The key is therefore not evidence of
     /// ownership for those rows — the audit is.
     NullKeyRowsUnchecked,
+}
+
+/// Which of a planned key's two lifetimes a nullability question is about.
+///
+/// A foreign key on ownership columns is unenforced for un-backfilled rows
+/// while its tranche runs, and fully enforced once STEP 7 tightens the columns.
+/// Both are true; they are true at different times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnforcementWindow {
+    /// PREPARE through BACKFILL, while ownership columns may still be NULL.
+    DuringTransition,
+    /// After FUTURE STEP 7's `SET NOT NULL`.
+    AfterTightening,
 }
 
 impl MatchSemantics {
@@ -724,19 +748,57 @@ impl PlannedObject {
     /// column does not count — it is NULL only during the transition, and
     /// FUTURE STEP 7 closes it.
     pub fn nullable_local_columns(&self) -> Vec<&'static str> {
+        self.nullable_local_columns_in(EnforcementWindow::AfterTightening)
+    }
+
+    /// The same question asked of the transition, where the answer differs.
+    ///
+    /// Between PREPARE and FUTURE STEP 7 a `NullableThenTightened` column is
+    /// genuinely NULL — that is the entire point of the backfill — so
+    /// `MATCH SIMPLE` skips those rows too. A key that is fully enforced in the
+    /// end state can therefore be enforcing nothing while the tranche is still
+    /// running, which is exactly why the audit rather than the foreign key is
+    /// the gate. Modelled separately rather than folded into the end-state
+    /// answer, because the two are different facts and a consumer needs to know
+    /// which one it is reading.
+    pub fn transition_nullable_local_columns(&self) -> Vec<&'static str> {
+        self.nullable_local_columns_in(EnforcementWindow::DuringTransition)
+    }
+
+    fn nullable_local_columns_in(&self, window: EnforcementWindow) -> Vec<&'static str> {
         let table = self.table();
         self.local_columns()
             .iter()
             .copied()
             .filter(|column| {
-                PRE_EXISTING_NULLABLE.contains(&(table, column))
-                    || PLANNED_OBJECTS.iter().any(|p| {
-                        p.table() == table
-                            && p.name() == *column
-                            && p.nullability() == Some(Nullability::RemainsNullable)
-                    })
+                if PRE_EXISTING_NULLABLE.contains(&(table, column)) {
+                    return true;
+                }
+                PLANNED_OBJECTS.iter().any(|p| {
+                    p.table() == table
+                        && p.name() == *column
+                        && match p.nullability() {
+                            Some(Nullability::RemainsNullable) => true,
+                            // NULL only until its tranche's backfill completes.
+                            Some(Nullability::NullableThenTightened) => {
+                                window == EnforcementWindow::DuringTransition
+                            }
+                            _ => false,
+                        }
+                })
             })
             .collect()
+    }
+
+    /// The `MATCH SIMPLE` consequence during PREPARE/BACKFILL, before FUTURE
+    /// STEP 7 tightens the ownership columns.
+    pub fn transition_match_semantics(&self) -> Option<MatchSemantics> {
+        self.unenforced_when_null()?;
+        Some(if self.transition_nullable_local_columns().is_empty() {
+            MatchSemantics::AllRowsChecked
+        } else {
+            MatchSemantics::NullKeyRowsUnchecked
+        })
     }
 
     /// Whether this object may be added `NOT VALID` and validated later.
@@ -780,10 +842,15 @@ impl PlannedObject {
 
     /// The lock this object's validation takes, where it has one.
     pub const fn validation_lock(&self) -> Option<LockProfile> {
-        if self.not_valid_permitted() {
-            Some(LockProfile::ValidateConstraint)
-        } else {
-            None
+        match self {
+            Self::ForeignKey { .. } => Some(LockProfile::ValidateConstraint),
+            // A CHECK has no parent, so its validation locks one table. Reusing
+            // the foreign-key profile would promise a `ROW SHARE` on a
+            // referenced table that does not exist — the same conflation on the
+            // validation side that `AddCheckNotValid` fixes on the creation
+            // side.
+            Self::Constraint { .. } => Some(LockProfile::ValidateCheckConstraint),
+            _ => None,
         }
     }
 
@@ -2660,8 +2727,55 @@ mod invariants {
             if object.referenced().is_none() {
                 assert_eq!(object.match_semantics(), None);
                 assert_eq!(object.unenforced_when_null(), None);
+                assert_eq!(object.transition_match_semantics(), None);
             }
         }
+    }
+
+    /// The transition window is strictly weaker than the end state.
+    ///
+    /// While a tranche runs, its ownership columns are genuinely NULL — that is
+    /// what the backfill is for — so `MATCH SIMPLE` skips those rows too. A key
+    /// recorded as fully enforced can therefore be enforcing nothing until
+    /// FUTURE STEP 7 tightens the columns, which is precisely why the audit and
+    /// not the foreign key is the gate. Both facts are published; neither may
+    /// be mistaken for the other.
+    #[test]
+    fn transition_semantics_are_never_stronger_than_the_end_state() {
+        let mut weaker_during_transition = 0usize;
+        for object in PLANNED_OBJECTS {
+            if object.unenforced_when_null().is_none() {
+                continue;
+            }
+            let end_state = object.nullable_local_columns();
+            let during = object.transition_nullable_local_columns();
+            for column in &end_state {
+                assert!(
+                    during.contains(column),
+                    "`{}` claims `{column}` is NULL-able in the end state but not during the \
+                     transition; nothing tightens a column *into* being NULL-able",
+                    object.name()
+                );
+            }
+            if during.len() > end_state.len() {
+                weaker_during_transition += 1;
+                assert_eq!(
+                    object.transition_match_semantics(),
+                    Some(MatchSemantics::NullKeyRowsUnchecked),
+                    "`{}` has transitional NULL-able columns, so MATCH SIMPLE skips those rows \
+                     while the tranche runs",
+                    object.name()
+                );
+            }
+        }
+        // The distinction has to be load-bearing for something, or publishing
+        // it is noise. Every ownership foreign key is unenforced until its
+        // backfill completes.
+        assert!(
+            weaker_during_transition > 0,
+            "no planned key is weaker during the transition; if that is genuinely true, the \
+             transition fields are redundant and should go"
+        );
     }
 
     /// An already-current target is a dependency prerequisite, not a unit of
@@ -2795,17 +2909,35 @@ mod invariants {
         assert!(LockProfile::AddForeignKeyNotValid
             .locks()
             .contains("referenced table"));
+        // Both VALIDATE profiles take SHARE UPDATE EXCLUSIVE on the table being
+        // validated; they differ only in whether a parent is locked alongside
+        // it, which a CHECK does not have.
+        assert!(LockProfile::ValidateCheckConstraint
+            .locks()
+            .contains("SHARE UPDATE EXCLUSIVE"));
         for object in PLANNED_OBJECTS {
-            if object.not_valid_permitted() {
-                assert_eq!(
-                    object.validation_lock(),
-                    Some(LockProfile::ValidateConstraint),
-                    "`{}` permits NOT VALID so it must validate under the weaker lock",
+            let Some(validation) = object.validation_lock() else {
+                assert!(
+                    !object.not_valid_permitted(),
+                    "`{}` permits NOT VALID but declares no validation lock",
                     object.name()
                 );
-            } else {
-                assert_eq!(object.validation_lock(), None);
-            }
+                continue;
+            };
+            assert!(
+                object.not_valid_permitted(),
+                "`{}` declares a validation lock but cannot be added NOT VALID",
+                object.name()
+            );
+            assert!(
+                matches!(
+                    validation,
+                    LockProfile::ValidateConstraint | LockProfile::ValidateCheckConstraint
+                ) && validation.locks().contains("SHARE UPDATE EXCLUSIVE"),
+                "`{}` permits NOT VALID so it must validate under a weaker lock, not {}",
+                object.name(),
+                validation.as_str()
+            );
         }
     }
 
@@ -2851,20 +2983,31 @@ mod invariants {
                 ),
                 _ => {}
             }
-            // Whichever of the two it is, validation stays separate and weaker.
+            // Whichever of the two it is, validation stays separate and weaker
+            // — and a CHECK validates under its own profile, because it has no
+            // parent to take ROW SHARE on.
             if object.not_valid_permitted() {
-                assert_eq!(
-                    object.validation_lock(),
-                    Some(LockProfile::ValidateConstraint)
-                );
+                let expected = match object {
+                    PlannedObject::Constraint { .. } => LockProfile::ValidateCheckConstraint,
+                    _ => LockProfile::ValidateConstraint,
+                };
+                assert_eq!(object.validation_lock(), Some(expected));
                 assert_ne!(
                     object.creation_lock(),
-                    Some(LockProfile::ValidateConstraint),
+                    object.validation_lock(),
                     "`{}` must not conflate declaring a constraint with validating it",
                     object.name()
                 );
             }
         }
+        // A CHECK's validation may not claim a referenced table.
+        let check = LockProfile::ValidateCheckConstraint.locks();
+        assert!(check.contains("SHARE UPDATE EXCLUSIVE"));
+        assert!(
+            !check.contains("ROW SHARE"),
+            "a CHECK has no parent, so its validation locks no second table: {check}"
+        );
+        assert!(LockProfile::ALL.contains(&LockProfile::ValidateCheckConstraint));
     }
 
     /// No table's prose may claim that *validation* takes the creation lock.

@@ -373,6 +373,12 @@ pub struct PlannedObjectDoc {
     /// Exactly which local columns can contain NULL, keyed on `(table, column)`
     /// rather than on the column name.
     pub nullable_local_columns: Vec<&'static str>,
+    /// The same two facts for the PREPARE-through-BACKFILL window, where an
+    /// ownership column is genuinely NULL until its tranche's backfill reaches
+    /// the row. A key that is fully enforced in the end state can be enforcing
+    /// nothing while the tranche runs.
+    pub transition_match_semantics: Option<plan::MatchSemantics>,
+    pub transition_nullable_local_columns: Vec<&'static str>,
     pub rendered: String,
 }
 
@@ -417,6 +423,8 @@ pub fn step_4b_contract() -> Step4bContract {
                     unenforced_when_null: o.unenforced_when_null(),
                     match_semantics: o.match_semantics(),
                     nullable_local_columns: o.nullable_local_columns(),
+                    transition_match_semantics: o.transition_match_semantics(),
+                    transition_nullable_local_columns: o.transition_nullable_local_columns(),
                     rendered: o.describe(),
                 }
             })

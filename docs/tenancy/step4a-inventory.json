@@ -1,6 +1,6 @@
 {
   "schema_version": "step4b0.1",
-  "inventory_digest": "sha256:56512cd95f687470a5c6a0504768e2a51798cd4c051e6bc3a1e55ad02630f681",
+  "inventory_digest": "sha256:a5edc2b890880f810e8f6598a75de0e4147c43e05683de01dbac492eea15591d",
   "reason_codes": [
     {
       "code": "UNCLASSIFIED_TABLE",
@@ -1848,8 +1848,12 @@
         "locks": "ACCESS EXCLUSIVE on the table alone, brief — no row scan, and no parent is locked alongside it"
       },
       {
-        "operation": "VALIDATE CONSTRAINT",
+        "operation": "VALIDATE CONSTRAINT (foreign key)",
         "locks": "SHARE UPDATE EXCLUSIVE on the child, ROW SHARE on the referenced table"
+      },
+      {
+        "operation": "VALIDATE CONSTRAINT (CHECK)",
+        "locks": "SHARE UPDATE EXCLUSIVE on the table alone — a CHECK has no parent to lock"
       },
       {
         "operation": "SET NOT NULL",
@@ -1889,6 +1893,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "agents UNIQUE (tenant_id, id) AS `agents_tenant_id_id_key` — already current"
       },
       {
@@ -1910,6 +1916,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE archival_batches ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -1931,6 +1939,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE archival_batches ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -1955,6 +1965,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_archival_batches_tenant ON archival_batches (tenant_id, agent_uuid)"
       },
       {
@@ -1979,6 +1994,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "archival_batches UNIQUE (id, tenant_id) AS `archival_batches_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
@@ -2006,6 +2025,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE archival_batches ADD CONSTRAINT archival_batches_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2027,6 +2051,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE audit_logs ADD COLUMN agent_uuid UUID NULL — NULL-able, and stays NULL-able"
       },
       {
@@ -2048,6 +2074,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE audit_logs ADD COLUMN tenant_id UUID NULL — NULL-able, and stays NULL-able"
       },
       {
@@ -2072,6 +2100,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
           "tenant_id",
           "agent_uuid"
         ],
@@ -2105,6 +2138,11 @@
           "tenant_id",
           "agent_uuid"
         ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE audit_logs ADD CONSTRAINT audit_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
@@ -2126,6 +2164,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE entities ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2147,6 +2187,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE entities ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2171,6 +2213,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_entities_tenant ON entities (tenant_id, agent_uuid)"
       },
       {
@@ -2195,6 +2242,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "entities UNIQUE (id, tenant_id) AS `entities_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
@@ -2222,6 +2273,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE entities ADD CONSTRAINT entities_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2243,6 +2299,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_graph ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2264,6 +2322,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_graph ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2288,6 +2348,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_graph_tenant ON memory_graph (tenant_id, agent_uuid)"
       },
       {
@@ -2315,6 +2380,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE memory_graph ADD CONSTRAINT memory_graph_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2336,6 +2406,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_policies ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2357,6 +2429,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_policies ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2381,6 +2455,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_rmk_policies_tenant ON rmk_policies (tenant_id, agent_uuid)"
       },
       {
@@ -2405,6 +2484,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "rmk_policies UNIQUE (id, tenant_id) AS `rmk_policies_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
@@ -2432,6 +2515,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE rmk_policies ADD CONSTRAINT rmk_policies_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2453,6 +2541,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE sessions ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2474,6 +2564,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE sessions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2498,6 +2590,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_sessions_tenant ON sessions (tenant_id, agent_uuid)"
       },
       {
@@ -2523,6 +2620,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "sessions UNIQUE (tenant_id, agent_uuid, session_id) AS `sessions_tenant_agent_session_key` — created by Step 4B as an FK target"
       },
       {
@@ -2550,6 +2652,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE sessions ADD CONSTRAINT sessions_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2571,6 +2678,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2592,6 +2701,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE working_memory ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2616,6 +2727,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_working_memory_tenant ON working_memory (tenant_id, agent_uuid)"
       },
       {
@@ -2643,6 +2759,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE working_memory ADD CONSTRAINT working_memory_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2672,6 +2793,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE working_memory ADD CONSTRAINT working_memory_session_fkey FOREIGN KEY (tenant_id, agent_uuid, session_id) REFERENCES sessions (tenant_id, agent_uuid, session_id) NOT VALID"
       },
       {
@@ -2693,6 +2819,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memories ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2714,6 +2842,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memories ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2738,6 +2868,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memories_tenant ON memories (tenant_id, agent_uuid)"
       },
       {
@@ -2762,6 +2897,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "memories UNIQUE (id, tenant_id) AS `memories_id_tenant_id_key` — created by Step 4B as an FK target"
       },
       {
@@ -2789,6 +2928,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE memories ADD CONSTRAINT memories_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2818,6 +2962,11 @@
         "nullable_local_columns": [
           "archival_batch_id"
         ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "archival_batch_id",
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE memories ADD CONSTRAINT memories_archival_batch_tenant_fkey FOREIGN KEY (archival_batch_id, tenant_id) REFERENCES archival_batches (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
@@ -2839,6 +2988,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE extraction_jobs ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2860,6 +3011,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE extraction_jobs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2884,6 +3037,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_extraction_jobs_tenant ON extraction_jobs (tenant_id, agent_uuid)"
       },
       {
@@ -2911,6 +3069,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE extraction_jobs ADD CONSTRAINT extraction_jobs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -2932,6 +3095,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2953,6 +3118,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -2977,6 +3144,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_retrieval_logs_tenant ON memory_retrieval_logs (tenant_id, agent_uuid)"
       },
       {
@@ -3004,6 +3176,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE memory_retrieval_logs ADD CONSTRAINT memory_retrieval_logs_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3025,6 +3202,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3046,6 +3225,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3070,6 +3251,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_cht_tenant ON cognitive_hypervisor_timeline (tenant_id, agent_uuid)"
       },
       {
@@ -3097,6 +3283,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE cognitive_hypervisor_timeline ADD CONSTRAINT cht_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3118,6 +3309,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_versions ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3141,6 +3334,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_versions_tenant ON memory_versions (tenant_id)"
       },
       {
@@ -3168,6 +3365,10 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE memory_versions ADD CONSTRAINT memory_versions_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
@@ -3189,6 +3390,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_entity_links ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3212,6 +3415,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_entity_links_tenant ON memory_entity_links (tenant_id)"
       },
       {
@@ -3239,6 +3446,10 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
@@ -3266,6 +3477,10 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE memory_entity_links ADD CONSTRAINT memory_entity_links_entity_tenant_fkey FOREIGN KEY (entity_id, tenant_id) REFERENCES entities (id, tenant_id) NOT VALID"
       },
       {
@@ -3287,6 +3502,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE co_access_edges ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3310,6 +3527,10 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_co_access_edges_tenant ON co_access_edges (tenant_id)"
       },
       {
@@ -3337,6 +3558,10 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
@@ -3364,6 +3589,10 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE co_access_edges ADD CONSTRAINT co_access_edges_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID"
       },
       {
@@ -3385,6 +3614,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_conflicts ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3406,6 +3637,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE memory_conflicts ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3430,6 +3663,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_memory_conflicts_tenant ON memory_conflicts (tenant_id, agent_uuid)"
       },
       {
@@ -3457,6 +3695,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3485,6 +3728,11 @@
         "match_semantics": "NULL_KEY_ROWS_UNCHECKED",
         "nullable_local_columns": [
           "memory_a"
+        ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "memory_a",
+          "tenant_id"
         ],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_a_tenant_fkey FOREIGN KEY (memory_a, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
@@ -3515,6 +3763,11 @@
         "nullable_local_columns": [
           "memory_b"
         ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "memory_b",
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE memory_conflicts ADD CONSTRAINT memory_conflicts_memory_b_tenant_fkey FOREIGN KEY (memory_b, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
@@ -3536,6 +3789,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE retrieval_feedback ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3557,6 +3812,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE retrieval_feedback ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3581,6 +3838,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_retrieval_feedback_tenant ON retrieval_feedback (tenant_id, agent_uuid)"
       },
       {
@@ -3608,6 +3870,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3637,6 +3904,11 @@
         "nullable_local_columns": [
           "memory_id"
         ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "memory_id",
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE retrieval_feedback ADD CONSTRAINT retrieval_feedback_memory_tenant_fkey FOREIGN KEY (memory_id, tenant_id) REFERENCES memories (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
@@ -3658,6 +3930,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE amp_controller_state ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3679,6 +3953,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE amp_controller_state ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3703,6 +3979,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_amp_controller_state_tenant ON amp_controller_state (tenant_id, agent_uuid)"
       },
       {
@@ -3730,6 +4011,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE amp_controller_state ADD CONSTRAINT amp_controller_state_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3751,6 +4037,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_episodes ADD COLUMN agent_uuid UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3772,6 +4060,8 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE rmk_episodes ADD COLUMN tenant_id UUID NULL — NULL-able now; NOT NULL in FUTURE STEP 7"
       },
       {
@@ -3796,6 +4086,11 @@
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "CREATE INDEX CONCURRENTLY idx_rmk_episodes_tenant ON rmk_episodes (tenant_id, agent_uuid)"
       },
       {
@@ -3823,6 +4118,11 @@
         "unenforced_when_null": false,
         "match_semantics": "ALL_ROWS_CHECKED",
         "nullable_local_columns": [],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "tenant_id",
+          "agent_uuid"
+        ],
         "rendered": "ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_tenant_agent_fkey FOREIGN KEY (tenant_id, agent_uuid) REFERENCES agents (tenant_id, id) NOT VALID"
       },
       {
@@ -3852,6 +4152,11 @@
         "nullable_local_columns": [
           "policy_id"
         ],
+        "transition_match_semantics": "NULL_KEY_ROWS_UNCHECKED",
+        "transition_nullable_local_columns": [
+          "policy_id",
+          "tenant_id"
+        ],
         "rendered": "ALTER TABLE rmk_episodes ADD CONSTRAINT rmk_episodes_policy_tenant_fkey FOREIGN KEY (policy_id, tenant_id) REFERENCES rmk_policies (id, tenant_id) NOT VALID — MATCH SIMPLE: rows with a NULL key component are not checked"
       },
       {
@@ -3870,11 +4175,13 @@
         "not_valid_permitted": true,
         "concurrent_build_required": false,
         "creation_lock": "ADD_CHECK_NOT_VALID",
-        "validation_lock": "VALIDATE_CONSTRAINT",
+        "validation_lock": "VALIDATE_CHECK_CONSTRAINT",
         "nullability": null,
         "unenforced_when_null": null,
         "match_semantics": null,
         "nullable_local_columns": [],
+        "transition_match_semantics": null,
+        "transition_nullable_local_columns": [],
         "rendered": "ALTER TABLE agents ADD CONSTRAINT agents_tenant_id_not_null_chk CHECK (tenant_id IS NOT NULL) NOT VALID"
       }
     ],
