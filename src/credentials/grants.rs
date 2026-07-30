@@ -1354,6 +1354,37 @@ mod db_tests {
         tenant: Uuid,
         target: Uuid,
     ) -> Result<(), sqlx::Error> {
+        // The UPDATE gets a connection of its own, established before the inserter
+        // takes its lock.
+        //
+        // This helper needs two connections held at the same instant: the inserter
+        // keeps one open across the whole gate while the racing UPDATE needs
+        // another. `#[sqlx::test]`'s pool cannot promise the second one. It is a
+        // CHILD of one master pool capped at 20 connections for the entire test
+        // binary, and it closes idle connections after one second (sqlx-postgres 0.9
+        // `testing/mod.rs`), so a connection released earlier is reaped and its
+        // permit handed back to the shared cap. Under a parallel `cargo test` the
+        // other tests are drawing on those same 20 permits, and this helper can be
+        // starved of its second connection for as long as it is willing to wait.
+        //
+        // That failure mode was measured on the sibling
+        // `a_policy_inserted_during_cleanup_cannot_break_agent_deletion`, which had
+        // the same shape: the spawned task's backend never appeared in
+        // `pg_stat_activity` at all for a full 60-second gate, then completed the
+        // instant the held connection was dropped. It is starvation, not slowness,
+        // and no gate budget can fix it -- the wait ends only when the test stops
+        // waiting, which is exactly when the interleaving can no longer happen.
+        // Reserving the connection up front, from a pool with no parent and no idle
+        // timeout to reap it, is what makes the race reachable rather than lucky.
+        let updater_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .expect("the racing UPDATE must have a connection reserved before the insert locks");
+
         let mut inserter = pool.acquire().await.unwrap();
         sqlx::raw_sql("BEGIN")
             .execute(&mut *inserter)
@@ -1374,11 +1405,11 @@ mod db_tests {
         // with the FOR SHARE the grant trigger took and still holds, so it
         // blocks until the insert commits.
         let updater = {
-            let pool = pool.clone();
+            let updater_pool = updater_pool.clone();
             tokio::spawn(async move {
                 sqlx::query("UPDATE public.credentials SET tenant_wide = TRUE WHERE id = $1")
                     .bind(cred)
-                    .execute(&pool)
+                    .execute(&updater_pool)
                     .await
                     .map(|_| ())
             })
@@ -1388,33 +1419,82 @@ mod db_tests {
         // it never blocks, the interleaving under test did not happen and the
         // result would mean nothing either way — so say so instead of scoring
         // it.
+        //
+        // THE BLOCKER MUST BE THIS INSERTER, not merely someone. The poll runs on
+        // the inserter's own connection, which buys two things: `pg_backend_pid()`
+        // IS the inserter, so requiring it to appear in `pg_blocking_pids(a.pid)`
+        // proves the UPDATE is waiting on the lock this helper is holding rather
+        // than on any lock at all; and the gate needs no third connection, which
+        // would otherwise be a third draw on the shared cap described above. The
+        // predicate is strictly narrower than the `wait_event_type = 'Lock'` scan it
+        // replaces, so it cannot admit anything that one caught.
+        //
+        // The loop ends on a definitive event -- blocked, or the UPDATE has finished
+        // and can no longer block -- rather than on a budget. The deadline is a
+        // backstop against a hang, not a latency assertion, which is why it is
+        // generous rather than tuned.
+        let gate_started = tokio::time::Instant::now();
+        let gate_budget = std::time::Duration::from_secs(120);
         let mut blocked = false;
-        for _ in 0..200 {
+        let mut finished_early = false;
+        while gate_started.elapsed() < gate_budget {
             let (waiting,): (i64,) = sqlx::query_as(
-                "SELECT count(*) FROM pg_stat_activity \
-                  WHERE datname = current_database() AND wait_event_type = 'Lock' \
-                    AND pid <> pg_backend_pid()",
+                "SELECT count(*) FROM pg_stat_activity a \
+                  WHERE a.datname = current_database() \
+                    AND a.pid <> pg_backend_pid() \
+                    AND pg_backend_pid() = ANY (pg_blocking_pids(a.pid))",
             )
-            .fetch_one(pool)
+            .fetch_one(&mut *inserter)
             .await
             .unwrap();
             if waiting > 0 {
                 blocked = true;
                 break;
             }
+            if updater.is_finished() {
+                finished_early = true;
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(
-            blocked,
-            "the UPDATE never waited on the row lock; the race under test did not occur"
-        );
+        let gate_elapsed = gate_started.elapsed();
 
+        // What the server saw, captured while it is still true, so a failed gate
+        // says whether the UPDATE was absent, idle, or waiting on somebody else.
+        let activity: Vec<(i32, String, String, String, String)> = if blocked {
+            Vec::new()
+        } else {
+            sqlx::query_as(
+                "SELECT a.pid, a.state, \
+                        COALESCE(a.wait_event_type, '-'), COALESCE(a.wait_event, '-'), \
+                        COALESCE(array_to_string(pg_blocking_pids(a.pid), ','), '') \
+                   FROM pg_stat_activity a \
+                  WHERE a.datname = current_database()",
+            )
+            .fetch_all(&mut *inserter)
+            .await
+            .unwrap_or_default()
+        };
+
+        // Commit and join BEFORE asserting, so a failed gate cannot panic out while
+        // still holding the row lock and leave the spawned task detached against a
+        // database the harness is about to drop.
         sqlx::raw_sql("COMMIT")
             .execute(&mut *inserter)
             .await
             .unwrap();
         drop(inserter);
-        updater.await.unwrap()
+        let outcome = updater.await.unwrap();
+        updater_pool.close().await;
+
+        assert!(
+            blocked,
+            "the UPDATE never waited on the row lock; the race under test did not occur. \
+             Gave up after {gate_elapsed:?}; UPDATE finished before it ever blocked: \
+             {finished_early}; its result: {outcome:?}; backends in this database at that \
+             moment (pid, state, wait_event_type, wait_event, blocked_by): {activity:?}"
+        );
+        outcome
     }
 
     #[sqlx::test(migrations = "./migrations")]
