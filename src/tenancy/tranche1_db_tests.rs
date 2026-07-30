@@ -2554,3 +2554,515 @@ async fn a_renamed_constraint_is_refused_by_shape_not_missed_by_name(pool: PgPoo
     .unwrap();
     assert_eq!(survivors, 2, "neither renamed constraint may be dropped");
 }
+
+// ── Concurrency: the parent must be locked before child cleanup ─────────────
+
+/// The RMK worker can insert a policy into the gap between the child cleanup and
+/// the parent delete.
+///
+/// Deleting the policies and then the agent is not enough on its own. While the
+/// parent row still exists the bridge resolves ownership and the NO ACTION key
+/// permits an insert, so a policy written after the `rmk_policies` delete and
+/// before the `agents` delete makes the parent delete fail — the same 500, under
+/// ordinary worker concurrency rather than a rare race.
+///
+/// Forced deterministically rather than by sleeping: a second connection opens a
+/// transaction and inserts a policy, which takes `FOR KEY SHARE` on the agent row
+/// through the foreign-key check and holds it. `delete_agent` then blocks — on
+/// `SELECT ... FOR UPDATE` with the fix, on the parent `DELETE` without it — and
+/// the test waits until a backend in *this test's own database* is genuinely
+/// blocked before releasing the other transaction. The readiness gate is
+/// described in full at the loop below; it deliberately does not use a bare
+/// `pg_locks` scan, which is cluster-wide and would be satisfied by an unrelated
+/// test. No timing assumption survives in the assertion path.
+///
+/// Driven through the real `store::delete_agent`, because the ordering under test
+/// is that function's.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPool) {
+    let state = crate::test_support::test_state(pool.clone());
+    insert_agent(&pool, "doomed", Some(TENANT)).await;
+    sqlx::query(
+        "INSERT INTO rmk_policies (agent_id, pressure_a, pressure_b, kp, ki, \
+         graph_bonus_weight, retrieval_threshold) VALUES ('doomed', 0, 0, 0, 0, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO rmk_episodes (agent_id, policy_id, task_success, token_savings, \
+                                   retrieval_precision, eviction_cost, reward) \
+         SELECT 'doomed', id, 1, 1, 1, 1, 1 FROM rmk_policies WHERE agent_id = 'doomed'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The worker: a policy insert held open inside a transaction.
+    let mut worker = pool.acquire().await.unwrap();
+    sqlx::raw_sql("BEGIN").execute(&mut *worker).await.unwrap();
+    sqlx::query(
+        "INSERT INTO rmk_policies (agent_id, pressure_a, pressure_b, kp, ki, \
+         graph_bonus_weight, retrieval_threshold) VALUES ('doomed', 9, 0, 0, 0, 0, 0)",
+    )
+    .execute(&mut *worker)
+    .await
+    .expect("the worker's insert is legitimate: the agent still exists");
+
+    let deleter = tokio::spawn({
+        let state = state.clone();
+        async move { crate::memory::store::delete_agent(&state, "doomed").await }
+    });
+
+    // Wait for the deleter to actually be blocked, rather than assuming it is.
+    //
+    // Scoped to this test's own database and to a backend something is genuinely
+    // blocking. `pg_locks` is cluster-wide, so a bare `WHERE NOT granted` is
+    // satisfied by any other test's contention -- and `#[sqlx::test]` gives each
+    // test its own database on one shared cluster while `cargo test` runs them in
+    // parallel, so that gate could release the worker before the deleter ever
+    // blocked, leaving the test to exercise no interleaving at all.
+    //
+    // Filtering `pg_locks` by `database` or `relation` does NOT fix it: measured
+    // on pg16, a FOR UPDATE waiting on FOR KEY SHARE waits on a `transactionid`
+    // lock, which carries neither column. `pg_stat_activity` does carry
+    // `datname`, and `pg_blocking_pids` confirms the backend is blocked rather
+    // than merely idle.
+    let mut blocked = false;
+    for _ in 0..200 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity a \
+              WHERE a.datname = current_database() \
+                AND a.pid <> pg_backend_pid() \
+                AND cardinality(pg_blocking_pids(a.pid)) > 0",
+        )
+        .fetch_one(&mut *worker)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Release the worker and join the task BEFORE asserting, so a failed gate
+    // cannot leave the spawned task detached and still holding a pooled
+    // connection while the test database is torn down around it.
+    sqlx::raw_sql("COMMIT").execute(&mut *worker).await.unwrap();
+    drop(worker);
+    // Bounded, so a future regression that turns this wait into a real deadlock
+    // fails with a message instead of hanging until CI's own timeout kills it.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), deleter)
+        .await
+        .expect("the deletion must not hang once the worker has committed")
+        .expect("the deleting task must not panic");
+
+    assert!(
+        blocked,
+        "the deleter must have been waiting on the worker's lock, or this test \
+         proves nothing about the interleaving"
+    );
+    let deleted = outcome.expect("deletion must survive a policy inserted during cleanup");
+    assert!(deleted, "the agent existed, so it must report a deletion");
+
+    // Both policies are gone, including the one written mid-cleanup.
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM rmk_policies WHERE agent_id='doomed'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "no policy may survive, whenever it was written");
+    let agents_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM agents WHERE agent_id='doomed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(agents_left, 0, "the agent must be gone");
+
+    // The retained-episode contract is unchanged by the lock.
+    let (episodes, orphaned): (i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(*) FILTER (WHERE policy_id IS NULL) \
+         FROM rmk_episodes WHERE agent_id = 'doomed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(episodes, 1, "the episode log is still retained");
+    assert_eq!(orphaned, 1, "and its policy reference is still NULLed");
+}
+
+/// The lock must not change what deletion does when nothing is racing it.
+#[sqlx::test(migrations = "./migrations")]
+async fn locking_the_agent_preserves_the_uncontended_contract(pool: PgPool) {
+    let state = crate::test_support::test_state(pool.clone());
+
+    // A nonexistent agent still reports false, and still cleans up orphans.
+    sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ('ghost','e','person')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deleted = crate::memory::store::delete_agent(&state, "ghost")
+        .await
+        .expect("deleting a nonexistent agent must not error");
+    assert!(!deleted, "a nonexistent agent must report false");
+    let orphans: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE agent_id='ghost'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        orphans, 0,
+        "orphaned child rows must still be cleaned up, as they were before the lock"
+    );
+
+    // Pre-backfill policies and other tenants are unaffected.
+    insert_agent(&pool, "doomed", Some(TENANT)).await;
+    insert_agent(&pool, "bystander", Some(OTHER_TENANT)).await;
+    for stmt in [
+        "ALTER TABLE rmk_policies DISABLE TRIGGER trg_rmk_policies_tenancy_bridge",
+        "INSERT INTO rmk_policies (agent_id, pressure_a, pressure_b, kp, ki, \
+         graph_bonus_weight, retrieval_threshold) VALUES ('doomed', 2, 0, 0, 0, 0, 0)",
+        "ALTER TABLE rmk_policies ENABLE TRIGGER trg_rmk_policies_tenancy_bridge",
+        "INSERT INTO rmk_policies (agent_id, pressure_a, pressure_b, kp, ki, \
+         graph_bonus_weight, retrieval_threshold) VALUES ('bystander', 1, 0, 0, 0, 0, 0)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert!(crate::memory::store::delete_agent(&state, "doomed")
+        .await
+        .unwrap());
+    let (doomed, bystander): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE agent_id='doomed'), \
+                count(*) FILTER (WHERE agent_id='bystander') FROM rmk_policies",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(doomed, 0, "the pre-backfill policy must still be removed");
+    assert_eq!(bystander, 1, "the other tenant must be untouched");
+}
+
+// ── The 0033 ordering guard must not depend on constraint names ─────────────
+
+/// Renaming 0041's constraints must not let the indexes rollback run early.
+///
+/// The ordering guard promised to refuse while 0041 is attached, but still found
+/// its objects by `conname`. Renaming a foreign key hid it even though `conindid`
+/// still identified it, and renaming a unique constraint renames its backing
+/// index too, so the index-OID lookup found nothing either. Measured against the
+/// previous head with all eight renamed: the script COMMITTED, dropping all five
+/// lookup indexes and retiring versions 33-40 while all eight constraints stayed
+/// attached.
+///
+/// Every one of the eight is renamed, so nothing left under an expected name can
+/// do the blocking and the refusal cannot pass for the wrong reason.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_indexes_rollback_refuses_while_renamed_0041_constraints_remain(pool: PgPool) {
+    for stmt in [
+        "ALTER TABLE archival_batches RENAME CONSTRAINT archival_batches_tenant_agent_fkey TO zz_f1",
+        "ALTER TABLE audit_logs   RENAME CONSTRAINT audit_logs_tenant_agent_fkey   TO zz_f2",
+        "ALTER TABLE entities     RENAME CONSTRAINT entities_tenant_agent_fkey     TO zz_f3",
+        "ALTER TABLE memory_graph RENAME CONSTRAINT memory_graph_tenant_agent_fkey TO zz_f4",
+        "ALTER TABLE rmk_policies RENAME CONSTRAINT rmk_policies_tenant_agent_fkey TO zz_f5",
+        "ALTER TABLE archival_batches RENAME CONSTRAINT archival_batches_id_tenant_id_key TO zz_u1",
+        "ALTER TABLE entities     RENAME CONSTRAINT entities_id_tenant_id_key      TO zz_u2",
+        "ALTER TABLE rmk_policies RENAME CONSTRAINT rmk_policies_id_tenant_id_key  TO zz_u3",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let under_expected_names: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname LIKE '%tenant\\_agent\\_fkey' \
+            OR conname IN ('archival_batches_id_tenant_id_key', 'entities_id_tenant_id_key', \
+                           'rmk_policies_id_tenant_id_key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        under_expected_names, 0,
+        "nothing may be left under an expected name, or an un-renamed object \
+         could be what blocks the rollback and the test proves nothing"
+    );
+
+    let (code, message) = expect_refusal(&pool, INDEXES_DOWN_SQL, "0033").await;
+    assert_eq!(code, "2BP01", "{message}");
+    // All eight, not a sample: `remaining` is a string_agg over every matched
+    // row, so a regression that stopped detecting exactly one table would still
+    // refuse — and every other assertion here is agnostic to WHICH objects were
+    // found. Asserting a subset would leave partial detection invisible.
+    for renamed in [
+        "zz_f1", "zz_f2", "zz_f3", "zz_f4", "zz_f5", "zz_u1", "zz_u2", "zz_u3",
+    ] {
+        assert!(
+            message.contains(renamed),
+            "the refusal must name {renamed} under its current name: {message}"
+        );
+    }
+
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger, 8, "versions 33-40 must not be retired");
+    assert_eq!(
+        count_tranche1_indexes(&pool).await,
+        5,
+        "the three adopted unique indexes now carry renamed names, but the five \
+         lookup indexes must all survive"
+    );
+    let still_attached: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_constraint WHERE conname LIKE 'zz\\_%'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_attached, 8, "no renamed constraint may be dropped");
+}
+
+/// Migration 0030's and 0029's objects have the tranche's exact shape.
+///
+/// `credential_agent_grants_agent_fkey` is `(tenant_id, agent_uuid)` referencing
+/// `agents (tenant_id, id)` through the same `conindid`, and
+/// `credentials_id_tenant_id_key` is `UNIQUE (id, tenant_id)` — measured. A
+/// shape-only rewrite of the guard, with the table scope dropped as a
+/// simplification, would report both as tranche 1 objects and refuse this
+/// rollback permanently. This pins the scope that stops it.
+#[sqlx::test(migrations = "./migrations")]
+async fn neighbouring_migrations_of_the_same_shape_do_not_block_the_indexes_rollback(pool: PgPool) {
+    let lookalikes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conname IN ('credential_agent_grants_agent_fkey', 'credentials_id_tenant_id_key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lookalikes, 2,
+        "both look-alikes must be present for this test to mean anything"
+    );
+
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback");
+    sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0030 and 0029 objects must not be mistaken for tranche 1 objects");
+
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger, 0, "the legitimate unwind must actually have run");
+}
+
+// ── Complete index identity ─────────────────────────────────────────────────
+
+/// `indkey` does not see ordering, access method, operator class or collation.
+///
+/// A pre-existing `idx_audit_logs_tenant ON (tenant_id DESC, agent_uuid)` has the
+/// same `indkey`, arity, uniqueness, predicate and expression state as the index
+/// migrations 0033-0037 build, so every property the guard compared matched and
+/// it was treated as tranche-owned. `indoption` is the bitmask that distinguishes
+/// them: bit 0 DESC, bit 1 NULLS FIRST, zero for the plain ordering these
+/// migrations use.
+///
+/// Operator class and collation are compared too, and are honestly untestable on
+/// this schema: `uuid_ops` is the only btree operator class PostgreSQL ships for
+/// `uuid`, and `uuid` is not collatable, so no hostile occupant can differ on
+/// those axes here. They are checked because the columns' types are not this
+/// guard's to guarantee.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_index_of_the_same_columns_but_different_semantics_is_not_ours(pool: PgPool) {
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "DESC ordering",
+            &[
+                "DROP INDEX idx_audit_logs_tenant",
+                "CREATE INDEX idx_audit_logs_tenant ON audit_logs (tenant_id DESC, agent_uuid)",
+            ],
+            "its column ordering is",
+        ),
+        (
+            "NULLS FIRST ordering",
+            &[
+                "DROP INDEX idx_audit_logs_tenant",
+                "CREATE INDEX idx_audit_logs_tenant ON audit_logs (tenant_id NULLS FIRST, agent_uuid)",
+            ],
+            "its column ordering is",
+        ),
+        (
+            // BRIN, not hash. A hash index is necessarily single-column, so the
+            // arity check fires too and the case cannot show the access-method
+            // check is doing any work — deleting that check entirely would leave
+            // the test green. BRIN takes both columns and is non-unique, so it
+            // matches the canonical shape on every axis except the one under
+            // test.
+            "non-btree access method",
+            &[
+                "DROP INDEX idx_audit_logs_tenant",
+                "CREATE INDEX idx_audit_logs_tenant ON audit_logs USING brin (tenant_id, agent_uuid)",
+            ],
+            "its access method is 'brin', expected 'btree'",
+        ),
+        (
+            "single-column hash index",
+            &[
+                "DROP INDEX idx_audit_logs_tenant",
+                "CREATE INDEX idx_audit_logs_tenant ON audit_logs USING hash (tenant_id)",
+            ],
+            "it has 1 column(s) (1 key), expected 2",
+        ),
+    ];
+
+    for (label, setup, expected_phrase) in cases {
+        // 0041 off first, so its ordering guard is satisfied and the index guard
+        // is what refuses. `reset_to_pre_0041` also rebuilds the three unique
+        // indexes the rollback takes with the constraints it drops.
+        reset_to_pre_0041(&pool).await;
+        for stmt in *setup {
+            sqlx::query(sqlx::AssertSqlSafe((*stmt).to_owned()))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: setup failed: {e}"));
+        }
+
+        let (code, message) = expect_refusal(&pool, INDEXES_DOWN_SQL, label).await;
+        assert_eq!(code, "55000", "{label}: {message}");
+        assert!(
+            message.contains(expected_phrase),
+            "{label}: the refusal must name the property that differs \
+             (expected {expected_phrase:?}): {message}"
+        );
+
+        let survived: bool =
+            sqlx::query_scalar("SELECT to_regclass('public.idx_audit_logs_tenant') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(survived, "{label}: the occupant must be left attached");
+        let ledger: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ledger, 8, "{label}: versions 33-40 must not be retired");
+
+        // Put the canonical index back for the next case.
+        for stmt in [
+            "DROP INDEX idx_audit_logs_tenant",
+            "CREATE INDEX idx_audit_logs_tenant ON audit_logs (tenant_id, agent_uuid)",
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    // With every occupant gone, the rollback it kept refusing now runs.
+    sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("the canonical set must still be droppable once the occupants are gone");
+    assert_eq!(count_tranche1_indexes(&pool).await, 0);
+}
+
+/// The canonical index is still recognised, and an INVALID one is still droppable.
+///
+/// The second half is the constraint that shapes the whole check: an interrupted
+/// `CREATE INDEX CONCURRENTLY` leaves the index INVALID, and dropping it is
+/// precisely what this rollback exists to do. Requiring `indisvalid` here would
+/// make the one state that needs recovery the one state that cannot be recovered,
+/// so validity is deliberately absent from the shape test — it is enforced in
+/// migration 0041 instead, which must never adopt an invalid index.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_canonical_index_is_recognised_valid_or_not(pool: PgPool) {
+    sqlx::raw_sql(CONSTRAINTS_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("0041 rollback");
+
+    sqlx::query(
+        "UPDATE pg_index SET indisvalid = false \
+         WHERE indexrelid = 'public.idx_entities_tenant'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .expect("the test role must be able to mark an index invalid");
+
+    sqlx::raw_sql(INDEXES_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("an INVALID tranche index must still be recognised and dropped");
+
+    assert_eq!(
+        count_tranche1_indexes(&pool).await,
+        0,
+        "every tranche index must be gone, including the invalid one"
+    );
+    let ledger: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version BETWEEN 33 AND 40")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(ledger, 0, "and the ledger must be cleared for the rebuild");
+}
+
+/// The forward migration's copy of the index-shape test, on its own axes.
+///
+/// `migrations/0041` and `rollback/0033` carry hand-duplicated shape checks, and
+/// the round that added ordering, access method, collation and operator class to
+/// both only tested the rollback's copy. A typo in the migration's `am` join or
+/// its operator-class subquery would let it adopt a DESC-ordered index as the
+/// tranche's unique constraint on a real deployment with nothing to catch it.
+///
+/// PostgreSQL would refuse the adoption itself — `ADD CONSTRAINT ... USING INDEX`
+/// rejects an index without default sorting — so what this pins is that the
+/// guard fires FIRST, with a diagnostic naming the axis, rather than leaving the
+/// operator PostgreSQL's generic "does not have default sorting behavior".
+#[sqlx::test(migrations = "./migrations")]
+async fn the_migration_also_refuses_an_index_whose_ordering_is_not_ours(pool: PgPool) {
+    reset_to_pre_0041(&pool).await;
+    for stmt in [
+        "DROP INDEX entities_id_tenant_id_key",
+        "CREATE UNIQUE INDEX entities_id_tenant_id_key ON entities (id DESC, tenant_id)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_UP, "DESC index at adoption").await;
+    assert_eq!(code, "55000", "{message}");
+    assert!(
+        message.contains("its column ordering is"),
+        "the migration's own guard must name the axis, not defer to PostgreSQL's \
+         generic sorting error: {message}"
+    );
+    assert!(
+        message.contains("entities_id_tenant_id_key"),
+        "and must name the index: {message}"
+    );
+
+    let adopted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+         WHERE conname = 'entities_id_tenant_id_key' AND contype = 'u'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        adopted, 0,
+        "the DESC index must not have become a constraint"
+    );
+}
