@@ -449,24 +449,60 @@ BEGIN
             -- PostgreSQL refuses to ADD CONSTRAINT over a non-default-sorted
             -- index, so this is consistency rather than a reachable hole; the
             -- two checks living apart is the actual defect.
+            -- Reported one axis at a time, for the same reason the adoption
+            -- branch does. A single summary line printing five values while the
+            -- condition tests ten is worse than no diagnostic: a DESC-ordered or
+            -- BRIN occupant fails on an axis the line does not print, so every
+            -- value in the message reads as correct and the operator is told the
+            -- index is wrong in a way the evidence appears to contradict.
             IF NOT FOUND THEN
                 problems := problems || 'constraint owns no index'::TEXT;
-            ELSIF NOT idx.indisunique
-               OR NOT idx.indisvalid
-               OR NOT idx.is_total
-               OR idx.indnkeyatts <> 2
-               OR idx.indrelid <> tbl_oid
-               OR idx.access_method IS DISTINCT FROM 'btree'
-               OR idx.nulls_not_distinct
-               OR EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0)
-               OR EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0)
-               OR idx.default_opclasses IS NOT TRUE THEN
-                problems := problems
-                    || format('backing index is not a valid, total, two-column unique index on '
-                              'this table (indisunique=%s indisvalid=%s total=%s indnkeyatts=%s '
-                              'on %s)',
-                              idx.indisunique, idx.indisvalid, idx.is_total, idx.indnkeyatts,
-                              idx.indrelid::regclass);
+            ELSE
+                IF NOT idx.indisunique THEN
+                    problems := problems || 'its backing index is not unique'::TEXT;
+                END IF;
+                IF NOT idx.indisvalid THEN
+                    problems := problems
+                        || 'its backing index is INVALID, so it enforces nothing'::TEXT;
+                END IF;
+                IF NOT idx.is_total THEN
+                    problems := problems || 'its backing index is partial'::TEXT;
+                END IF;
+                IF idx.indrelid <> tbl_oid THEN
+                    problems := problems
+                        || format('its backing index is on %s, expected public.%I',
+                                  idx.indrelid::regclass, spec.tbl);
+                END IF;
+                IF idx.nulls_not_distinct THEN
+                    problems := problems
+                        || 'its backing index is NULLS NOT DISTINCT; the tranche builds plain '
+                           'unique indexes, which treat NULLs as distinct'::TEXT;
+                END IF;
+                IF idx.access_method IS DISTINCT FROM 'btree' THEN
+                    problems := problems
+                        || format('its backing index access method is %L, expected %L',
+                                  idx.access_method, 'btree');
+                END IF;
+                IF EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0) THEN
+                    problems := problems
+                        || format('its backing index column ordering is %L, expected all-zero '
+                                  '(ASC NULLS LAST); bit 0 is DESC, bit 1 is NULLS FIRST',
+                                  idx.options);
+                END IF;
+                IF EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0) THEN
+                    problems := problems
+                        || format('its backing index carries collations %L; the uuid columns '
+                                  'these migrations index have none', idx.collations);
+                END IF;
+                IF idx.default_opclasses IS NOT TRUE THEN
+                    problems := problems
+                        || 'its backing index uses a non-default operator class'::TEXT;
+                END IF;
+                IF idx.indnkeyatts <> 2 THEN
+                    problems := problems
+                        || format('its backing index has %s key column(s), expected 2',
+                                  idx.indnkeyatts);
+                END IF;
             END IF;
         END IF;
 

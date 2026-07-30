@@ -68,15 +68,26 @@ BEGIN
     -- otherwise get past the index check and only discover the dependency when
     -- ALTER TABLE ... DROP COLUMN failed partway down.
     --
-    -- Reached from the parent's unique key by OID rather than by (name,
-    -- table-name). `conname` is unique only per relation, so a bare-name match
-    -- would refuse over a constraint on some unrelated table -- but a literal
-    -- table name is defeated by `ALTER TABLE ... RENAME`, which leaves
-    -- constraint names untouched, so a renamed child reported "none" while its
-    -- key was still attached. `conindid` is the OID of
-    -- `agents_tenant_id_id_key`, which all five depend on and which no rename of
-    -- a child can change; `conrelid::regclass` then reports where each one
-    -- actually is.
+    -- Both halves of this lookup are OIDs.  Neither is a constraint name.
+    --
+    -- `conindid` is the OID of `agents_tenant_id_id_key`, which all five
+    -- foreign keys depend on and which no rename of a child can change.
+    -- `conrelid` scopes the answer to the five tables this script drops columns
+    -- from, which is what keeps a later tranche's key off the list: tranche 2
+    -- hangs its own composite keys off the same parent index, and those are
+    -- none of this script's business.
+    --
+    -- Scoping by `conname` instead -- which is what this did -- left the last
+    -- name-based handle in the file, and it was the wrong half to leave.
+    -- `ALTER TABLE ... RENAME CONSTRAINT` on any of the five made this report
+    -- "none" while the key was still attached, so the operator met a raw
+    -- dependency error from DROP COLUMN partway down instead of this
+    -- diagnostic.  It was also blind to a differently named key that a later
+    -- migration hung off the same columns, which this script would equally have
+    -- to refuse over.
+    --
+    -- `conrelid::regclass` reports where each one actually is, so a renamed
+    -- table still yields a usable message.
     SELECT string_agg(format('%s on %s', c.conname, c.conrelid::regclass), ', '
                       ORDER BY c.conname)
       INTO constraints
@@ -88,11 +99,11 @@ BEGIN
                 WHERE p.conname = 'agents_tenant_id_id_key'
                   AND p.conrelid = 'public.agents'::regclass
                   AND p.contype  = 'u')
-       AND c.conname IN ('archival_batches_tenant_agent_fkey',
-                         'audit_logs_tenant_agent_fkey',
-                         'entities_tenant_agent_fkey',
-                         'memory_graph_tenant_agent_fkey',
-                         'rmk_policies_tenant_agent_fkey');
+       AND c.conrelid IN (to_regclass('public.archival_batches'),
+                          to_regclass('public.audit_logs'),
+                          to_regclass('public.entities'),
+                          to_regclass('public.memory_graph'),
+                          to_regclass('public.rmk_policies'));
 
     IF remaining IS NOT NULL OR constraints IS NOT NULL THEN
         RAISE EXCEPTION

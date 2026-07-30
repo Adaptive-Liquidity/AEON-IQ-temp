@@ -3465,3 +3465,128 @@ async fn the_provenance_marker_is_identical_everywhere_it_appears(pool: PgPool) 
         "the stamped comment must be exactly what the scripts compare against"
     );
 }
+
+/// Renamed tranche foreign keys must not hide from the rollback guard.
+///
+/// The guard's FK half was scoped by `conname`, the last name-based handle in a
+/// file whose other handles are all OIDs, and the consequence is not a raw
+/// error later -- it is silent destruction. `ALTER TABLE ... DROP COLUMN` drops
+/// a dependent foreign key with no ERROR and no NOTICE, so a rollback that
+/// cannot see the keys runs to completion and takes them with it, then deletes
+/// migration version 41's work while the ledger still claims it applied.
+///
+/// All five are renamed, not one. Renaming one proves less than it looks:
+/// the guard still refuses over the four siblings that kept their names, so the
+/// key it cannot see is destroyed inside a run that appears to have been
+/// stopped. The five-way rename is the state in which the pre-fix guard reports
+/// "none" and destroys everything.
+///
+/// The index half of the guard cannot cover this, so the eight indexes are
+/// removed first to leave the FK half testing alone.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_rollback_still_refuses_over_renamed_tranche_foreign_keys(pool: PgPool) {
+    for stmt in [
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+        "ALTER TABLE entities DROP CONSTRAINT entities_id_tenant_id_key",
+        "ALTER TABLE rmk_policies DROP CONSTRAINT rmk_policies_id_tenant_id_key",
+        "DROP INDEX idx_archival_batches_tenant, idx_audit_logs_tenant, idx_entities_tenant, \
+         idx_memory_graph_tenant, idx_rmk_policies_tenant",
+        "ALTER TABLE archival_batches RENAME CONSTRAINT archival_batches_tenant_agent_fkey \
+         TO zz_renamed_archival_batches",
+        "ALTER TABLE audit_logs RENAME CONSTRAINT audit_logs_tenant_agent_fkey \
+         TO zz_renamed_audit_logs",
+        "ALTER TABLE entities RENAME CONSTRAINT entities_tenant_agent_fkey TO zz_renamed_entities",
+        "ALTER TABLE memory_graph RENAME CONSTRAINT memory_graph_tenant_agent_fkey \
+         TO zz_renamed_memory_graph",
+        "ALTER TABLE rmk_policies RENAME CONSTRAINT rmk_policies_tenant_agent_fkey \
+         TO zz_renamed_rmk_policies",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_DOWN_SQL,
+        "renamed tranche foreign keys must still be seen",
+    )
+    .await;
+    assert_eq!(
+        code, "2BP01",
+        "dependent_objects_still_exist is the refusal's SQLSTATE"
+    );
+    for (renamed, table) in [
+        ("zz_renamed_archival_batches", "archival_batches"),
+        ("zz_renamed_audit_logs", "audit_logs"),
+        ("zz_renamed_entities", "entities"),
+        ("zz_renamed_memory_graph", "memory_graph"),
+        ("zz_renamed_rmk_policies", "rmk_policies"),
+    ] {
+        assert!(
+            message.contains(&format!("{renamed} on {table}")),
+            "the refusal must name each key by where it is, not by what it used to be \
+             called; {renamed} is missing from: {message}"
+        );
+    }
+
+    // All five are still attached, which is the outcome that matters: DROP
+    // COLUMN would have removed them without a word.
+    let still_there: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE contype = 'f' AND conname LIKE 'zz\\_renamed\\_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(still_there, 5, "every renamed foreign key must survive");
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name IN ('agent_uuid', 'tenant_id') \
+           AND table_name IN ('archival_batches', 'audit_logs', 'entities', 'memory_graph', \
+                              'rmk_policies')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, 10, "and no ownership column may have been dropped");
+}
+
+/// The rerun guard must name the axis it actually failed on.
+///
+/// Its condition tests ten properties of the backing index; its message printed
+/// five values. A DESC-ordered or BRIN occupant fails on an axis the message
+/// never printed, so every value in it read as correct and the operator was
+/// told the index was wrong by evidence that appeared to say otherwise.
+///
+/// Reaching this state needs catalog surgery, because PostgreSQL refuses to
+/// ADD CONSTRAINT over a non-default-sorted index -- which is exactly why the
+/// diagnostic has to be exact. Nobody arrives here by accident, and there is
+/// nothing else to go on.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_rerun_guard_names_the_axis_a_desc_backed_constraint_fails_on(pool: PgPool) {
+    sqlx::raw_sql(
+        "UPDATE pg_index SET indoption = '1 0'::int2vector \
+          WHERE indexrelid = 'public.entities_id_tenant_id_key'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        CONSTRAINTS_UP,
+        "0041 must refuse a constraint backed by a DESC-ordered index",
+    )
+    .await;
+    assert_eq!(code, "42710", "duplicate_object is the refusal's SQLSTATE");
+    assert!(
+        message.contains("column ordering") && message.contains("bit 0 is DESC"),
+        "the refusal must name the axis that actually failed: {message}"
+    );
+    // And it must not have reported an axis that is fine.
+    assert!(
+        !message.contains("is not unique") && !message.contains("is partial"),
+        "the refusal must not report axes the index satisfies: {message}"
+    );
+}
