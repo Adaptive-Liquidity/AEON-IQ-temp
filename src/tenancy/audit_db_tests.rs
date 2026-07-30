@@ -2204,51 +2204,17 @@ async fn agent_tenancy_migrations_cannot_carry_checkpoint_evidence(pool: PgPool)
             "the planned checkpoint table must declare `{required}`: {planned:?}"
         );
     }
-    // And Step 4B-1 creates it. Step 4B-0 declared this table and asserted here
-    // that it did *not* exist, because DDL in a contract-only step would have
-    // been a leak. That assertion has now done its job and inverts: the
-    // migration exists, so the check that matters is that the live table
-    // actually carries the four roles `agent_tenancy_migrations` lacks. A
-    // planned table nobody created would leave the FINALIZE guard reading a
-    // table that is not there.
-    let live: Vec<String> = sqlx::query_scalar(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'tenancy_backfill_checkpoints'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert!(
-        !live.is_empty(),
-        "Step 4B-1 creates tenancy_backfill_checkpoints; it is absent from the live schema"
-    );
-    for required in ["tranche", "contract_digest", "status", "resume_cursor"] {
-        assert!(
-            live.iter().any(|c| c == required),
-            "the live checkpoint table must carry `{required}`, which is one of the four roles \
-             agent_tenancy_migrations cannot serve: {live:?}"
-        );
-    }
-
-    // Measured against the live catalog rather than trusted from the migration
-    // text: the completion uniqueness has to be scoped to COMPLETED, or the
-    // ABANDONED history the contract deliberately retains would collide with it
-    // and an operator could not retry a tranche against the same digest.
-    let indexdef: String = sqlx::query_scalar(
-        "SELECT indexdef FROM pg_indexes \
-         WHERE schemaname = 'public' \
-           AND indexname = 'tenancy_backfill_checkpoints_completed_key'",
+    // And it does not exist yet — this PR plans it, it does not create it.
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = 'tenancy_backfill_checkpoints')",
     )
     .fetch_one(&pool)
     .await
-    .expect("the partial completion index must exist");
+    .unwrap();
     assert!(
-        indexdef.contains("UNIQUE"),
-        "completion index must be unique: {indexdef}"
-    );
-    assert!(
-        indexdef.contains("WHERE") && indexdef.contains("COMPLETED"),
-        "completion uniqueness must be partial on COMPLETED, or retained ABANDONED attempts \
-         collide: {indexdef}"
+        !exists,
+        "Step 4B-0 is a contract: it declares tenancy_backfill_checkpoints, and Step 4B-1 creates \
+         it. A table appearing here means DDL leaked into the contract step."
     );
 }

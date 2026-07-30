@@ -80,7 +80,7 @@ pub const ROW_ID_DOMAIN: &str = "aeon-tenancy-audit-row-id-v1";
 /// never occurs. Both the new field and the new enum value can reach a consumer
 /// pinned to `step4b0.1`, which is why this is a version bump rather than a
 /// silent addition.
-pub const REPORT_SCHEMA_VERSION: &str = "step4b0.3";
+pub const REPORT_SCHEMA_VERSION: &str = "step4b0.2";
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -806,15 +806,7 @@ struct LiveIndex {
     is_unique: bool,
     is_valid: bool,
     is_ready: bool,
-    /// PostgreSQL's normalised rendering of the partial predicate, or `None`
-    /// for a total index.
-    ///
-    /// This is the single source of truth for partiality: `pg_get_expr` returns
-    /// NULL exactly when `indpred` is NULL, so a separate `is_partial` boolean
-    /// would be a second projection of the same fact that nothing keeps in step
-    /// if either is edited later — directly under the feature this exists to
-    /// make rigorous.
-    predicate: Option<String>,
+    is_partial: bool,
     has_expressions: bool,
     key_column_count: i16,
 }
@@ -892,7 +884,7 @@ async fn live_indexes(
                 i.indisunique AS is_unique, \
                 i.indisvalid AS is_valid, \
                 i.indisready AS is_ready, \
-                pg_get_expr(i.indpred, i.indrelid) AS predicate, \
+                (i.indpred IS NOT NULL) AS is_partial, \
                 (i.indexprs IS NOT NULL) AS has_expressions, \
                 i.indnkeyatts AS key_column_count, \
                 COALESCE((SELECT array_agg(COALESCE(a.attname::text, '(expression)') \
@@ -922,7 +914,7 @@ async fn live_indexes(
                 is_unique: row.try_get("is_unique")?,
                 is_valid: row.try_get("is_valid")?,
                 is_ready: row.try_get("is_ready")?,
-                predicate: row.try_get("predicate")?,
+                is_partial: row.try_get("is_partial")?,
                 has_expressions: row.try_get("has_expressions")?,
                 key_column_count: row.try_get("key_column_count")?,
             },
@@ -1065,7 +1057,7 @@ fn verify_schema_contract(
                 require_unique,
                 require_valid,
                 require_ready,
-                predicate,
+                require_non_partial,
                 require_no_expressions,
                 ..
             } => {
@@ -1117,39 +1109,15 @@ fn verify_schema_contract(
                     ));
                     ok = false;
                 }
-                // Both halves are checked, because permitting a partial index
-                // is not the same as requiring one and says nothing about which
-                // rows it covers. A total index where a partial one is declared
-                // silently forbids the retry the partial scope exists to allow;
-                // a partial index whose predicate has drifted can admit rows the
-                // declaration means to exclude. Under a bare "may be partial"
-                // boolean the audit reported both as satisfied.
-                match predicate {
-                    inventory::IndexPredicate::Total if live.predicate.is_some() => {
-                        drift(format!(
-                            "index `{name}` is required to be non-partial, but the live index has \
-                             a WHERE predicate and so constrains only the rows matching it"
-                        ));
-                        ok = false;
-                    }
-                    inventory::IndexPredicate::Total => {}
-                    inventory::IndexPredicate::Exactly { normalized } => match &live.predicate {
-                        None => {
-                            drift(format!(
-                                "index `{name}` is required to be partial on `{normalized}`, but \
-                                 the live index has no WHERE predicate and so covers every row"
-                            ));
-                            ok = false;
-                        }
-                        Some(live_predicate) if live_predicate != normalized => {
-                            drift(format!(
-                                "index `{name}` is required to be partial on `{normalized}`, but \
-                                 the live index is partial on `{live_predicate}`"
-                            ));
-                            ok = false;
-                        }
-                        Some(_) => {}
-                    },
+                // A partial unique index guarantees uniqueness only inside its
+                // predicate, so it cannot back a join that assumes at most one
+                // match for every row.
+                if *require_non_partial && live.is_partial {
+                    drift(format!(
+                        "index `{name}` is required to be non-partial, but the live index has a \
+                         WHERE predicate and so constrains only the rows matching it"
+                    ));
+                    ok = false;
                 }
                 if *require_no_expressions && live.has_expressions {
                     drift(format!(
@@ -1213,29 +1181,6 @@ async fn audit_within_snapshot(
     conn: &mut sqlx::PgConnection,
     generated_at: Option<String>,
 ) -> Result<TenancyAuditReport, AuditError> {
-    // Pin name resolution before any catalog query runs.
-    //
-    // Every query below reads `pg_catalog` relations unqualified, which was
-    // merely untidy while the audit only compared identifiers. It stopped being
-    // untidy when the schema contract started comparing a *rendered predicate*:
-    // `pg_get_expr` deparses an operator according to the session search_path,
-    // so a schema placed ahead of `pg_catalog` can make a shadowed operator
-    // render byte-identically to the built-in one. Measured on pg16: a partial
-    // index built with a custom `evil.=` over (text, text) deparses as
-    // `(status OPERATOR(evil.=) 'COMPLETED'::text)` under a normal search_path,
-    // and as the indistinguishable `(status = 'COMPLETED'::text)` when `evil`
-    // precedes `pg_catalog`.
-    //
-    // Reaching that state needs privileges beyond what forging a checkpoint row
-    // would take, so this is defence in depth rather than a live hole — but it
-    // is one line, and `rollback/0032_tenancy_tranche1_prepare_down.sql` and the
-    // bridge trigger functions already pin search_path for exactly this reason.
-    // `SET LOCAL` confines it to this transaction, so the caller's session is
-    // unchanged afterwards.
-    sqlx::query("SET LOCAL search_path = pg_catalog, public")
-        .execute(&mut *conn)
-        .await?;
-
     let schema = inventory::APPLICATION_SCHEMA;
     let discovered = inventory::discover(&mut *conn, schema).await?;
     let keys = primary_keys(&mut *conn, schema).await?;

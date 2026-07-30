@@ -77,40 +77,8 @@ pub async fn count_agents(state: &AppState) -> Result<i64> {
 /// Delete an agent and all associated data in a single transaction.
 ///
 /// Returns `true` if the agent existed and was deleted, `false` if not found.
-///
-/// Takes a `FOR UPDATE` row lock on the agent as its first statement and holds it
-/// for the whole transaction, so this can block behind a concurrent write that
-/// references the same agent -- an RMK policy insert, or another `delete_agent`
-/// for the same id. The lock is row-scoped: deletions and writes for other agents
-/// are unaffected. See the comment on the lock for why it is required and why
-/// `FOR NO KEY UPDATE` would not do.
 pub async fn delete_agent(state: &AppState, agent_id: &str) -> Result<bool> {
     let mut tx = state.db.begin().await?;
-
-    // Lock the parent before touching any child, or the cleanup has a gap.
-    //
-    // The RMK worker inserts policies for live agents on its own schedule. With
-    // no lock, it can insert one AFTER the `rmk_policies` delete below and
-    // BEFORE the `agents` delete: the parent still exists, so the bridge
-    // resolves ownership and the NO ACTION key permits the insert, and the
-    // parent delete then fails on the row that appeared behind it. The 500 this
-    // function was fixed to stop comes straight back under ordinary worker
-    // concurrency.
-    //
-    // FOR UPDATE is the weakest lock that closes it, and the choice is not
-    // arbitrary. A foreign-key check takes FOR KEY SHARE on the parent row;
-    // FOR UPDATE conflicts with FOR KEY SHARE, so a concurrent insert blocks on
-    // this statement instead of slipping past the delete. FOR NO KEY UPDATE
-    // would NOT conflict with FOR KEY SHARE and would leave the gap open.
-    //
-    // Deliberately not `fetch_optional` with an early return: a missing agent
-    // must still fall through to the deletes below, so orphaned child rows are
-    // cleaned up exactly as they were before this lock existed, and the return
-    // value still comes from the `agents` delete alone.
-    sqlx::query("SELECT 1 FROM agents WHERE agent_id = $1 FOR UPDATE")
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
 
     // memories must be deleted before archival_batches (FK: memories.archival_batch_id)
     sqlx::query("DELETE FROM memories WHERE agent_id = $1")
@@ -130,31 +98,6 @@ pub async fn delete_agent(state: &AppState, agent_id: &str) -> Result<bool> {
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM audit_logs WHERE agent_id = $1")
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-    // rmk_policies is the fifth table tenancy tranche 1 hangs a composite
-    // ownership key off (migration 0041), and it was the only one of the five
-    // that nothing here emptied: archival_batches goes by the ON DELETE CASCADE
-    // on its agent_id key, and entities, memory_graph and audit_logs go by the
-    // statements above. That key defaults to ON DELETE NO ACTION, so leaving the
-    // policies behind makes this whole transaction fail for any agent RMK has
-    // ever served.
-    //
-    // Deleted explicitly rather than by putting ON DELETE CASCADE on the key,
-    // because the key is MATCH SIMPLE over columns that stay NULL-able until
-    // BACKFILL runs: PostgreSQL skips the constraint for any row with a NULL
-    // component, and a skipped constraint cascades nothing. Measured on pg16, a
-    // cascade removed a bridge-populated policy and left a pre-backfill one
-    // behind, so an agent's policies would be half-deleted according to when
-    // each row happened to be written. `agent_id` has no such gap: it is
-    // globally unique per agents_agent_id_key and NOT NULL on every
-    // rmk_policies row since migration 0017.
-    //
-    // rmk_episodes is deliberately NOT deleted: it is a metrics log, and its
-    // policy_id is ON DELETE SET NULL (migration 0018), so retained episodes
-    // simply lose the policy reference.
-    sqlx::query("DELETE FROM rmk_policies WHERE agent_id = $1")
         .bind(agent_id)
         .execute(&mut *tx)
         .await?;

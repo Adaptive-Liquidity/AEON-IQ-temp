@@ -1086,14 +1086,13 @@ mod tests {
     fn the_report_schema_version_is_pinned_to_the_step_4b0_shape() {
         assert_eq!(
             super::super::audit::REPORT_SCHEMA_VERSION,
-            "step4b0.3",
-            "Step 4B-1 changed the payload shape again: a declared unique index now carries a \
-             typed `predicate` object where it carried a `require_non_partial` boolean. A \
-             consumer pinned to the old version must refuse this report rather than misread it"
+            "step4b0.2",
+            "the Step 4B-0 contract changed the payload shape; reverting the version would let a \
+             Step 4A consumer read a report it cannot understand"
         );
         assert_eq!(
             canonical_inventory_payload().schema_version,
-            "step4b0.3",
+            "step4b0.2",
             "the payload must carry the bumped version, not merely define it"
         );
     }
