@@ -34,7 +34,148 @@
 --
 -- Idempotency: every statement is IF NOT EXISTS or CREATE OR REPLACE, so
 -- re-running the whole file is a no-op rather than a duplicate-object error.
+-- That is only safe because of the provenance guards immediately below: they
+-- prove that anything this file is about to skip-or-replace is this file's own
+-- earlier work, and refuse otherwise.
 -- ============================================================================
+
+-- ── Provenance: this tranche creates, or it refuses.  It never adopts. ──────
+--
+-- `ADD COLUMN IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION` and `CREATE OR
+-- REPLACE TRIGGER` are what make this file re-runnable, and each of them is
+-- also a silent adoption of somebody else's object:
+--
+--   * A pre-existing `entities.tenant_id` is skipped by IF NOT EXISTS and then
+--     dropped unconditionally by rollback/0032, destroying data this tranche
+--     never created.  The column holds rows, so an identically-shaped column is
+--     NOT interchangeable -- this is the one place where the tranche's usual
+--     identity-by-shape rule is insufficient and provenance is required.
+--   * `CREATE OR REPLACE FUNCTION` preserves the OID, so replacing a
+--     pre-existing `fn_entities_tenancy_bridge()` silently changes the behaviour
+--     of every trigger that already calls it, and rollback/0032 then drops it.
+--   * `CREATE OR REPLACE TRIGGER` replaces a same-named trigger on the same
+--     table, and rollback/0032 then drops that too.  Same defect, third object
+--     kind; fixed here rather than left for the next reviewer to find.
+--
+-- The handle is `pg_description`.  Every object this file creates is stamped
+-- with the marker below, in the same transaction that creates it, and
+-- rollback/0032 destroys only objects carrying exactly that comment.  A comment
+-- is keyed by (objoid, objsubid), so it survives ALTER TABLE RENAME of either
+-- the table or the column -- which is more than a name-based handle manages.
+-- It cannot be created by accident, so it yields no false adoption.  Stripping
+-- it yields a false REFUSAL, which preserves data; that direction is the safe
+-- one, and rollback/0032 says how to resolve it.
+--
+-- The three guards run before anything is created, so a refusal leaves the
+-- schema untouched rather than half-built.
+--
+-- The marker text appears three times in the tranche: the guard below, the
+-- stamping block at the foot of this file, and the guard in
+-- rollback/0032_tenancy_tranche1_prepare_down.sql.  All three must stay
+-- byte-identical; `the_provenance_marker_is_identical_everywhere_it_appears`
+-- fails if they drift.
+
+DO $provenance_guard$
+DECLARE
+    -- Declared once.  Duplicated verbatim in the stamping block at the foot of
+    -- this file and in rollback/0032_tenancy_tranche1_prepare_down.sql; the test
+    -- `the_provenance_marker_is_identical_everywhere_it_appears` fails on drift.
+    marker CONSTANT TEXT :=
+        'AEON tenancy tranche 1 (migration 0032). Provenance marker: rollback/0032 '
+        'destroys only objects carrying exactly this comment, and refuses to touch '
+        'any that do not.';
+    occupied TEXT;
+BEGIN
+    -- Ten ownership columns.
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('%s.%s', expected.tbl, expected.col),
+               ', ' ORDER BY expected.tbl, expected.col)
+      INTO occupied
+      FROM (VALUES
+              ('archival_batches', 'agent_uuid'), ('archival_batches', 'tenant_id'),
+              ('audit_logs',       'agent_uuid'), ('audit_logs',       'tenant_id'),
+              ('entities',         'agent_uuid'), ('entities',         'tenant_id'),
+              ('memory_graph',     'agent_uuid'), ('memory_graph',     'tenant_id'),
+              ('rmk_policies',     'agent_uuid'), ('rmk_policies',     'tenant_id')
+           ) AS expected(tbl, col)
+      JOIN pg_catalog.pg_attribute a
+        ON a.attrelid = pg_catalog.to_regclass(pg_catalog.format('public.%I', expected.tbl))
+       AND a.attname  = expected.col
+       AND a.attnum   > 0
+       AND NOT a.attisdropped
+     WHERE pg_catalog.col_description(a.attrelid, a.attnum::int) IS DISTINCT FROM marker;
+
+    IF occupied IS NOT NULL THEN
+        RAISE EXCEPTION
+            'these ownership columns already exist and tenancy tranche 1 did not create '
+            'them: %. Migration 0032 will not adopt a column it did not create, because '
+            'rollback/0032 drops the ownership columns and would destroy data belonging to '
+            'whatever does own them. Nothing has been changed. Either drop or rename the '
+            'pre-existing columns, or -- if they really are this tranche''s and their '
+            'provenance comment was removed -- restore the comment this migration stamps.',
+            occupied
+            USING ERRCODE = 'duplicate_column';
+    END IF;
+
+    -- Five bridge functions, matched by SIGNATURE rather than by name:
+    -- PostgreSQL allows overloading, and only the zero-argument
+    -- `trigger`-returning form is the one this file installs and rollback/0032
+    -- drops.
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('public.%s()', expected.fn), ', ' ORDER BY expected.fn)
+      INTO occupied
+      FROM (VALUES
+              ('fn_archival_batches_tenancy_bridge'),
+              ('fn_audit_logs_tenancy_bridge'),
+              ('fn_entities_tenancy_bridge'),
+              ('fn_memory_graph_tenancy_bridge'),
+              ('fn_rmk_policies_tenancy_bridge')
+           ) AS expected(fn)
+      JOIN pg_catalog.pg_proc p
+        ON p.proname      = expected.fn
+       AND p.pronamespace = 'public'::regnamespace
+       AND p.pronargs     = 0
+       AND p.prorettype   = 'pg_catalog.trigger'::regtype
+     WHERE pg_catalog.obj_description(p.oid, 'pg_proc') IS DISTINCT FROM marker;
+
+    IF occupied IS NOT NULL THEN
+        RAISE EXCEPTION
+            'these bridge functions already exist and tenancy tranche 1 did not create '
+            'them: %. CREATE OR REPLACE FUNCTION preserves the OID, so replacing them would '
+            'silently change the behaviour of every trigger that already calls them, and '
+            'rollback/0032 would then drop them outright. Nothing has been changed.',
+            occupied
+            USING ERRCODE = 'duplicate_function';
+    END IF;
+
+    -- Five bridge triggers, scoped to the table each one belongs on: trigger
+    -- names are unique only per table.
+    SELECT pg_catalog.string_agg(
+               pg_catalog.format('%s on public.%s', expected.trg, expected.tbl),
+               ', ' ORDER BY expected.trg)
+      INTO occupied
+      FROM (VALUES
+              ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
+              ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
+              ('trg_entities_tenancy_bridge',         'entities'),
+              ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
+              ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
+           ) AS expected(trg, tbl)
+      JOIN pg_catalog.pg_trigger t
+        ON t.tgname  = expected.trg
+       AND t.tgrelid = pg_catalog.to_regclass(pg_catalog.format('public.%I', expected.tbl))
+       AND NOT t.tgisinternal
+     WHERE pg_catalog.obj_description(t.oid, 'pg_trigger') IS DISTINCT FROM marker;
+
+    IF occupied IS NOT NULL THEN
+        RAISE EXCEPTION
+            'these bridge triggers already exist and tenancy tranche 1 did not create '
+            'them: %. CREATE OR REPLACE TRIGGER would replace them and rollback/0032 would '
+            'then drop them, leaving nothing to restore. Nothing has been changed.',
+            occupied
+            USING ERRCODE = 'duplicate_object';
+    END IF;
+END $provenance_guard$;
 
 -- ── The backfill checkpoint protocol table ──────────────────────────────────
 -- Typed as `plan::TENANCY_BACKFILL_CHECKPOINTS`.  `agent_tenancy_migrations`
@@ -509,3 +650,63 @@ $$;
 CREATE OR REPLACE TRIGGER trg_audit_logs_tenancy_bridge
     BEFORE INSERT OR UPDATE ON audit_logs
     FOR EACH ROW EXECUTE FUNCTION public.fn_audit_logs_tenancy_bridge();
+
+-- ── Provenance stamps ───────────────────────────────────────────────────────
+-- Every object created above is stamped here, in the same transaction that
+-- created it, so no window exists in which one of them is unattributed.
+--
+-- Written as a loop over the object lists rather than as twenty literal COMMENT
+-- statements so the marker appears exactly once more in this file, and so a
+-- stamp cannot be forgotten when the lists change: the same lists the guard at
+-- the head of the file checks are the lists stamped here.
+--
+-- Re-running this file re-issues identical comments, which is a no-op.
+DO $provenance_stamp$
+DECLARE
+    -- Byte-identical to the guard at the head of this file and to the guard in
+    -- rollback/0032_tenancy_tranche1_prepare_down.sql.
+    marker CONSTANT TEXT :=
+        'AEON tenancy tranche 1 (migration 0032). Provenance marker: rollback/0032 '
+        'destroys only objects carrying exactly this comment, and refuses to touch '
+        'any that do not.';
+    target RECORD;
+BEGIN
+    FOR target IN
+        SELECT * FROM (VALUES
+              ('archival_batches', 'agent_uuid'), ('archival_batches', 'tenant_id'),
+              ('audit_logs',       'agent_uuid'), ('audit_logs',       'tenant_id'),
+              ('entities',         'agent_uuid'), ('entities',         'tenant_id'),
+              ('memory_graph',     'agent_uuid'), ('memory_graph',     'tenant_id'),
+              ('rmk_policies',     'agent_uuid'), ('rmk_policies',     'tenant_id')
+        ) AS c(tbl, col)
+    LOOP
+        EXECUTE pg_catalog.format('COMMENT ON COLUMN public.%I.%I IS %L',
+                                  target.tbl, target.col, marker);
+    END LOOP;
+
+    FOR target IN
+        SELECT * FROM (VALUES
+              ('fn_archival_batches_tenancy_bridge'),
+              ('fn_audit_logs_tenancy_bridge'),
+              ('fn_entities_tenancy_bridge'),
+              ('fn_memory_graph_tenancy_bridge'),
+              ('fn_rmk_policies_tenancy_bridge')
+        ) AS f(fn)
+    LOOP
+        EXECUTE pg_catalog.format('COMMENT ON FUNCTION public.%I() IS %L',
+                                  target.fn, marker);
+    END LOOP;
+
+    FOR target IN
+        SELECT * FROM (VALUES
+              ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
+              ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
+              ('trg_entities_tenancy_bridge',         'entities'),
+              ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
+              ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
+        ) AS t(trg, tbl)
+    LOOP
+        EXECUTE pg_catalog.format('COMMENT ON TRIGGER %I ON public.%I IS %L',
+                                  target.trg, target.tbl, marker);
+    END LOOP;
+END $provenance_stamp$;

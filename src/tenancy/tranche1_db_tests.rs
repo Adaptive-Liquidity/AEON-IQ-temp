@@ -3110,3 +3110,358 @@ async fn the_migration_also_refuses_an_index_whose_ordering_is_not_ours(pool: Pg
         "the DESC index must not have become a constraint"
     );
 }
+
+// ── Provenance: the tranche creates, or it refuses.  It never adopts. ───────
+//
+// `ADD COLUMN IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION` and `CREATE OR
+// REPLACE TRIGGER` are what make migration 0032 re-runnable, and each is also a
+// silent adoption of somebody else's object: rollback/0032 later destroys all
+// twenty unconditionally. The column case is the one that loses data, and it is
+// the one where the tranche's usual identity-by-shape rule cannot help -- a
+// column holds rows, so an identically-shaped `uuid` column is not
+// interchangeable with ours. Provenance, carried in `pg_description`, is.
+//
+// These tests drive the real migration and the real rollback script rather than
+// a paraphrase of them, and each one asserts that the object it planted is
+// still exactly as it was afterwards.
+
+/// Unwind tranche 1 to the state migration 0032 expects to find: 0041 and the
+/// concurrent index builds gone, and 0032's own objects gone with them.
+async fn unwind_to_pre_prepare(pool: &PgPool) {
+    for script in [CONSTRAINTS_DOWN_SQL, INDEXES_DOWN_SQL, PREPARE_DOWN_SQL] {
+        sqlx::raw_sql(script)
+            .execute(pool)
+            .await
+            .expect("the tranche must unwind cleanly before a provenance test plants anything");
+    }
+}
+
+/// A pre-existing ownership column must stop the migration, not be adopted.
+///
+/// `ADD COLUMN IF NOT EXISTS` skips a column that is already there, so 0032
+/// never created it -- and rollback/0032 then drops it anyway, taking every
+/// row's value with it. Nothing in the tranche distinguished the two cases,
+/// because shape cannot: a foreign `tenant_id uuid` is byte-for-byte the shape
+/// 0032 would have added.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_pre_existing_ownership_column(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // Somebody else's column, with somebody else's data in it.
+    let squatter = Uuid::new_v4();
+    for stmt in [
+        "ALTER TABLE entities ADD COLUMN tenant_id UUID".to_owned(),
+        "INSERT INTO entities (agent_id, name, entity_type) VALUES ('other', 'e', 'person')"
+            .to_owned(),
+        format!("UPDATE entities SET tenant_id = '{squatter}'"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must not adopt a column it did not create",
+    )
+    .await;
+    assert_eq!(code, "42701", "duplicate_column is the refusal's SQLSTATE");
+    assert!(
+        message.contains("entities.tenant_id"),
+        "the refusal must name the column it found: {message}"
+    );
+
+    // The squatter's data is untouched -- this is the whole point.
+    let survived: Option<Uuid> = sqlx::query_scalar("SELECT tenant_id FROM entities")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        survived,
+        Some(squatter),
+        "the pre-existing column's data must survive the refusal"
+    );
+
+    // And the refusal happened before anything was built.
+    let bridges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'public' AND p.proname LIKE 'fn\\_%\\_tenancy\\_bridge'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        bridges, 0,
+        "a refusing migration must leave the schema untouched, not half-built"
+    );
+}
+
+/// A pre-existing bridge function must stop the migration, not be replaced.
+///
+/// `CREATE OR REPLACE FUNCTION` preserves the OID, so replacing one silently
+/// changes the behaviour of every trigger already calling it -- and
+/// rollback/0032 then drops it as though the tranche had created it. The
+/// assertion that matters is not that the migration failed but that `prosrc` is
+/// still the body somebody else wrote.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_pre_existing_bridge_function(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // Same name, same signature, entirely different owner.
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.fn_entities_tenancy_bridge() RETURNS trigger \
+         LANGUAGE plpgsql AS $body$ BEGIN NEW.name := 'not_the_tranches_function'; \
+         RETURN NEW; END $body$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must not replace a bridge function it did not create",
+    )
+    .await;
+    assert_eq!(
+        code, "42723",
+        "duplicate_function is the refusal's SQLSTATE"
+    );
+    assert!(
+        message.contains("public.fn_entities_tenancy_bridge()"),
+        "the refusal must name the function it found: {message}"
+    );
+
+    let body: String = sqlx::query_scalar(
+        "SELECT p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'public' AND p.proname = 'fn_entities_tenancy_bridge' \
+           AND p.pronargs = 0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        body.contains("not_the_tranches_function"),
+        "the pre-existing function's body must not have been replaced in place: {body}"
+    );
+}
+
+/// A pre-existing bridge trigger must stop the migration, not be replaced.
+///
+/// The third object kind in the same family, and reachable the same way:
+/// `CREATE OR REPLACE TRIGGER` replaces a same-named trigger on the same table,
+/// and rollback/0032 drops it afterwards, leaving nothing to restore.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_pre_existing_bridge_trigger(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // A trigger with a tranche name on a tranche table, calling something else.
+    // Deliberately NOT named like a bridge function, so the function guard
+    // cannot be what fires.
+    for stmt in [
+        "CREATE FUNCTION public.zz_keeper() RETURNS trigger LANGUAGE plpgsql \
+         AS $body$ BEGIN RETURN NEW; END $body$",
+        "CREATE TRIGGER trg_entities_tenancy_bridge BEFORE INSERT ON entities \
+         FOR EACH ROW EXECUTE FUNCTION public.zz_keeper()",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must not replace a trigger it did not create",
+    )
+    .await;
+    assert_eq!(code, "42710", "duplicate_object is the refusal's SQLSTATE");
+    assert!(
+        message.contains("trg_entities_tenancy_bridge on public.entities"),
+        "the refusal must name the trigger and the table it is on: {message}"
+    );
+
+    let still_calls: String = sqlx::query_scalar(
+        "SELECT p.proname FROM pg_trigger t JOIN pg_proc p ON p.oid = t.tgfoid \
+         WHERE t.tgname = 'trg_entities_tenancy_bridge' \
+           AND t.tgrelid = 'public.entities'::regclass AND NOT t.tgisinternal",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_calls, "zz_keeper",
+        "the pre-existing trigger must still call its own function"
+    );
+}
+
+/// The rollback must refuse an unstamped object rather than destroy it.
+///
+/// The other half of the contract. 0032 refuses to start over an unstamped
+/// object, so an unstamped object at rollback time was either never this
+/// tranche's or has had its provenance comment removed. Either way this script
+/// must not drop it -- and must not have retired completion evidence on the way
+/// to finding out, which is why the guard sits ahead of that block.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_rollback_refuses_to_destroy_an_unstamped_column(pool: PgPool) {
+    insert_completed_checkpoint(&pool, "digest-for-the-provenance-test").await;
+    sqlx::raw_sql("COMMENT ON COLUMN entities.tenant_id IS NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for script in [CONSTRAINTS_DOWN_SQL, INDEXES_DOWN_SQL] {
+        sqlx::raw_sql(script).execute(&pool).await.expect("unwind");
+    }
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_DOWN_SQL,
+        "the rollback must refuse an ownership column it cannot prove is its own",
+    )
+    .await;
+    assert_eq!(
+        code, "55000",
+        "object_not_in_prerequisite_state is the refusal's SQLSTATE"
+    );
+    assert!(
+        message.contains("column entities.tenant_id"),
+        "the refusal must name the unstamped object: {message}"
+    );
+
+    // Nothing was destroyed.
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name IN ('agent_uuid', 'tenant_id') \
+           AND table_name IN ('archival_batches', 'audit_logs', 'entities', 'memory_graph', \
+                              'rmk_policies')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, 10, "all ten ownership columns must survive");
+
+    // And nothing was changed on the way to refusing: the guard runs ahead of
+    // the block that retires COMPLETED checkpoints.
+    let still_completed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints WHERE status = 'COMPLETED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        still_completed, 1,
+        "a refusing rollback must not have retired completion evidence first"
+    );
+}
+
+/// Provenance must not cost the migration its idempotency.
+///
+/// The file's header promises re-running it is a no-op, and the guards are the
+/// only thing standing between that promise and silent adoption. Re-applying
+/// 0032 over its own work must therefore still succeed, and every one of the
+/// twenty objects must still carry the stamp afterwards.
+#[sqlx::test(migrations = "./migrations")]
+async fn re_running_the_prepare_migration_over_its_own_work_is_a_no_op(pool: PgPool) {
+    // 0041 depends on the columns, so it stays applied throughout; 0032 is
+    // simply run again on top of the finished tranche, twice.
+    for attempt in 1..=2 {
+        sqlx::raw_sql(PREPARE_UP_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("re-run {attempt} of 0032 over its own work must succeed: {e}")
+            });
+    }
+
+    let stamped: i64 = sqlx::query_scalar(
+        "WITH marker AS (SELECT col_description(a.attrelid, a.attnum::int) AS c \
+                           FROM pg_attribute a \
+                          WHERE a.attrelid IN ('public.archival_batches'::regclass, \
+                                               'public.audit_logs'::regclass, \
+                                               'public.entities'::regclass, \
+                                               'public.memory_graph'::regclass, \
+                                               'public.rmk_policies'::regclass) \
+                            AND a.attname IN ('agent_uuid', 'tenant_id') \
+                            AND a.attnum > 0 AND NOT a.attisdropped \
+                          UNION ALL \
+                         SELECT obj_description(p.oid, 'pg_proc') \
+                           FROM pg_proc p \
+                          WHERE p.pronamespace = 'public'::regnamespace \
+                            AND p.proname LIKE 'fn\\_%\\_tenancy\\_bridge' AND p.pronargs = 0 \
+                          UNION ALL \
+                         SELECT obj_description(t.oid, 'pg_trigger') \
+                           FROM pg_trigger t \
+                          WHERE t.tgname LIKE 'trg\\_%\\_tenancy\\_bridge' AND NOT t.tgisinternal) \
+         SELECT count(*) FROM marker WHERE c LIKE 'AEON tenancy tranche 1 (migration 0032).%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stamped, 20,
+        "ten columns, five functions and five triggers must all carry the provenance marker"
+    );
+}
+
+/// The marker is a contract between two files, so drift must fail the build.
+///
+/// It is declared three times -- the guard and the stamping block in
+/// migrations/0032, and the guard in rollback/0032 -- and a one-character
+/// divergence would make the rollback refuse every object the migration
+/// stamped, which is a permanent false refusal with no diagnostic pointing at
+/// the cause.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_provenance_marker_is_identical_everywhere_it_appears(pool: PgPool) {
+    /// Concatenate the adjacent single-quoted literals of every
+    /// `marker CONSTANT TEXT := ...;` declaration in a script.
+    fn declared_markers(sql: &str) -> Vec<String> {
+        const DECL: &str = "marker CONSTANT TEXT :=";
+        sql.match_indices(DECL)
+            .map(|(at, _)| {
+                let tail = &sql[at + DECL.len()..];
+                let mut rest = &tail[..tail.find(';').expect("a declaration ends in a semicolon")];
+                let mut joined = String::new();
+                while let Some(open) = rest.find('\'') {
+                    let after = &rest[open + 1..];
+                    let close = after.find('\'').expect("an unterminated SQL literal");
+                    joined.push_str(&after[..close]);
+                    rest = &after[close + 1..];
+                }
+                joined
+            })
+            .collect()
+    }
+
+    let declared: Vec<String> = declared_markers(PREPARE_UP_SQL)
+        .into_iter()
+        .chain(declared_markers(PREPARE_DOWN_SQL))
+        .collect();
+    assert_eq!(
+        declared.len(),
+        3,
+        "two declarations in the migration and one in the rollback: {declared:#?}"
+    );
+    assert!(
+        declared.windows(2).all(|w| w[0] == w[1]),
+        "every declaration of the marker must be byte-identical: {declared:#?}"
+    );
+
+    // And the text the scripts declare is the text PostgreSQL actually holds,
+    // so this test cannot pass over a marker that never reached the catalog.
+    let in_catalog: String = sqlx::query_scalar(
+        "SELECT col_description('public.entities'::regclass, \
+                                (SELECT attnum FROM pg_attribute \
+                                  WHERE attrelid = 'public.entities'::regclass \
+                                    AND attname = 'tenant_id')::int)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        in_catalog, declared[0],
+        "the stamped comment must be exactly what the scripts compare against"
+    );
+}

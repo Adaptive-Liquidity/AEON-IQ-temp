@@ -33,7 +33,9 @@
 --
 -- Deliberately NOT resolved with `DROP ... CASCADE` anywhere.
 --
--- SAFE TO RE-RUN.  Every statement is IF EXISTS.
+-- SAFE TO RE-RUN.  Every statement is IF EXISTS, and the provenance guard only
+-- fires on an object that is PRESENT and unstamped, so a second run over an
+-- already-unwound schema finds nothing to object to.
 BEGIN;
 
 SET LOCAL search_path = pg_catalog, public;
@@ -160,6 +162,112 @@ BEGIN
             USING ERRCODE = 'object_not_in_prerequisite_state';
     END IF;
 END $$;
+
+-- Refuse to destroy an object this tranche did not create.
+--
+-- The DROP statements below name their objects literally, and migration 0032
+-- reaches them with `ADD COLUMN IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`
+-- and `CREATE OR REPLACE TRIGGER`.  Without this guard those two facts compose
+-- into data loss: a `tenant_id` that existed before the tranche was skipped by
+-- IF NOT EXISTS, never created by 0032, and dropped here anyway -- taking every
+-- row's value with it.  A bridge function that existed before the tranche had
+-- its body replaced in place (CREATE OR REPLACE preserves the OID, so every
+-- trigger already calling it silently changed behaviour) and is dropped here as
+-- though 0032 had created it.
+--
+-- Shape is not enough for these, unlike the constraints and indexes the other
+-- guards compare.  A column holds rows, so an identically-shaped `uuid`
+-- column is not interchangeable with ours; only provenance distinguishes them.
+--
+-- Migration 0032 therefore stamps every object it creates with the marker
+-- below, in the same transaction that creates it, and refuses to run at all if
+-- one of them already exists unstamped.  This script is the other half: it
+-- destroys only what carries the stamp.
+--
+-- Failure direction is deliberate.  A missing stamp on an object that really is
+-- ours -- someone ran `COMMENT ON COLUMN ... IS NULL` -- makes this script
+-- refuse rather than drop, which preserves data and is recoverable by restoring
+-- the comment.  There is no case in which a wrong answer here destroys
+-- something.
+DO $provenance_guard$
+DECLARE
+    -- Byte-identical to both occurrences in
+    -- migrations/0032_tenancy_tranche1_prepare.sql.  The test
+    -- `the_provenance_marker_is_identical_everywhere_it_appears` fails on drift.
+    marker CONSTANT TEXT :=
+        'AEON tenancy tranche 1 (migration 0032). Provenance marker: rollback/0032 '
+        'destroys only objects carrying exactly this comment, and refuses to touch '
+        'any that do not.';
+    foreign_objects TEXT;
+BEGIN
+    SELECT string_agg(descr, ', ' ORDER BY descr)
+      INTO foreign_objects
+      FROM (
+            SELECT format('column %s.%s', expected.tbl, expected.col) AS descr
+              FROM (VALUES
+                      ('archival_batches', 'agent_uuid'), ('archival_batches', 'tenant_id'),
+                      ('audit_logs',       'agent_uuid'), ('audit_logs',       'tenant_id'),
+                      ('entities',         'agent_uuid'), ('entities',         'tenant_id'),
+                      ('memory_graph',     'agent_uuid'), ('memory_graph',     'tenant_id'),
+                      ('rmk_policies',     'agent_uuid'), ('rmk_policies',     'tenant_id')
+                   ) AS expected(tbl, col)
+              JOIN pg_catalog.pg_attribute a
+                ON a.attrelid = to_regclass(format('public.%I', expected.tbl))
+               AND a.attname  = expected.col
+               AND a.attnum   > 0
+               AND NOT a.attisdropped
+             WHERE col_description(a.attrelid, a.attnum::int) IS DISTINCT FROM marker
+
+            UNION ALL
+
+            -- By signature, not by name: PostgreSQL allows overloading and only
+            -- the zero-argument `trigger`-returning form is dropped below.
+            SELECT format('function public.%s()', expected.fn)
+              FROM (VALUES
+                      ('fn_archival_batches_tenancy_bridge'),
+                      ('fn_audit_logs_tenancy_bridge'),
+                      ('fn_entities_tenancy_bridge'),
+                      ('fn_memory_graph_tenancy_bridge'),
+                      ('fn_rmk_policies_tenancy_bridge')
+                   ) AS expected(fn)
+              JOIN pg_catalog.pg_proc p
+                ON p.proname      = expected.fn
+               AND p.pronamespace = 'public'::regnamespace
+               AND p.pronargs     = 0
+               AND p.prorettype   = 'pg_catalog.trigger'::regtype
+             WHERE obj_description(p.oid, 'pg_proc') IS DISTINCT FROM marker
+
+            UNION ALL
+
+            -- Scoped to the table each trigger belongs on: trigger names are
+            -- unique only per relation.
+            SELECT format('trigger %s on public.%s', expected.trg, expected.tbl)
+              FROM (VALUES
+                      ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
+                      ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
+                      ('trg_entities_tenancy_bridge',         'entities'),
+                      ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
+                      ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
+                   ) AS expected(trg, tbl)
+              JOIN pg_catalog.pg_trigger t
+                ON t.tgname  = expected.trg
+               AND t.tgrelid = to_regclass(format('public.%I', expected.tbl))
+               AND NOT t.tgisinternal
+             WHERE obj_description(t.oid, 'pg_trigger') IS DISTINCT FROM marker
+           ) AS unstamped;
+
+    IF foreign_objects IS NOT NULL THEN
+        RAISE EXCEPTION
+            'these objects exist but do not carry tenancy tranche 1''s provenance marker, '
+            'so this script will not destroy them: %. Migration 0032 stamps everything it '
+            'creates and refuses to start if one of these already exists unstamped, so an '
+            'unstamped object here was not created by this tranche -- or its comment was '
+            'removed afterwards. Nothing has been changed. Restore the marker if the object '
+            'really is this tranche''s, or remove the object by hand if it is not.',
+            foreign_objects
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END $provenance_guard$;
 
 -- Retire completion evidence before destroying what it describes.
 --
