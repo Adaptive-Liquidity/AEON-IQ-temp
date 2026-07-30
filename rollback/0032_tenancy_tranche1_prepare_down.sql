@@ -33,7 +33,22 @@
 --
 -- Deliberately NOT resolved with `DROP ... CASCADE` anywhere.
 --
--- SAFE TO RE-RUN.  Every statement is IF EXISTS.
+-- DROPS ONLY WHAT IT OWNS.  A name is not a claim of ownership, and every drop
+-- below is by name.  Migration 0032 stamps each of the twenty objects it creates
+-- -- ten ownership columns, five bridge functions, five bridge triggers -- with an
+-- ownership marker in `pg_description`, inside the transaction that creates it.
+-- This script drops an object only while that marker is present, and refuses
+-- outright if any of the twenty names is occupied by something without it: a
+-- pre-existing `entities.tenant_id` was skipped by 0032's `ADD COLUMN IF NOT
+-- EXISTS` with a notice, and the `DROP COLUMN` statements below then destroyed it
+-- and its data as though the tranche had created it.  The refusal comes before the
+-- first mutation and names every offender at once.  See the guard for what it does
+-- and does not prove, and for the one state it deliberately refuses rather than
+-- resolves: a database that applied 0032 before the marker existed.
+--
+-- SAFE TO RE-RUN.  Every statement is IF EXISTS, and an object that is simply
+-- absent is skipped rather than refused -- only a PRESENT unmarked one is an
+-- ownership dispute.
 BEGIN;
 
 SET LOCAL search_path = pg_catalog, public;
@@ -75,6 +90,27 @@ BEGIN
     -- `agents_tenant_id_id_key`, which all five depend on and which no rename of
     -- a child can change; `conrelid::regclass` then reports where each one
     -- actually is.
+    --
+    -- SCOPED BY TABLE OID, NOT BY CONSTRAINT NAME, and that half was still a hole
+    -- after `conindid` replaced the literal table name: `ALTER TABLE ... RENAME
+    -- CONSTRAINT` leaves the key attached and pointing at the same parent index
+    -- while hiding it from a `conname IN (...)` filter. This guard then reported
+    -- "none" and the script proceeded -- and it does not fail late, which is what
+    -- makes the miss quiet: `ALTER TABLE ... DROP COLUMN` drops the foreign-key
+    -- constraints that use the column without needing CASCADE, so a renamed
+    -- ownership key was silently destroyed by the column drops below while the
+    -- ledger recorded 41 as still applied. Sibling script 0033 was rewritten to
+    -- find the same five keys by the same two axes; this is that test, one script
+    -- along.
+    --
+    -- The table scope is what keeps it precise, and dropping it would be a
+    -- regression rather than a simplification: measured on pg16, migration 0030's
+    -- `credential_agent_grants_agent_fkey` has the identical shape --
+    -- `(tenant_id, agent_uuid)` referencing `agents (tenant_id, id)` through the
+    -- same `conindid` -- so a shape-only test would report it as a tranche 1 key
+    -- and refuse this rollback forever. A renamed or schema-moved TABLE escapes
+    -- this arm because its scope is the thing that moved; that is caught by the
+    -- bridge-trigger guard below, which refuses before anything is touched.
     SELECT string_agg(format('%s on %s', c.conname, c.conrelid::regclass), ', '
                       ORDER BY c.conname)
       INTO constraints
@@ -86,11 +122,11 @@ BEGIN
                 WHERE p.conname = 'agents_tenant_id_id_key'
                   AND p.conrelid = 'public.agents'::regclass
                   AND p.contype  = 'u')
-       AND c.conname IN ('archival_batches_tenant_agent_fkey',
-                         'audit_logs_tenant_agent_fkey',
-                         'entities_tenant_agent_fkey',
-                         'memory_graph_tenant_agent_fkey',
-                         'rmk_policies_tenant_agent_fkey');
+       AND c.conrelid IN (to_regclass('public.archival_batches'),
+                          to_regclass('public.audit_logs'),
+                          to_regclass('public.entities'),
+                          to_regclass('public.memory_graph'),
+                          to_regclass('public.rmk_policies'));
 
     IF remaining IS NOT NULL OR constraints IS NOT NULL THEN
         RAISE EXCEPTION
@@ -158,6 +194,160 @@ BEGIN
             'to what migration 0032 created, then re-run.',
             moved
             USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END $$;
+
+-- ── Refuse to drop any of the twenty objects this tranche does not own ───────
+--
+-- A NAME IS NOT A CLAIM OF OWNERSHIP, and every DROP below is by name. Migration
+-- 0032 creates its columns with `ADD COLUMN IF NOT EXISTS` and its functions and
+-- triggers with `CREATE OR REPLACE`, none of which says whether the object it
+-- found was already there. A pre-existing `entities.tenant_id` was skipped by the
+-- build with a notice, version 32 was recorded, and the `DROP COLUMN` statements
+-- below then destroyed it and its data as though the tranche had created it. The
+-- same held for a zero-argument `trigger`-returning function of a bridge's name --
+-- whose OID `CREATE OR REPLACE` preserves, so 0032 silently rewrote what every
+-- existing trigger on it executed -- and for a same-named trigger on a bridged
+-- table.
+--
+-- Migration 0032 therefore stamps each of those twenty objects with an ownership
+-- marker in `pg_description` inside the transaction that creates it, and this
+-- script drops an object only while the marker is present. Absent is fine and is
+-- not an error: this file promises to be re-runnable, so an object that is already
+-- gone is simply skipped, exactly as the `IF EXISTS` on every drop intends. What
+-- is refused is an object that is PRESENT and unmarked.
+--
+-- Refusal is transaction-wide and comes before the first mutation -- ahead of the
+-- checkpoint retirement below, which is the earliest write this script performs --
+-- so a refused rollback changes nothing at all, not even the ledger. All twenty
+-- are checked in one pass and reported together.
+--
+-- `pg_description` rows are dropped with the object they describe, so a marker
+-- cannot outlive its column and be inherited by a later column that happens to
+-- reuse the name or the attnum.
+--
+-- A marker is evidence about 0032, not a defence against someone who can
+-- `COMMENT ON` these objects; anyone with that privilege can already do worse.
+--
+-- The remediation for a legacy database is stated in the refusal itself, because
+-- there is one state this cannot distinguish and should not silently resolve: a
+-- database that applied 0032 BEFORE the marker existed has the tranche's own
+-- twenty objects, unmarked. Guessing in either direction is wrong -- adopting them
+-- is the very defect this guard closes, and refusing without a next action strands
+-- the operator -- so it refuses and names the fix.
+DO $$
+DECLARE
+    col_marker TEXT := 'AEON-IQ tenancy tranche 1 ownership column. Created and owned by '
+                       'migration 0032; rollback/0032_tenancy_tranche1_prepare_down.sql drops it '
+                       'only while this exact comment is present. '
+                       'aeon-iq:tenancy:tranche1:0032:ownership-column';
+    fn_marker  TEXT := 'AEON-IQ tenancy tranche 1 bridge function. Created and owned by '
+                       'migration 0032; rollback/0032_tenancy_tranche1_prepare_down.sql drops it '
+                       'only while this exact comment is present. '
+                       'aeon-iq:tenancy:tranche1:0032:bridge-function';
+    trg_marker TEXT := 'AEON-IQ tenancy tranche 1 bridge trigger. Created and owned by '
+                       'migration 0032; rollback/0032_tenancy_tranche1_prepare_down.sql drops it '
+                       'only while this exact comment is present. '
+                       'aeon-iq:tenancy:tranche1:0032:bridge-trigger';
+    rec        RECORD;
+    unowned    TEXT[] := ARRAY[]::TEXT[];
+BEGIN
+    -- The ten columns the ALTER TABLE statements below drop.
+    FOR rec IN
+        SELECT expected.tbl, expected.col, d.description AS comment
+          FROM (VALUES
+                  ('archival_batches', 'agent_uuid'), ('archival_batches', 'tenant_id'),
+                  ('audit_logs',       'agent_uuid'), ('audit_logs',       'tenant_id'),
+                  ('entities',         'agent_uuid'), ('entities',         'tenant_id'),
+                  ('memory_graph',     'agent_uuid'), ('memory_graph',     'tenant_id'),
+                  ('rmk_policies',     'agent_uuid'), ('rmk_policies',     'tenant_id')
+               ) AS expected(tbl, col)
+          JOIN pg_catalog.pg_attribute a
+            ON a.attrelid = to_regclass(format('public.%I', expected.tbl))
+           AND a.attname  = expected.col
+           AND a.attnum   > 0
+           AND NOT a.attisdropped
+          LEFT JOIN pg_catalog.pg_description d
+            ON d.objoid   = a.attrelid
+           AND d.classoid = 'pg_catalog.pg_class'::regclass
+           AND d.objsubid = a.attnum
+         ORDER BY expected.tbl, expected.col
+    LOOP
+        IF rec.comment IS DISTINCT FROM col_marker THEN
+            unowned := unowned || format('column public.%s.%s (comment: %s)',
+                                         rec.tbl, rec.col,
+                                         COALESCE(quote_literal(rec.comment), 'none'));
+        END IF;
+    END LOOP;
+
+    -- The five functions the DROP FUNCTION statements below drop, discovered by
+    -- the same zero-argument `trigger`-returning contract those statements name.
+    -- An unrelated overload is neither dropped nor reported.
+    FOR rec IN
+        SELECT expected.fn, d.description AS comment
+          FROM (VALUES
+                  ('fn_archival_batches_tenancy_bridge'), ('fn_audit_logs_tenancy_bridge'),
+                  ('fn_entities_tenancy_bridge'),         ('fn_memory_graph_tenancy_bridge'),
+                  ('fn_rmk_policies_tenancy_bridge')
+               ) AS expected(fn)
+          JOIN pg_catalog.pg_proc p
+            ON p.proname      = expected.fn
+           AND p.pronamespace = 'public'::regnamespace
+           AND p.pronargs     = 0
+           AND p.prorettype   = 'pg_catalog.trigger'::regtype
+          LEFT JOIN pg_catalog.pg_description d
+            ON d.objoid   = p.oid
+           AND d.classoid = 'pg_catalog.pg_proc'::regclass
+           AND d.objsubid = 0
+         ORDER BY expected.fn
+    LOOP
+        IF rec.comment IS DISTINCT FROM fn_marker THEN
+            unowned := unowned || format('function public.%s() (comment: %s)',
+                                         rec.fn, COALESCE(quote_literal(rec.comment), 'none'));
+        END IF;
+    END LOOP;
+
+    -- The five triggers, scoped to (name, table) exactly as the DROP TRIGGER
+    -- statements below are. A same-named trigger on any other table is not
+    -- reachable by those statements and must not be reported here.
+    FOR rec IN
+        SELECT expected.trg, expected.tbl, d.description AS comment
+          FROM (VALUES
+                  ('trg_archival_batches_tenancy_bridge', 'archival_batches'),
+                  ('trg_audit_logs_tenancy_bridge',       'audit_logs'),
+                  ('trg_entities_tenancy_bridge',         'entities'),
+                  ('trg_memory_graph_tenancy_bridge',     'memory_graph'),
+                  ('trg_rmk_policies_tenancy_bridge',     'rmk_policies')
+               ) AS expected(trg, tbl)
+          JOIN pg_catalog.pg_trigger t
+            ON t.tgname  = expected.trg
+           AND t.tgrelid = to_regclass(format('public.%I', expected.tbl))
+           AND NOT t.tgisinternal
+          LEFT JOIN pg_catalog.pg_description d
+            ON d.objoid   = t.oid
+           AND d.classoid = 'pg_catalog.pg_trigger'::regclass
+           AND d.objsubid = 0
+         ORDER BY expected.trg
+    LOOP
+        IF rec.comment IS DISTINCT FROM trg_marker THEN
+            unowned := unowned || format('trigger %s on public.%s (comment: %s)',
+                                         rec.trg, rec.tbl,
+                                         COALESCE(quote_literal(rec.comment), 'none'));
+        END IF;
+    END LOOP;
+
+    IF cardinality(unowned) > 0 THEN
+        RAISE EXCEPTION
+            'refusing to drop tranche 1 objects this rollback does not own: %. Each holds a name '
+            'migration 0032 uses but does not carry the ownership marker that migration writes '
+            'when it creates the object, so dropping it would destroy something else -- a column '
+            'together with its data. Nothing has been changed. Rename or remove the occupant, '
+            'then re-run. If these ARE the tranche''s own objects in a database that applied 0032 '
+            'before the marker existed, re-stamp them with the COMMENT statements migration 0032 '
+            'uses and re-run; verify first, because the marker is exactly what authorises this '
+            'script to drop them.',
+            array_to_string(unowned, ' | ')
+            USING ERRCODE = 'duplicate_object';
     END IF;
 END $$;
 
