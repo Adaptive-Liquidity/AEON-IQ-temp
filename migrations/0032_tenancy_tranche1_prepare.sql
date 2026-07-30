@@ -218,16 +218,41 @@ BEGIN
     SELECT pg_catalog.string_agg(missing.what, ', ' ORDER BY missing.what)
       INTO occupied
       FROM (
-            SELECT pg_catalog.format('missing CHECK %s', expected.con) AS what
+            -- Compared by EXPRESSION, not by name.
+            --
+            -- Codex, P1 on 9a6c279: matching `contype` and `conname` alone
+            -- establishes none of the invariants this guard exists to protect.
+            -- Seven constraints carrying these exact names and defined as
+            -- `CHECK (true)` satisfied a name-only test, `CREATE TABLE IF NOT
+            -- EXISTS` adopted the table, and a forged COMPLETED row still
+            -- reached FINALIZE. That is identity-by-name at an eighth object
+            -- kind, and the tranche's rule is that identity is by shape.
+            --
+            -- The right-hand sides are PostgreSQL's own normalised rendering,
+            -- read back out of `pg_get_expr` after this migration builds the
+            -- table -- not the source text above, which deparses differently.
+            -- Exact comparison is pinned to pg16, the only version in compose
+            -- and CI, exactly as `IndexPredicate::Exactly` already is. A major
+            -- upgrade that changed deparse output would fail closed here, with
+            -- a spurious refusal naming the constraint, rather than silently
+            -- passing.
+            SELECT pg_catalog.format('CHECK %s is missing or does not match', expected.con) AS what
               FROM (VALUES
-                      ('tenancy_backfill_checkpoints_status_ck'),
-                      ('tenancy_backfill_checkpoints_tranche_ck'),
-                      ('tenancy_backfill_checkpoints_completed_shape_ck'),
-                      ('tenancy_backfill_checkpoints_completed_cursor_ck'),
-                      ('tenancy_backfill_checkpoints_counts_ck'),
-                      ('tenancy_backfill_checkpoints_completed_clean_ck'),
-                      ('tenancy_backfill_checkpoints_completed_accounting_ck')
-                   ) AS expected(con)
+                      ('tenancy_backfill_checkpoints_status_ck',
+                       '(status = ANY (ARRAY[''IN_PROGRESS''::text, ''COMPLETED''::text, ''ABANDONED''::text]))'),
+                      ('tenancy_backfill_checkpoints_tranche_ck',
+                       '(tranche = ANY (ARRAY[''TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN''::text, ''TRANCHE_2_SESSIONS''::text, ''TRANCHE_3_MEMORIES''::text, ''TRANCHE_4_LINEAGE_AND_ARCHIVAL''::text, ''TRANCHE_5_OPERATIONS''::text, ''FINAL_CONSTRAINT_TIGHTENING''::text]))'),
+                      ('tenancy_backfill_checkpoints_completed_shape_ck',
+                       '((status = ''COMPLETED''::text) = (completed_at IS NOT NULL))'),
+                      ('tenancy_backfill_checkpoints_completed_cursor_ck',
+                       '((status <> ''COMPLETED''::text) OR (resume_cursor IS NULL))'),
+                      ('tenancy_backfill_checkpoints_counts_ck',
+                       '((rows_total >= 0) AND (rows_backfilled >= 0) AND (blocking_count >= 0) AND (rows_backfilled <= rows_total))'),
+                      ('tenancy_backfill_checkpoints_completed_clean_ck',
+                       '((status <> ''COMPLETED''::text) OR (blocking_count = 0))'),
+                      ('tenancy_backfill_checkpoints_completed_accounting_ck',
+                       '((status <> ''COMPLETED''::text) OR (rows_backfilled = rows_total))')
+                   ) AS expected(con, expr)
              WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
                AND NOT EXISTS (
                      SELECT 1
@@ -235,7 +260,8 @@ BEGIN
                       WHERE k.conrelid =
                             pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
                         AND k.contype  = 'c'
-                        AND k.conname  = expected.con)
+                        AND k.conname  = expected.con
+                        AND pg_catalog.pg_get_expr(k.conbin, k.conrelid) = expected.expr)
 
             UNION ALL
 

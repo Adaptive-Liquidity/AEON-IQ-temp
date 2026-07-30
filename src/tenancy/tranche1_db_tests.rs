@@ -3723,3 +3723,96 @@ async fn the_prepare_migration_refuses_a_pre_existing_checkpoint_table(pool: PgP
         "and it still has none of the tranche's CHECKs, so nothing was half-applied"
     );
 }
+
+/// Correctly named but vacuous CHECKs must not pass for the real table.
+///
+/// Codex, P1 on `9a6c279`: the checkpoint guard matched `contype` and `conname`
+/// and nothing else, so seven constraints carrying the tranche's exact names and
+/// defined as `CHECK (true)` satisfied it. `CREATE TABLE IF NOT EXISTS` then
+/// adopted the table and a forged COMPLETED row still reached FINALIZE --
+/// identity-by-name at an eighth object kind, in the guard written to stop
+/// identity-by-name. The constraint expressions are now compared against
+/// PostgreSQL's own normalised rendering.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_checkpoint_table_with_vacuous_checks(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    let named_but_vacuous: String = [
+        "tenancy_backfill_checkpoints_status_ck",
+        "tenancy_backfill_checkpoints_tranche_ck",
+        "tenancy_backfill_checkpoints_completed_shape_ck",
+        "tenancy_backfill_checkpoints_completed_cursor_ck",
+        "tenancy_backfill_checkpoints_counts_ck",
+        "tenancy_backfill_checkpoints_completed_clean_ck",
+        "tenancy_backfill_checkpoints_completed_accounting_ck",
+    ]
+    .iter()
+    .map(|c| format!(", CONSTRAINT {c} CHECK (true)"))
+    .collect();
+
+    for stmt in [
+        "DROP TABLE tenancy_backfill_checkpoints".to_owned(),
+        format!(
+            "CREATE TABLE tenancy_backfill_checkpoints ( \
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tranche TEXT, \
+                 contract_digest TEXT, status TEXT, resume_cursor TEXT, \
+                 rows_total BIGINT, rows_backfilled BIGINT, blocking_count BIGINT, \
+                 started_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), \
+                 completed_at TIMESTAMPTZ{named_but_vacuous})"
+        ),
+        // Every value here is refused by the real CHECKs and accepted by these.
+        "INSERT INTO tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, \
+            blocking_count, completed_at) \
+         VALUES ('NOT_EVEN_A_TRANCHE', 'forged', 'COMPLETED', 0, 999, 7, NULL)"
+            .to_owned(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // The name-only guard this replaces would have seen all seven and adopted.
+    let by_name: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'public.tenancy_backfill_checkpoints'::regclass AND contype = 'c'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        by_name, 7,
+        "the decoy must satisfy a name-only test to be a real test"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must compare CHECK expressions, not just their names",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    for named in [
+        "tenancy_backfill_checkpoints_status_ck is missing or does not match",
+        "tenancy_backfill_checkpoints_counts_ck is missing or does not match",
+        "tenancy_backfill_checkpoints_completed_accounting_ck is missing or does not match",
+    ] {
+        assert!(
+            message.contains(named),
+            "the refusal must name each constraint whose expression differs; \
+             '{named}' is absent from: {message}"
+        );
+    }
+
+    // The forged row -- COMPLETED with no completed_at, an unknown tranche, more
+    // rows backfilled than exist and a nonzero blocking count -- is exactly what
+    // FINALIZE_PRECONDITION would have been handed.
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints \
+          WHERE status = 'COMPLETED' AND rows_backfilled > rows_total",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(forged, 1, "the occupant is left exactly as it was");
+}
