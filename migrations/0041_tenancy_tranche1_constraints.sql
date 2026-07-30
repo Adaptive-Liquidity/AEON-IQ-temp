@@ -449,24 +449,64 @@ BEGIN
             -- PostgreSQL refuses to ADD CONSTRAINT over a non-default-sorted
             -- index, so this is consistency rather than a reachable hole; the
             -- two checks living apart is the actual defect.
+            --
+            -- EACH AXIS REPORTS ITSELF, one `problems` entry at a time, rather
+            -- than one combined test with a fixed message. The combined form
+            -- tested ten axes and printed five, so a failure on any of the other
+            -- five -- access method, NULLS NOT DISTINCT, column ordering,
+            -- collation, operator class -- raised a diagnostic whose every named
+            -- value looked correct and which named nothing that was wrong. A
+            -- refusal an operator cannot act on is most of the way to no refusal
+            -- at all. The wording of each entry matches the adoption branch above,
+            -- so the same defect reads the same way whichever branch catches it.
             IF NOT FOUND THEN
                 problems := problems || 'constraint owns no index'::TEXT;
-            ELSIF NOT idx.indisunique
-               OR NOT idx.indisvalid
-               OR NOT idx.is_total
-               OR idx.indnkeyatts <> 2
-               OR idx.indrelid <> tbl_oid
-               OR idx.access_method IS DISTINCT FROM 'btree'
-               OR idx.nulls_not_distinct
-               OR EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0)
-               OR EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0)
-               OR idx.default_opclasses IS NOT TRUE THEN
-                problems := problems
-                    || format('backing index is not a valid, total, two-column unique index on '
-                              'this table (indisunique=%s indisvalid=%s total=%s indnkeyatts=%s '
-                              'on %s)',
-                              idx.indisunique, idx.indisvalid, idx.is_total, idx.indnkeyatts,
-                              idx.indrelid::regclass);
+            ELSE
+                IF idx.indrelid IS DISTINCT FROM tbl_oid THEN
+                    problems := problems
+                        || format('its backing index is on %s, expected public.%s',
+                                  idx.indrelid::regclass, spec.tbl);
+                END IF;
+                IF NOT idx.indisunique THEN
+                    problems := problems || 'its backing index is not unique'::TEXT;
+                END IF;
+                IF NOT idx.indisvalid THEN
+                    problems := problems
+                        || 'its backing index is INVALID and enforces nothing'::TEXT;
+                END IF;
+                IF NOT idx.is_total THEN
+                    problems := problems || 'its backing index is partial'::TEXT;
+                END IF;
+                IF idx.indnkeyatts <> 2 THEN
+                    problems := problems
+                        || format('its backing index has %s key column(s), expected 2',
+                                  idx.indnkeyatts);
+                END IF;
+                IF idx.access_method IS DISTINCT FROM 'btree' THEN
+                    problems := problems
+                        || format('its backing index access method is %L, expected %L',
+                                  idx.access_method, 'btree');
+                END IF;
+                IF idx.nulls_not_distinct THEN
+                    problems := problems
+                        || 'its backing index is NULLS NOT DISTINCT; the tranche builds plain '
+                           'unique indexes, which treat NULLs as distinct'::TEXT;
+                END IF;
+                IF EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0) THEN
+                    problems := problems
+                        || format('its backing index column ordering is %L, expected all-zero '
+                                  '(ASC NULLS LAST); bit 0 is DESC, bit 1 is NULLS FIRST',
+                                  idx.options);
+                END IF;
+                IF EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0) THEN
+                    problems := problems
+                        || format('its backing index carries collations %L; the uuid columns '
+                                  'these migrations index have none', idx.collations);
+                END IF;
+                IF idx.default_opclasses IS NOT TRUE THEN
+                    problems := problems
+                        || 'its backing index uses a non-default operator class'::TEXT;
+                END IF;
             END IF;
         END IF;
 
