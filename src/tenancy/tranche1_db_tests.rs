@@ -3816,3 +3816,48 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_vacuous_checks(po
     .unwrap();
     assert_eq!(forged, 1, "the occupant is left exactly as it was");
 }
+
+/// A total unique index must not pass for the tranche's partial one.
+///
+/// Found by self-audit after Codex's P1, by enumerating every `IF NOT EXISTS`
+/// in the tranche and asking what identifies the object. This index was checked
+/// for ownership and nothing else, and it is the object that makes "at most one
+/// authoritative completion per tranche and digest" true. Its
+/// `WHERE status = 'COMPLETED'` scoping is a named contract decision: it is what
+/// keeps ABANDONED history retained rather than overwritten, which is exactly
+/// what `rollback/0032` relies on when it retires a completion.
+///
+/// A TOTAL occupant is the sharp case rather than a non-unique one: it is
+/// stricter, so nothing fails at insert time to reveal it, and it silently
+/// forbids the second ABANDONED row the rollback is designed to leave behind.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_total_index_where_a_partial_one_belongs(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // The table is left exactly as the tranche built it -- the rollback retains
+    // it, so it is still here with all seven CHECKs intact. Only the index is
+    // swapped, so the refusal below can be about nothing but index shape.
+    for stmt in [
+        "DROP INDEX tenancy_backfill_checkpoints_completed_key",
+        "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+           ON tenancy_backfill_checkpoints (tranche, contract_digest)",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must not adopt a total index where its partial one belongs",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("tenancy_backfill_checkpoints_completed_key is not the partial unique")
+            && message.contains("<total>"),
+        "the refusal must name the index and say what shape it actually found: {message}"
+    );
+}

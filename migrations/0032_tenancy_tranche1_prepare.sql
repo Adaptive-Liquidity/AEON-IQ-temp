@@ -265,6 +265,45 @@ BEGIN
 
             UNION ALL
 
+            -- The partial unique index, by SHAPE.
+            --
+            -- Found by self-audit after Codex's P1, enumerating every
+            -- `IF NOT EXISTS` in the tranche and asking what identifies the
+            -- object. This one was checked for ownership and nothing else, and
+            -- it is not decorative: it is what makes "at most one authoritative
+            -- completion per tranche and digest" true, and its
+            -- `WHERE status = 'COMPLETED'` scoping is what keeps ABANDONED
+            -- history retained rather than overwritten. A non-unique occupant
+            -- lets two COMPLETED rows coexist, which is the evidence FINALIZE
+            -- reads; a total occupant blocks the ABANDONED history the rollback
+            -- deliberately keeps; different columns key it on the wrong thing.
+            SELECT pg_catalog.format(
+                       'index tenancy_backfill_checkpoints_completed_key is not the '
+                       'partial unique index this migration builds '
+                       '(indisunique=%s predicate=%L columns=%L)',
+                       i.indisunique,
+                       COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
+                       COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
+                                   FROM pg_catalog.unnest(i.indkey::int2[])
+                                        WITH ORDINALITY AS k(attnum, ord)
+                                   JOIN pg_catalog.pg_attribute a
+                                     ON a.attrelid = i.indrelid AND a.attnum = k.attnum),
+                                '<none>'))
+              FROM pg_catalog.pg_index i
+             WHERE i.indexrelid =
+                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints_completed_key')
+               AND (NOT i.indisunique
+                    OR pg_catalog.pg_get_expr(i.indpred, i.indrelid)
+                       IS DISTINCT FROM '(status = ''COMPLETED''::text)'
+                    OR (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
+                          FROM pg_catalog.unnest(i.indkey::int2[])
+                               WITH ORDINALITY AS k(attnum, ord)
+                          JOIN pg_catalog.pg_attribute a
+                            ON a.attrelid = i.indrelid AND a.attnum = k.attnum)
+                       IS DISTINCT FROM 'tranche,contract_digest')
+
+            UNION ALL
+
             SELECT pg_catalog.format('%s is owned by a role this migration cannot vouch for',
                                      expected.rel)
               FROM (VALUES
