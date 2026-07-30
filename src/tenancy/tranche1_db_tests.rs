@@ -3861,3 +3861,262 @@ async fn the_prepare_migration_refuses_a_total_index_where_a_partial_one_belongs
         "the refusal must name the index and say what shape it actually found: {message}"
     );
 }
+
+/// The seven checkpoint CHECKs, in the source form migration 0032 declares them.
+///
+/// Written as `IN (...)` and bare comparisons exactly as 0032 does, so
+/// PostgreSQL normalises them to the same `pg_get_expr` output the guard
+/// compares against. A decoy built from these matches the guard on expression
+/// and differs only in `convalidated`, which is the axis under test.
+const CHECKPOINT_CHECK_SOURCE: &[(&str, &str)] = &[
+    (
+        "tenancy_backfill_checkpoints_status_ck",
+        "status IN ('IN_PROGRESS', 'COMPLETED', 'ABANDONED')",
+    ),
+    (
+        "tenancy_backfill_checkpoints_tranche_ck",
+        "tranche IN ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'TRANCHE_2_SESSIONS', \
+         'TRANCHE_3_MEMORIES', 'TRANCHE_4_LINEAGE_AND_ARCHIVAL', 'TRANCHE_5_OPERATIONS', \
+         'FINAL_CONSTRAINT_TIGHTENING')",
+    ),
+    (
+        "tenancy_backfill_checkpoints_completed_shape_ck",
+        "(status = 'COMPLETED') = (completed_at IS NOT NULL)",
+    ),
+    (
+        "tenancy_backfill_checkpoints_completed_cursor_ck",
+        "status <> 'COMPLETED' OR resume_cursor IS NULL",
+    ),
+    (
+        "tenancy_backfill_checkpoints_counts_ck",
+        "rows_total >= 0 AND rows_backfilled >= 0 AND blocking_count >= 0 \
+         AND rows_backfilled <= rows_total",
+    ),
+    (
+        "tenancy_backfill_checkpoints_completed_clean_ck",
+        "status <> 'COMPLETED' OR blocking_count = 0",
+    ),
+    (
+        "tenancy_backfill_checkpoints_completed_accounting_ck",
+        "status <> 'COMPLETED' OR rows_backfilled = rows_total",
+    ),
+];
+
+/// Replace the retained checkpoint table with a foreign occupant.
+///
+/// The rollback deliberately keeps the real table, so any test modelling an
+/// occupant has to remove it first. The illegal row is inserted BEFORE the
+/// constraints, which is exactly what makes `NOT VALID` the only way to attach
+/// them afterwards.
+async fn replace_checkpoint_table_with_decoy(pool: &PgPool, not_valid: bool) {
+    for stmt in [
+        "DROP TABLE public.tenancy_backfill_checkpoints".to_owned(),
+        "CREATE TABLE public.tenancy_backfill_checkpoints ( \
+             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tranche TEXT, \
+             contract_digest TEXT, status TEXT, resume_cursor TEXT, \
+             rows_total BIGINT, rows_backfilled BIGINT, blocking_count BIGINT, \
+             started_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), \
+             completed_at TIMESTAMPTZ)"
+            .to_owned(),
+        // The seeded row differs by case, and that is the point. A row the real
+        // CHECKs forbid is what makes NOT VALID the only way to attach them; a
+        // legal row keeps the validated case a fair comparison rather than an
+        // empty table.
+        if not_valid {
+            "INSERT INTO public.tenancy_backfill_checkpoints \
+               (tranche, contract_digest, status, rows_total, rows_backfilled, \
+                blocking_count, completed_at) \
+             VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'forged', 'COMPLETED', \
+                     0, 999, 7, NOW())"
+                .to_owned()
+        } else {
+            "INSERT INTO public.tenancy_backfill_checkpoints \
+               (tranche, contract_digest, status, rows_total, rows_backfilled, \
+                blocking_count, completed_at) \
+             VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'honest', 'COMPLETED', \
+                     7, 7, 0, NOW())"
+                .to_owned()
+        },
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    let suffix = if not_valid { " NOT VALID" } else { "" };
+    for (name, predicate) in CHECKPOINT_CHECK_SOURCE {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE public.tenancy_backfill_checkpoints \
+               ADD CONSTRAINT {name} CHECK ({predicate}){suffix}"
+        )))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("attaching {name} must succeed: {e}"));
+    }
+}
+
+/// A NOT VALID CHECK matches by expression and asserts nothing about the rows.
+///
+/// Codex, on `1f5cdda`: `pg_get_expr` renders a `NOT VALID` constraint exactly as
+/// it renders a validated one, so the expression comparison added in `fc15246`
+/// was satisfied by constraints attached AFTER malformed rows were already in the
+/// table. `CREATE TABLE IF NOT EXISTS` then adopted it and the forged COMPLETED
+/// row survived -- a row violating completion accounting while still matching
+/// what FINALIZE_PRECONDITION looks for. `convalidated` is what makes this guard
+/// an assertion about the DATA rather than only about the schema.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_checkpoint_checks_that_were_never_validated(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, true).await;
+
+    // The decoy matches the expression comparison on all seven, so `convalidated`
+    // is the only axis that can refuse it.
+    let unvalidated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND contype = 'c' AND NOT convalidated",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unvalidated, 7,
+        "all seven must be attached and unvalidated for this to be a real test"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse CHECKs that were never validated against the rows",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("tenancy_backfill_checkpoints_counts_ck is missing or does not match"),
+        "the refusal must name the unvalidated constraints: {message}"
+    );
+
+    // The row that would have reached FINALIZE is still there, still illegal.
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.tenancy_backfill_checkpoints \
+          WHERE status = 'COMPLETED' AND (rows_backfilled > rows_total OR blocking_count <> 0)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(forged, 1, "the occupant is refused, not repaired");
+}
+
+/// The same decoy with VALIDATED constraints is still accepted.
+///
+/// Pins the axis. Without this, the test above would keep passing even if the
+/// guard had started refusing every pre-existing table for an unrelated reason.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_validated_equivalent_checkpoint_table_is_still_accepted(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&pool)
+        .await
+        .expect("a validated, correctly shaped table is this tranche's own and must be adopted");
+}
+
+/// An INVALID unique index enforces nothing and must not be adopted.
+///
+/// Codex, on `1f5cdda`. Deliberately the OPPOSITE of the rollback guards, which
+/// ignore `indisvalid` so an interrupted concurrent build stays droppable
+/// (decision 6). Adopting and dropping want different answers: a rollback should
+/// still remove a broken index, and a migration must never accept one as the
+/// object that guarantees uniqueness. 0041's adoption branch already refuses
+/// INVALID for the same reason.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_an_invalid_completion_index(pool: PgPool) {
+    sqlx::raw_sql(
+        "UPDATE pg_index SET indisvalid = false \
+          WHERE indexrelid = 'public.tenancy_backfill_checkpoints_completed_key'::regclass",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse an INVALID completion index",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("indisvalid=f"),
+        "the refusal must report the validity it actually found: {message}"
+    );
+}
+
+/// A writable schema ahead of `public` must not capture this migration's DDL.
+///
+/// Codex, on `1f5cdda`: the provenance guards inspect `public.<object>` while the
+/// DDL was unqualified, so a `search_path` with a writable schema first created
+/// the checkpoint table somewhere else entirely. sqlx would then record version
+/// 32 as applied with no checkpoint table in `public` at all -- and the audit and
+/// the FINALIZE protocol both look only in `public`. Every DDL target in 0032 is
+/// now schema-qualified, so a guard and the statement it guards can no longer
+/// disagree about which object they mean.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_shadow_schema_cannot_capture_the_prepare_migrations_ddl(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // One connection throughout: the search_path has to be set on the same
+    // session that applies the migration.
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE SCHEMA zz_shadow; \
+         SET search_path = zz_shadow, public",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("a hostile search_path must not stop the migration");
+
+    let (in_public, in_shadow): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT to_regclass('public.tenancy_backfill_checkpoints')::text, \
+                to_regclass('zz_shadow.tenancy_backfill_checkpoints')::text",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert!(
+        in_public.is_some(),
+        "the checkpoint table must land in public, where the audit and FINALIZE look"
+    );
+    assert_eq!(
+        in_shadow, None,
+        "and nothing of this tranche may land in the shadow schema"
+    );
+
+    let shadow_objects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'zz_shadow'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(shadow_objects, 0, "the shadow schema must be left empty");
+
+    // The same exposure applied to every unqualified ALTER, not just the table.
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+          WHERE table_schema = 'public' AND column_name IN ('agent_uuid', 'tenant_id') \
+            AND table_name IN ('archival_batches', 'audit_logs', 'entities', 'memory_graph', \
+                               'rmk_policies')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(owned, 10, "all ten ownership columns must land in public");
+}

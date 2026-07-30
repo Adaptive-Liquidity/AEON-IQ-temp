@@ -261,7 +261,14 @@ BEGIN
                             pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
                         AND k.contype  = 'c'
                         AND k.conname  = expected.con
-                        AND pg_catalog.pg_get_expr(k.conbin, k.conrelid) = expected.expr)
+                        AND pg_catalog.pg_get_expr(k.conbin, k.conrelid) = expected.expr
+                        -- Codex, on 1f5cdda: the expressions match even when the
+                        -- constraint was added NOT VALID after malformed rows were
+                        -- already in the table, so `convalidated` is what makes this
+                        -- an assertion about the DATA and not just about the schema.
+                        -- 0032 declares these inline in CREATE TABLE, where they are
+                        -- always validated, so requiring it costs a clean apply nothing.
+                        AND k.convalidated)
 
             UNION ALL
 
@@ -280,8 +287,8 @@ BEGIN
             SELECT pg_catalog.format(
                        'index tenancy_backfill_checkpoints_completed_key is not the '
                        'partial unique index this migration builds '
-                       '(indisunique=%s predicate=%L columns=%L)',
-                       i.indisunique,
+                       '(indisunique=%s indisvalid=%s predicate=%L columns=%L)',
+                       i.indisunique, i.indisvalid,
                        COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
                        COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
                                    FROM pg_catalog.unnest(i.indkey::int2[])
@@ -293,6 +300,14 @@ BEGIN
              WHERE i.indexrelid =
                    pg_catalog.to_regclass('public.tenancy_backfill_checkpoints_completed_key')
                AND (NOT i.indisunique
+                    -- An INVALID index enforces nothing, so it must never be
+                    -- adopted as the object that guarantees uniqueness. 0041's
+                    -- adoption branch already refuses INVALID for the same
+                    -- reason; note this is the opposite of the rollback guards,
+                    -- which deliberately ignore `indisvalid` so an interrupted
+                    -- concurrent build stays droppable. Adopting and dropping
+                    -- want different answers here.
+                    OR NOT i.indisvalid
                     OR pg_catalog.pg_get_expr(i.indpred, i.indrelid)
                        IS DISTINCT FROM '(status = ''COMPLETED''::text)'
                     OR (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
@@ -333,7 +348,7 @@ END $provenance_guard$;
 -- cannot serve this purpose: it has no tranche, no digest, no cursor and no
 -- status, so a FINALIZE guard reading it would assert against the wrong
 -- evidence and pass.
-CREATE TABLE IF NOT EXISTS tenancy_backfill_checkpoints (
+CREATE TABLE IF NOT EXISTS public.tenancy_backfill_checkpoints (
     id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     tranche         TEXT        NOT NULL,
     contract_digest TEXT        NOT NULL,
@@ -395,23 +410,23 @@ CREATE TABLE IF NOT EXISTS tenancy_backfill_checkpoints (
 -- overwritten.  Only WHERE status = 'COMPLETED' gives "at most one
 -- authoritative completion" while leaving the history alone.
 CREATE UNIQUE INDEX IF NOT EXISTS tenancy_backfill_checkpoints_completed_key
-    ON tenancy_backfill_checkpoints (tranche, contract_digest)
+    ON public.tenancy_backfill_checkpoints (tranche, contract_digest)
     WHERE status = 'COMPLETED';
 
 CREATE INDEX IF NOT EXISTS idx_tenancy_backfill_checkpoints_tranche
-    ON tenancy_backfill_checkpoints (tranche, started_at DESC);
+    ON public.tenancy_backfill_checkpoints (tranche, started_at DESC);
 
-COMMENT ON TABLE tenancy_backfill_checkpoints IS
+COMMENT ON TABLE public.tenancy_backfill_checkpoints IS
     'Per-tranche, per-contract backfill evidence (plan §4 step 4B). BACKFILL writes progress '
     'here and FINALIZE refuses to proceed without a COMPLETED row for its own tranche against '
     'the current contract digest with blocking_count = 0. ABANDONED rows are retained as '
     'history and are never treated as completion.';
 
-COMMENT ON COLUMN tenancy_backfill_checkpoints.contract_digest IS
+COMMENT ON COLUMN public.tenancy_backfill_checkpoints.contract_digest IS
     'report::inventory_digest() at the time the backfill ran. A backfill that ran against a '
     'superseded plan proves nothing about the current one, so FINALIZE compares this exactly.';
 
-COMMENT ON COLUMN tenancy_backfill_checkpoints.blocking_count IS
+COMMENT ON COLUMN public.tenancy_backfill_checkpoints.blocking_count IS
     'Blocking findings the authoritative audit reported for THIS tranche at completion time. '
     'Per-tranche rather than global: a later tranche is not evidence about this one.';
 
@@ -425,23 +440,23 @@ COMMENT ON COLUMN tenancy_backfill_checkpoints.blocking_count IS
 -- administrative action) which are legitimate rows with no owning agent, so
 -- tightening it would make the schema reject valid audit history.
 
-ALTER TABLE archival_batches
+ALTER TABLE public.archival_batches
     ADD COLUMN IF NOT EXISTS agent_uuid UUID,
     ADD COLUMN IF NOT EXISTS tenant_id  UUID;
 
-ALTER TABLE audit_logs
+ALTER TABLE public.audit_logs
     ADD COLUMN IF NOT EXISTS agent_uuid UUID,
     ADD COLUMN IF NOT EXISTS tenant_id  UUID;
 
-ALTER TABLE entities
+ALTER TABLE public.entities
     ADD COLUMN IF NOT EXISTS agent_uuid UUID,
     ADD COLUMN IF NOT EXISTS tenant_id  UUID;
 
-ALTER TABLE memory_graph
+ALTER TABLE public.memory_graph
     ADD COLUMN IF NOT EXISTS agent_uuid UUID,
     ADD COLUMN IF NOT EXISTS tenant_id  UUID;
 
-ALTER TABLE rmk_policies
+ALTER TABLE public.rmk_policies
     ADD COLUMN IF NOT EXISTS agent_uuid UUID,
     ADD COLUMN IF NOT EXISTS tenant_id  UUID;
 
@@ -518,7 +533,7 @@ END;
 $$;
 
 CREATE OR REPLACE TRIGGER trg_archival_batches_tenancy_bridge
-    BEFORE INSERT OR UPDATE ON archival_batches
+    BEFORE INSERT OR UPDATE ON public.archival_batches
     FOR EACH ROW EXECUTE FUNCTION public.fn_archival_batches_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_entities_tenancy_bridge()
@@ -579,7 +594,7 @@ END;
 $$;
 
 CREATE OR REPLACE TRIGGER trg_entities_tenancy_bridge
-    BEFORE INSERT OR UPDATE ON entities
+    BEFORE INSERT OR UPDATE ON public.entities
     FOR EACH ROW EXECUTE FUNCTION public.fn_entities_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_memory_graph_tenancy_bridge()
@@ -640,7 +655,7 @@ END;
 $$;
 
 CREATE OR REPLACE TRIGGER trg_memory_graph_tenancy_bridge
-    BEFORE INSERT OR UPDATE ON memory_graph
+    BEFORE INSERT OR UPDATE ON public.memory_graph
     FOR EACH ROW EXECUTE FUNCTION public.fn_memory_graph_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_rmk_policies_tenancy_bridge()
@@ -701,7 +716,7 @@ END;
 $$;
 
 CREATE OR REPLACE TRIGGER trg_rmk_policies_tenancy_bridge
-    BEFORE INSERT OR UPDATE ON rmk_policies
+    BEFORE INSERT OR UPDATE ON public.rmk_policies
     FOR EACH ROW EXECUTE FUNCTION public.fn_rmk_policies_tenancy_bridge();
 
 -- ── The conditional bridge: audit_logs ──────────────────────────────────────
@@ -799,7 +814,7 @@ END;
 $$;
 
 CREATE OR REPLACE TRIGGER trg_audit_logs_tenancy_bridge
-    BEFORE INSERT OR UPDATE ON audit_logs
+    BEFORE INSERT OR UPDATE ON public.audit_logs
     FOR EACH ROW EXECUTE FUNCTION public.fn_audit_logs_tenancy_bridge();
 
 -- ── Provenance stamps ───────────────────────────────────────────────────────
