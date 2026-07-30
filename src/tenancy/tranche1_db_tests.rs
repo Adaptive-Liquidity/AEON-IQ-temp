@@ -2362,13 +2362,18 @@ async fn an_unrelated_trigger_of_the_same_name_does_not_block_the_prepare_rollba
             .await
             .unwrap();
     }
-    let decoy_exists: bool = sqlx::query_scalar(
+    // The decoy is looked up through this query twice: once now, to prove the
+    // fixture built something, and once AFTER the rollback, to prove the
+    // rollback left it alone. Re-running it is the whole point -- an assertion
+    // on the value captured here could only ever restate the fixture, which is
+    // exactly the dead assertion this test used to end on.
+    const DECOY_PRESENT: &str =
         "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
-         WHERE t.tgname = 'trg_entities_tenancy_bridge' AND c.relname = 'zz_trigger_decoy')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+         WHERE t.tgname = 'trg_entities_tenancy_bridge' AND c.relname = 'zz_trigger_decoy')";
+    let decoy_exists: bool = sqlx::query_scalar(DECOY_PRESENT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(
         decoy_exists,
         "the decoy trigger must exist to be a real test"
@@ -2396,9 +2401,27 @@ async fn an_unrelated_trigger_of_the_same_name_does_not_block_the_prepare_rollba
         columns, 0,
         "the rollback must have dropped the ownership columns"
     );
+    // Re-queried against the catalog as it stands AFTER the rollback. This is
+    // the assertion the test exists for: the rollback did its own work above,
+    // and the unrelated trigger -- and the function it calls -- are still here.
+    let decoy_survives: bool = sqlx::query_scalar(DECOY_PRESENT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert!(
-        decoy_exists,
-        "and the decoy trigger is none of its business"
+        decoy_survives,
+        "the decoy trigger is none of the rollback's business and must survive it"
+    );
+    let decoy_fn_survives: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'public' AND p.proname = 'zz_decoy_fn')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        decoy_fn_survives,
+        "and the function the decoy calls must survive it too"
     );
 }
 
@@ -2628,8 +2651,27 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     // lock, which carries neither column. `pg_stat_activity` does carry
     // `datname`, and `pg_blocking_pids` confirms the backend is blocked rather
     // than merely idle.
+    // Bounded by WALL CLOCK, not by an iteration count.
+    //
+    // A fixed 200 x 25ms budget is only 5s of sleeping, and it measures the
+    // wrong thing: every iteration also pays for a round trip to a shared
+    // cluster and for whatever CPU the other tests are taking. Under
+    // `cargo test -- --test-threads=16` that made the gate expire before the
+    // deleter had even reached the lock -- reproduced at 1 failure in 6 runs,
+    // panicking on the `blocked` assertion below. CI runs `cargo test` at core
+    // count, so it could flake there too.
+    //
+    // Nothing about the interleaving under test changed: the gate still waits
+    // for a backend in this test's own database to be genuinely blocked, and
+    // still fails loudly rather than proceeding, if that never happens. Only
+    // the patience did. The cost of the wider bound is paid ONLY on the failure
+    // path -- a healthy run leaves this loop on the first or second poll.
+    const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+    let gate_started = std::time::Instant::now();
     let mut blocked = false;
-    for _ in 0..200 {
+    let mut polls = 0u32;
+    while gate_started.elapsed() < READINESS_BUDGET {
+        polls += 1;
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity a \
               WHERE a.datname = current_database() \
@@ -2645,6 +2687,7 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    let gate_waited = gate_started.elapsed();
 
     // Release the worker and join the task BEFORE asserting, so a failed gate
     // cannot leave the spawned task detached and still holding a pooled
@@ -2661,7 +2704,8 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     assert!(
         blocked,
         "the deleter must have been waiting on the worker's lock, or this test \
-         proves nothing about the interleaving"
+         proves nothing about the interleaving (gave up after {polls} polls over \
+         {gate_waited:?})"
     );
     let deleted = outcome.expect("deletion must survive a policy inserted during cleanup");
     assert!(deleted, "the agent existed, so it must report a deletion");
