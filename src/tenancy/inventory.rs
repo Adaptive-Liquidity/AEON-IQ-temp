@@ -490,53 +490,12 @@ pub enum SchemaObjectContract {
         require_unique: bool,
         require_valid: bool,
         require_ready: bool,
-        /// What the index must cover, and — when partial — exactly which rows.
-        predicate: IndexPredicate,
+        /// A partial index guarantees uniqueness only over its predicate, so it
+        /// cannot back a join that assumes at most one match.
+        require_non_partial: bool,
         /// An expression index does not constrain the bare columns.
         require_no_expressions: bool,
     },
-}
-
-/// What rows a declared unique index must cover.
-///
-/// This replaces a `require_non_partial: bool`, which could only ever *permit*
-/// a partial index and never require one, and could say nothing at all about
-/// which rows the predicate selects. Both gaps were reachable: a partial index
-/// silently replaced by a total one stops an operator retrying a tranche after
-/// an abandoned attempt, and a partial index whose predicate is quietly changed
-/// can admit two rows the schema is supposed to allow only one of. Under the
-/// old boolean the audit reported the contract satisfied in both cases.
-///
-/// Modelled as a closed enum rather than a `require_non_partial: bool` plus a
-/// separate predicate field, which would have admitted two meaningless states:
-/// "must be total, and also check this predicate", and "must be partial, but on
-/// anything". A bare `Option<&str>` would have the same two inhabitants as this
-/// enum and would be equally sound; the enum is chosen for legibility at the
-/// match sites, where `Total` and `Exactly { .. }` say what they mean and `None`
-/// would have to be remembered as "total" rather than "unspecified".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-// Tagged `predicate`, matching the field it lives in. That renders
-// `"predicate": {"predicate": "TOTAL"}` in the artifact, which reads like a
-// stutter — but it is the shape every internally-tagged enum in this module
-// already produces (`"kind": {"kind": "TENANT_COLUMN", ...}`), and singling
-// this one out would make the artifact inconsistent rather than tidy.
-#[serde(tag = "predicate", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum IndexPredicate {
-    /// The index must cover every row. A partial index here guarantees
-    /// uniqueness only over its own predicate, so it cannot back a join that
-    /// assumes at most one match.
-    Total,
-    /// The index must be partial, and PostgreSQL's normalised rendering of its
-    /// predicate must equal this string exactly.
-    ///
-    /// Compare against `pg_get_expr(indpred, indrelid)`, not against the text an
-    /// author typed. Measured on pg16: `WHERE status = 'COMPLETED'`,
-    /// `WHERE (status = 'COMPLETED')` and `WHERE status::text =
-    /// 'COMPLETED'::text` all normalise to the identical
-    /// `(status = 'COMPLETED'::text)`, while `WHERE status <> 'COMPLETED'`
-    /// renders differently. Exact comparison of the normalised form is
-    /// therefore precise without being brittle about spelling.
-    Exactly { normalized: &'static str },
 }
 
 impl SchemaObjectContract {
@@ -582,10 +541,10 @@ impl SchemaObjectContract {
                 require_unique,
                 require_valid,
                 require_ready,
-                predicate,
+                require_non_partial,
                 require_no_expressions,
             } => {
-                let mut flags: Vec<&str> = Vec::new();
+                let mut flags = Vec::new();
                 if *require_unique {
                     flags.push("unique");
                 }
@@ -595,18 +554,8 @@ impl SchemaObjectContract {
                 if *require_ready {
                     flags.push("ready");
                 }
-                // Stated either way, and for a partial index the predicate is
-                // stated too. Rendering nothing for the partial case made the
-                // published artifact misleading by omission: a deliberately
-                // partial index read as though it were total, and the predicate
-                // that is the whole guarantee never appeared at all.
-                let partial_flag;
-                match predicate {
-                    IndexPredicate::Total => flags.push("non-partial"),
-                    IndexPredicate::Exactly { normalized } => {
-                        partial_flag = format!("partial on {normalized}");
-                        flags.push(&partial_flag);
-                    }
+                if *require_non_partial {
+                    flags.push("non-partial");
                 }
                 if *require_no_expressions {
                     flags.push("no expressions");
@@ -622,11 +571,6 @@ impl SchemaObjectContract {
 }
 
 /// A standalone unique index, with the strict defaults.
-///
-/// Declares [`IndexPredicate::Total`]. For an index that is *deliberately*
-/// partial, reach for [`partial_unique_index`] instead — this one will report
-/// drift against it forever, because a partial index cannot satisfy a
-/// total declaration.
 const fn unique_index(
     name: &'static str,
     columns: &'static [&'static str],
@@ -637,40 +581,7 @@ const fn unique_index(
         require_unique: true,
         require_valid: true,
         require_ready: true,
-        predicate: IndexPredicate::Total,
-        require_no_expressions: true,
-    }
-}
-
-/// A unique index whose partial predicate is the guarantee, not a weakening.
-///
-/// Separate from [`unique_index`] rather than a parameter on it, because the two
-/// say opposite things. `unique_index` declares `IndexPredicate::Total` so that a
-/// uniqueness the scanner depends on cannot quietly be scoped down to a subset
-/// of rows. A *deliberately* partial index inverts that: scoping it is the
-/// point, and requiring it to be total would reject the only correct shape.
-///
-/// The only user today is the backfill checkpoint table's completion key, where
-/// `WHERE status = 'COMPLETED'` is what allows retained ABANDONED attempts to
-/// coexist with at most one authoritative completion. Requiring non-partial
-/// there would demand an index that makes a retry impossible.
-///
-/// Everything else stays strict: still unique, still valid, still ready, still
-/// free of expressions.
-const fn partial_unique_index(
-    name: &'static str,
-    columns: &'static [&'static str],
-    normalized_predicate: &'static str,
-) -> SchemaObjectContract {
-    SchemaObjectContract::UniqueIndex {
-        name,
-        columns,
-        require_unique: true,
-        require_valid: true,
-        require_ready: true,
-        predicate: IndexPredicate::Exactly {
-            normalized: normalized_predicate,
-        },
+        require_non_partial: true,
         require_no_expressions: true,
     }
 }
@@ -1752,64 +1663,6 @@ pub const REGISTRY: &[TableEntry] = &[
         rationale: "Owned by its agent through a real FK to `agents(agent_id)`. Everything \
                     session-scoped resolves through `(agent_id, session_id)`, which is the only \
                     unique key on this table besides its surrogate primary key.",
-    },
-    TableEntry {
-        table: "tenancy_backfill_checkpoints",
-        schema_contract: &[
-            primary_key("tenancy_backfill_checkpoints_pkey", &["id"]),
-            // The partial scope is the whole point, and it is why this is
-            // declared here rather than left to drift: a plain UNIQUE would
-            // reject the retry an operator makes after abandoning an attempt
-            // against the same digest, and a missing one would let two rows
-            // both claim to be the authoritative completion a FINALIZE guard
-            // reads.
-            partial_unique_index(
-                "tenancy_backfill_checkpoints_completed_key",
-                &["tranche", "contract_digest"],
-                // PostgreSQL's normalised rendering, not the migration's
-                // spelling. Verified on pg16 against the live catalog.
-                "(status = 'COMPLETED'::text)",
-            ),
-        ],
-        row_identity: SURROGATE_ID,
-        session_semantics: None,
-        class: TableClass::SystemGlobal,
-        canonical_path: None,
-        secondary_paths: &[],
-        consistency: None,
-        tranche: Tranche::RootsAndDirectAgentChildren,
-        plan: MigrationPlan {
-            initial_nullability: "n/a — no ownership columns are added",
-            backfill_source: "n/a — SYSTEM_GLOBAL tables are never backfilled with an \
-                              inferred tenant",
-            required_zero_codes: &[ReasonCode::GlobalScopeUnverified],
-            validate_step: None,
-            future_uniqueness: None,
-            future_unique_columns: None,
-            lock_profile: "none — created by tranche 1's PREPARE and not modified afterwards",
-            // NONE_REQUIRED, not the 0032 rollback script. This field means
-            // "what must be rolled back before this table can be", and nothing
-            // must: `rollback/0032_tenancy_tranche1_prepare_down.sql`
-            // deliberately RETAINS this table rather than dropping it, so
-            // naming it here would name the one script that does not roll this
-            // table back. Removing the table at all is a separate, manual
-            // DROP an operator performs knowingly — see that script's header.
-            rollback_dependencies: NONE_REQUIRED,
-            inactive_paths: NONE_REQUIRED,
-        },
-        global_scope_evidence: Some(
-            "Evidence about migration *runs*, not about tenant data. Each row records that a \
-             named tranche was backfilled against a named contract digest, and is written only \
-             by the operator's backfill command and read only by the FINALIZE guard. It is on \
-             no request path and carries no tenant-shaped column at all: `tranche` and \
-             `contract_digest` describe the migration, not an owner. Giving these rows a tenant \
-             would misrepresent an operator action as tenant data, and would additionally make \
-             the FINALIZE guard tenant-scoped, which would let one tenant's backfill authorise \
-             a schema change for every tenant.",
-        ),
-        rationale: "Protocol bookkeeping for the three-stage tenancy migration. Registered here \
-                    in the same change that creates it, so it cannot exist as an unregistered \
-                    side-table the verifier reports as drift.",
     },
     TableEntry {
         table: "working_memory",
