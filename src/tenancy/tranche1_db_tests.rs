@@ -3639,3 +3639,87 @@ async fn the_rerun_guard_names_the_axis_a_desc_backed_constraint_fails_on(pool: 
         "the refusal must not report axes the index satisfies: {message}"
     );
 }
+
+/// A pre-existing checkpoint table must stop the migration, not be adopted.
+///
+/// `CREATE TABLE IF NOT EXISTS` adopts as silently as `ADD COLUMN IF NOT
+/// EXISTS`, and this is the worst object in the tranche to adopt: skipping the
+/// CREATE also skips every CHECK inside it. A table of the right name and the
+/// wrong shape then accepts a COMPLETED row that no backfill earned -- rows
+/// backfilled exceeding rows total, a nonzero blocking count -- and that row is
+/// exactly what FINALIZE_PRECONDITION trusts before validating constraints over
+/// data nobody backfilled.
+///
+/// Checked by shape rather than by the provenance marker the columns, functions
+/// and triggers use, because rollback/0032 never drops this table: adopting it
+/// destroys nothing, and what adoption actually costs is the constraints.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_pre_existing_checkpoint_table(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    // The rollback deliberately retains the table, so it is still here; drop it
+    // to model an occupant this tranche never built.
+    for stmt in [
+        "DROP TABLE tenancy_backfill_checkpoints",
+        "CREATE TABLE tenancy_backfill_checkpoints ( \
+             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tranche TEXT, \
+             contract_digest TEXT, status TEXT, resume_cursor TEXT, \
+             rows_total BIGINT, rows_backfilled BIGINT, blocking_count BIGINT, \
+             started_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), \
+             completed_at TIMESTAMPTZ)",
+        // A completion nobody earned. Every one of these values is refused by
+        // the real table's CHECKs, which is the point.
+        "INSERT INTO tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, \
+            blocking_count, completed_at) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'forged', 'COMPLETED', \
+                 0, 999, 7, NOW())",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must not adopt a checkpoint table it did not create",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    for missing in [
+        "tenancy_backfill_checkpoints_status_ck",
+        "tenancy_backfill_checkpoints_tranche_ck",
+        "tenancy_backfill_checkpoints_counts_ck",
+        "tenancy_backfill_checkpoints_completed_accounting_ck",
+    ] {
+        assert!(
+            message.contains(missing),
+            "the refusal must name each CHECK the occupant lacks; {missing} is missing \
+             from: {message}"
+        );
+    }
+
+    // The occupant is untouched -- this migration refuses, it does not repair.
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM tenancy_backfill_checkpoints WHERE contract_digest = 'forged'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        forged, 1,
+        "the occupant's rows are left exactly as they were"
+    );
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'public.tenancy_backfill_checkpoints'::regclass AND contype = 'c'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        checks, 0,
+        "and it still has none of the tranche's CHECKs, so nothing was half-applied"
+    );
+}

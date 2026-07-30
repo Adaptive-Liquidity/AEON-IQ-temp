@@ -69,6 +69,18 @@
 -- The three guards run before anything is created, so a refusal leaves the
 -- schema untouched rather than half-built.
 --
+-- WHAT THE MARKER IS AND IS NOT.  It is a provenance handle: it stops this
+-- migration adopting an object it did not create, and so stops rollback/0032
+-- destroying data belonging to whatever did.  It is NOT authentication.  A role
+-- that can create objects in `public` can also write the marker onto them, so
+-- each guard additionally requires `pg_has_role(current_user, <owner>,
+-- 'USAGE')` -- an object owned by a role this migration cannot vouch for is
+-- refused whatever its comment says.  Note honestly that this ownership test is
+-- VACUOUS when migrations run as a superuser, because a superuser is a member
+-- of every role; where that is the deployment, the load-bearing control is
+-- PostgreSQL 15+'s default of not granting CREATE on `public` to PUBLIC, not
+-- anything in this file.
+--
 -- The marker text appears three times in the tranche: the guard below, the
 -- stamping block at the foot of this file, and the guard in
 -- rollback/0032_tenancy_tranche1_prepare_down.sql.  All three must stay
@@ -103,7 +115,9 @@ BEGIN
        AND a.attname  = expected.col
        AND a.attnum   > 0
        AND NOT a.attisdropped
-     WHERE pg_catalog.col_description(a.attrelid, a.attnum::int) IS DISTINCT FROM marker;
+      JOIN pg_catalog.pg_class ct ON ct.oid = a.attrelid
+     WHERE pg_catalog.col_description(a.attrelid, a.attnum::int) IS DISTINCT FROM marker
+        OR NOT pg_catalog.pg_has_role(current_user, ct.relowner, 'USAGE');
 
     IF occupied IS NOT NULL THEN
         RAISE EXCEPTION
@@ -136,7 +150,8 @@ BEGIN
        AND p.pronamespace = 'public'::regnamespace
        AND p.pronargs     = 0
        AND p.prorettype   = 'pg_catalog.trigger'::regtype
-     WHERE pg_catalog.obj_description(p.oid, 'pg_proc') IS DISTINCT FROM marker;
+     WHERE pg_catalog.obj_description(p.oid, 'pg_proc') IS DISTINCT FROM marker
+        OR NOT pg_catalog.pg_has_role(current_user, p.proowner, 'USAGE');
 
     IF occupied IS NOT NULL THEN
         RAISE EXCEPTION
@@ -165,7 +180,9 @@ BEGIN
         ON t.tgname  = expected.trg
        AND t.tgrelid = pg_catalog.to_regclass(pg_catalog.format('public.%I', expected.tbl))
        AND NOT t.tgisinternal
-     WHERE pg_catalog.obj_description(t.oid, 'pg_trigger') IS DISTINCT FROM marker;
+      JOIN pg_catalog.pg_class tt ON tt.oid = t.tgrelid
+     WHERE pg_catalog.obj_description(t.oid, 'pg_trigger') IS DISTINCT FROM marker
+        OR NOT pg_catalog.pg_has_role(current_user, tt.relowner, 'USAGE');
 
     IF occupied IS NOT NULL THEN
         RAISE EXCEPTION
@@ -174,6 +191,75 @@ BEGIN
             'then drop them, leaving nothing to restore. Nothing has been changed.',
             occupied
             USING ERRCODE = 'duplicate_object';
+    END IF;
+
+    -- The checkpoint protocol table.
+    --
+    -- `CREATE TABLE IF NOT EXISTS` adopts exactly as silently as `ADD COLUMN IF
+    -- NOT EXISTS` does, and this is the worst object in the tranche to adopt:
+    -- skipping the CREATE also skips every CHECK inside it, so a pre-existing
+    -- table of this name enforces neither the `status` vocabulary, nor the
+    -- `tranche` vocabulary, nor `rows_backfilled <= rows_total`, nor
+    -- `COMPLETED => blocking_count = 0`, nor `COMPLETED => rows_backfilled =
+    -- rows_total`. A forged or merely malformed COMPLETED row then satisfies
+    -- FINALIZE_PRECONDITION -- the one piece of evidence FINALIZE trusts before
+    -- it validates constraints over data nobody backfilled.
+    --
+    -- Checked by SHAPE rather than by the provenance marker used above, and the
+    -- difference is deliberate. The marker exists because dropping a column
+    -- destroys data, so this migration must know whose column it is; this table
+    -- is never dropped by rollback/0032 at all, so adopting it destroys
+    -- nothing. What adoption costs here is the constraints, and those are
+    -- exactly what shape can see. The table also already carries a documented
+    -- `COMMENT ON TABLE`, which a marker would have to overwrite.
+    --
+    -- Ownership is checked alongside, for the same reason it is checked above:
+    -- an object this migration cannot vouch for is not this migration's.
+    SELECT pg_catalog.string_agg(missing.what, ', ' ORDER BY missing.what)
+      INTO occupied
+      FROM (
+            SELECT pg_catalog.format('missing CHECK %s', expected.con) AS what
+              FROM (VALUES
+                      ('tenancy_backfill_checkpoints_status_ck'),
+                      ('tenancy_backfill_checkpoints_tranche_ck'),
+                      ('tenancy_backfill_checkpoints_completed_shape_ck'),
+                      ('tenancy_backfill_checkpoints_completed_cursor_ck'),
+                      ('tenancy_backfill_checkpoints_counts_ck'),
+                      ('tenancy_backfill_checkpoints_completed_clean_ck'),
+                      ('tenancy_backfill_checkpoints_completed_accounting_ck')
+                   ) AS expected(con)
+             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM pg_catalog.pg_constraint k
+                      WHERE k.conrelid =
+                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                        AND k.contype  = 'c'
+                        AND k.conname  = expected.con)
+
+            UNION ALL
+
+            SELECT pg_catalog.format('%s is owned by a role this migration cannot vouch for',
+                                     expected.rel)
+              FROM (VALUES
+                      ('tenancy_backfill_checkpoints'),
+                      ('tenancy_backfill_checkpoints_completed_key'),
+                      ('idx_tenancy_backfill_checkpoints_tranche')
+                   ) AS expected(rel)
+              JOIN pg_catalog.pg_class c
+                ON c.oid = pg_catalog.to_regclass(pg_catalog.format('public.%I', expected.rel))
+             WHERE NOT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE')
+           ) AS missing;
+
+    IF occupied IS NOT NULL THEN
+        RAISE EXCEPTION
+            'tenancy_backfill_checkpoints already exists but is not the table this migration '
+            'creates: %. CREATE TABLE IF NOT EXISTS would adopt it, and adopting it skips '
+            'every CHECK this migration puts on it -- after which a COMPLETED row that no '
+            'backfill ever earned satisfies the FINALIZE precondition. Nothing has been '
+            'changed. Drop or rename the occupant, then re-run.',
+            occupied
+            USING ERRCODE = 'duplicate_table';
     END IF;
 END $provenance_guard$;
 
