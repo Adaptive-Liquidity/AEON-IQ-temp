@@ -51,12 +51,31 @@ SET LOCAL search_path = pg_catalog, public;
 -- was left half-unwound, with a ledger claiming the indexes had never been
 -- built.
 --
--- Both kinds are now found through something a rename does not disturb:
+-- Neither kind is looked up by its own name any more, and that was still a hole
+-- at the previous head: renaming a foreign key hid it from the `conname` filter
+-- even though `conindid` still identified it, and renaming a unique constraint
+-- renames its backing index too, so the index-OID lookup found nothing either.
+-- Either way this guard reported "0041 is not applied", the drops below ran, and
+-- versions 33-40 were retired while 0041 was still attached.
+--
+-- Found instead by what cannot be renamed away:
 --   * the five foreign keys through `conindid`, the OID of
---     `agents_tenant_id_id_key` on the parent -- the one key all five depend on,
---     whatever their own tables are called now;
---   * the three unique constraints through the OID of the index they adopted,
---     which keeps its name across a table rename.
+--     `agents_tenant_id_id_key` on the parent -- the one key all five depend on;
+--   * the three unique constraints by their column shape.
+--
+-- BOTH ARMS STAY SCOPED TO THE TRANCHE'S TABLES BY OID, and dropping that scope
+-- would be a real regression rather than a simplification. Measured on pg16,
+-- migration 0030's `credential_agent_grants_agent_fkey` has the identical shape
+-- -- `(tenant_id, agent_uuid)` referencing `agents (tenant_id, id)` through the
+-- same `conindid` -- and migration 0029's `credentials_id_tenant_id_key` is
+-- likewise `UNIQUE (id, tenant_id)`. A shape-only test would report both as
+-- tranche 1 objects and refuse this rollback forever.
+--
+-- A renamed or schema-moved TABLE escapes both arms, because their scope is
+-- exactly the thing that moved. That is covered, before any drop, by the
+-- missing-table guard further down; the refusal simply comes from there instead,
+-- and says the table is not in `public`.
+--
 -- Each is reported with `conrelid::regclass`, so the message names where the
 -- constraint actually is rather than where this script expected it.
 --
@@ -77,29 +96,34 @@ BEGIN
        AND c.contype = 'u';
 
     SELECT string_agg(found.label, ', ' ORDER BY found.label) INTO remaining FROM (
-        -- The five ownership keys, reached from the parent's unique key.
+        -- The five ownership keys: any foreign key backed by the parent's unique
+        -- key that sits on a tranche table, whatever it is called now.
         SELECT format('%s on %s', c.conname, c.conrelid::regclass) AS label
           FROM pg_catalog.pg_constraint c
          WHERE c.contype = 'f'
            AND agents_idx IS NOT NULL
            AND c.conindid = agents_idx
-           AND c.conname IN ('archival_batches_tenant_agent_fkey',
-                             'audit_logs_tenant_agent_fkey',
-                             'entities_tenant_agent_fkey',
-                             'memory_graph_tenant_agent_fkey',
-                             'rmk_policies_tenant_agent_fkey')
+           AND c.conrelid IN (to_regclass('public.archival_batches'),
+                              to_regclass('public.audit_logs'),
+                              to_regclass('public.entities'),
+                              to_regclass('public.memory_graph'),
+                              to_regclass('public.rmk_policies'))
         UNION ALL
-        -- The three adopted unique constraints, reached from their own index.
+        -- The three adopted unique constraints, by shape on a tranche table
+        -- rather than by their own name, because renaming a unique constraint
+        -- renames its backing index too and leaves nothing to look it up by.
         SELECT format('%s on %s', c.conname, c.conrelid::regclass) AS label
-          FROM (VALUES
-                  ('archival_batches_id_tenant_id_key'),
-                  ('entities_id_tenant_id_key'),
-                  ('rmk_policies_id_tenant_id_key')
-               ) AS expected(name)
-          JOIN pg_catalog.pg_constraint c
-            ON c.conname = expected.name
-           AND c.contype = 'u'
-           AND c.conindid = to_regclass(format('public.%I', expected.name))
+          FROM pg_catalog.pg_constraint c
+         WHERE c.contype = 'u'
+           AND NOT c.condeferrable AND NOT c.condeferred AND c.conparentid = 0
+           AND c.conrelid IN (to_regclass('public.archival_batches'),
+                              to_regclass('public.entities'),
+                              to_regclass('public.rmk_policies'))
+           AND (SELECT array_agg(a.attname::TEXT ORDER BY k.ord)
+                  FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = k.attnum)
+               = ARRAY['id', 'tenant_id']
     ) AS found;
 
     IF remaining IS NOT NULL THEN
@@ -133,8 +157,16 @@ END $$;
 --
 -- Expected shape, as migrations 0033-0040 build it: the five lookup indexes are
 -- non-unique btree over (tenant_id, agent_uuid); the three unique indexes are
--- unique btree over (id, tenant_id); none is partial and none is an expression
--- index.
+-- unique btree over (id, tenant_id); none is partial, none is an expression
+-- index, all use plain ASC/NULLS LAST ordering, the default operator class and
+-- no collation.
+--
+-- `indisvalid` is deliberately NOT part of this test. An interrupted
+-- CREATE INDEX CONCURRENTLY leaves the index behind INVALID, and dropping it is
+-- exactly what this script exists to do -- requiring validity here would make
+-- the one state that needs recovery the one state that cannot be recovered.
+-- Validity is checked where it actually matters, in migration 0041, which must
+-- never ADOPT an invalid index as a constraint.
 DO $$
 DECLARE
     spec     RECORD;
@@ -166,9 +198,18 @@ BEGIN
     LOOP
         SELECT i.indrelid, i.indisunique, i.indnkeyatts, i.indnatts, i.indkey,
                i.indpred IS NOT NULL AS is_partial,
-               i.indexprs IS NOT NULL AS is_expression
+               i.indexprs IS NOT NULL AS is_expression,
+               i.indnullsnotdistinct AS nulls_not_distinct,
+               am.amname AS access_method,
+               i.indoption::int2[] AS options,
+               i.indcollation::oid[] AS collations,
+               (SELECT bool_and(oc.opcdefault AND oc.opcmethod = ic.relam)
+                  FROM unnest(i.indclass::oid[]) AS k(cls)
+                  JOIN pg_catalog.pg_opclass oc ON oc.oid = k.cls) AS default_opclasses
           INTO idx
           FROM pg_catalog.pg_index i
+          JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+          JOIN pg_catalog.pg_am    am ON am.oid = ic.relam
          WHERE i.indexrelid = to_regclass(format('public.%I', spec.idx_name));
 
         CONTINUE WHEN NOT FOUND;   -- already dropped, or moved with its table
@@ -188,6 +229,35 @@ BEGIN
         END IF;
         IF idx.is_expression THEN
             problems := problems || 'it indexes an expression, not plain columns'::TEXT;
+        END IF;
+        IF idx.nulls_not_distinct THEN
+            problems := problems
+                || 'it is NULLS NOT DISTINCT; the tranche builds plain unique indexes, '
+                   'which treat NULLs as distinct'::TEXT;
+        END IF;
+        IF idx.access_method IS DISTINCT FROM 'btree' THEN
+            problems := problems
+                || format('its access method is %L, expected %L', idx.access_method, 'btree');
+        END IF;
+        -- indoption is a per-column bitmask: bit 0 is DESC, bit 1 is NULLS FIRST.
+        -- Zero is the plain ASC/NULLS LAST ordering these migrations build. Checked
+        -- because `indkey` is blind to it: `(tenant_id DESC, agent_uuid)` has the
+        -- same indkey, arity, uniqueness, predicate and expression state as the
+        -- canonical index, and was accepted as tranche-owned.
+        IF EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0) THEN
+            problems := problems
+                || format('its column ordering is %L, expected all-zero '
+                          '(ASC NULLS LAST); bit 0 is DESC, bit 1 is NULLS FIRST',
+                          idx.options);
+        END IF;
+        IF EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0) THEN
+            problems := problems
+                || format('it carries collations %L; the uuid columns these '
+                          'migrations index have none', idx.collations);
+        END IF;
+        IF idx.default_opclasses IS NOT TRUE THEN
+            problems := problems
+                || 'it uses a non-default operator class'::TEXT;
         END IF;
         IF idx.indnatts <> 2 OR idx.indnkeyatts <> 2 THEN
             problems := problems

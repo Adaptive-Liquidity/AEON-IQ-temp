@@ -263,9 +263,18 @@ BEGIN
                 -- so it could not catch this.
                 SELECT i.indrelid, i.indisunique, i.indnkeyatts, i.indnatts, i.indkey,
                        i.indpred IS NOT NULL AS is_partial,
-                       i.indexprs IS NOT NULL AS is_expression
+                       i.indexprs IS NOT NULL AS is_expression,
+                       i.indnullsnotdistinct AS nulls_not_distinct,
+                       am.amname AS access_method,
+                       i.indoption::int2[] AS options,
+                       i.indcollation::oid[] AS collations,
+                       (SELECT bool_and(oc.opcdefault AND oc.opcmethod = ic.relam)
+                          FROM unnest(i.indclass::oid[]) AS k(cls)
+                          JOIN pg_catalog.pg_opclass oc ON oc.oid = k.cls) AS default_opclasses
                   INTO idx
                   FROM pg_catalog.pg_index i
+                  JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+                  JOIN pg_catalog.pg_am    am ON am.oid = ic.relam
                  WHERE i.indexrelid = to_regclass(format('public.%I', spec.con_name));
 
                 problems := ARRAY[]::TEXT[];
@@ -282,6 +291,35 @@ BEGIN
                 END IF;
                 IF idx.is_expression THEN
                     problems := problems || 'it indexes an expression'::TEXT;
+                END IF;
+                IF idx.nulls_not_distinct THEN
+                    problems := problems
+                        || 'it is NULLS NOT DISTINCT; the tranche builds plain unique indexes, '
+                           'which treat NULLs as distinct'::TEXT;
+                END IF;
+                IF idx.access_method IS DISTINCT FROM 'btree' THEN
+                    problems := problems
+                        || format('its access method is %L, expected %L', idx.access_method, 'btree');
+                END IF;
+                -- indoption is a per-column bitmask: bit 0 is DESC, bit 1 is NULLS FIRST.
+                -- Zero is the plain ASC/NULLS LAST ordering these migrations build. Checked
+                -- because `indkey` is blind to it: `(tenant_id DESC, agent_uuid)` has the
+                -- same indkey, arity, uniqueness, predicate and expression state as the
+                -- canonical index, and was accepted as tranche-owned.
+                IF EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0) THEN
+                    problems := problems
+                        || format('its column ordering is %L, expected all-zero '
+                                  '(ASC NULLS LAST); bit 0 is DESC, bit 1 is NULLS FIRST',
+                                  idx.options);
+                END IF;
+                IF EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0) THEN
+                    problems := problems
+                        || format('it carries collations %L; the uuid columns these '
+                                  'migrations index have none', idx.collations);
+                END IF;
+                IF idx.default_opclasses IS NOT TRUE THEN
+                    problems := problems
+                        || 'it uses a non-default operator class'::TEXT;
                 END IF;
                 IF idx.indnatts <> 2 OR idx.indnkeyatts <> 2 THEN
                     problems := problems
@@ -390,18 +428,39 @@ BEGIN
             -- A UNIQUE constraint is only as good as the index it owns, and an
             -- INVALID or partial one enforces nothing.
             SELECT i.indisunique, i.indisvalid, i.indpred IS NULL AS is_total,
-                   i.indnkeyatts, i.indrelid
+                   i.indnkeyatts, i.indrelid, i.indnullsnotdistinct AS nulls_not_distinct,
+                   am.amname AS access_method,
+                   i.indoption::int2[] AS options,
+                   i.indcollation::oid[] AS collations,
+                   (SELECT bool_and(oc.opcdefault AND oc.opcmethod = ic.relam)
+                      FROM unnest(i.indclass::oid[]) AS k(cls)
+                      JOIN pg_catalog.pg_opclass oc ON oc.oid = k.cls) AS default_opclasses
               INTO idx
               FROM pg_catalog.pg_index i
+              JOIN pg_catalog.pg_class ic ON ic.oid = i.indexrelid
+              JOIN pg_catalog.pg_am    am ON am.oid = ic.relam
              WHERE i.indexrelid = con.conindid;
 
+            -- Held to the same axes as the adoption branch above. They diverged
+            -- once -- adoption checked ordering, access method, collation and
+            -- operator class while this branch did not -- and a constraint
+            -- repointed at a DESC-ordered index was accepted here as the
+            -- tranche's own. Reaching that state needs catalog surgery, because
+            -- PostgreSQL refuses to ADD CONSTRAINT over a non-default-sorted
+            -- index, so this is consistency rather than a reachable hole; the
+            -- two checks living apart is the actual defect.
             IF NOT FOUND THEN
                 problems := problems || 'constraint owns no index'::TEXT;
             ELSIF NOT idx.indisunique
                OR NOT idx.indisvalid
                OR NOT idx.is_total
                OR idx.indnkeyatts <> 2
-               OR idx.indrelid <> tbl_oid THEN
+               OR idx.indrelid <> tbl_oid
+               OR idx.access_method IS DISTINCT FROM 'btree'
+               OR idx.nulls_not_distinct
+               OR EXISTS (SELECT 1 FROM unnest(idx.options) AS o(v) WHERE o.v <> 0)
+               OR EXISTS (SELECT 1 FROM unnest(idx.collations) AS c(v) WHERE c.v <> 0)
+               OR idx.default_opclasses IS NOT TRUE THEN
                 problems := problems
                     || format('backing index is not a valid, total, two-column unique index on '
                               'this table (indisunique=%s indisvalid=%s total=%s indnkeyatts=%s '
