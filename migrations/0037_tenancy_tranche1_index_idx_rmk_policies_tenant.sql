@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_rmk_policies_tenant
-    ON rmk_policies (tenant_id, agent_uuid);
+    ON public.rmk_policies (tenant_id, agent_uuid);

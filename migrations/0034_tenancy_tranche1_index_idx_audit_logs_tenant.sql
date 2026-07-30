@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_audit_logs_tenant
-    ON audit_logs (tenant_id, agent_uuid);
+    ON public.audit_logs (tenant_id, agent_uuid);

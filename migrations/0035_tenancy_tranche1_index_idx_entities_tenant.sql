@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_entities_tenant
-    ON entities (tenant_id, agent_uuid);
+    ON public.entities (tenant_id, agent_uuid);

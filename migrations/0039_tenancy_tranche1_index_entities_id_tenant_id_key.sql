@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS entities_id_tenant_id_key
-    ON entities (id, tenant_id);
+    ON public.entities (id, tenant_id);

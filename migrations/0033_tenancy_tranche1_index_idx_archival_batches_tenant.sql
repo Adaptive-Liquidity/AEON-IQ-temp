@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_archival_batches_tenant
-    ON archival_batches (tenant_id, agent_uuid);
+    ON public.archival_batches (tenant_id, agent_uuid);

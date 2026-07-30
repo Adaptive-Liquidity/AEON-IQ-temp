@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS rmk_policies_id_tenant_id_key
-    ON rmk_policies (id, tenant_id);
+    ON public.rmk_policies (id, tenant_id);

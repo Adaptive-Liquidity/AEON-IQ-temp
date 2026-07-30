@@ -3911,11 +3911,21 @@ const CHECKPOINT_CHECK_SOURCE: &[(&str, &str)] = &[
 async fn replace_checkpoint_table_with_decoy(pool: &PgPool, not_valid: bool) {
     for stmt in [
         "DROP TABLE public.tenancy_backfill_checkpoints".to_owned(),
+        // Column-for-column what migration 0032 declares, including every NOT
+        // NULL. That exactness is the point, and it was not here before: Codex
+        // found the column arm of the guard missing by noticing that THIS
+        // fixture -- the positive control asserting a correctly shaped occupant
+        // is accepted -- left nearly every protocol column nullable and passed
+        // anyway. A positive control that is not actually equivalent silently
+        // licenses the gap it is supposed to rule out.
         "CREATE TABLE public.tenancy_backfill_checkpoints ( \
-             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), tranche TEXT, \
-             contract_digest TEXT, status TEXT, resume_cursor TEXT, \
-             rows_total BIGINT, rows_backfilled BIGINT, blocking_count BIGINT, \
-             started_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(), \
+             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+             tranche TEXT NOT NULL, contract_digest TEXT NOT NULL, status TEXT NOT NULL, \
+             resume_cursor TEXT, \
+             rows_total BIGINT NOT NULL DEFAULT 0, rows_backfilled BIGINT NOT NULL DEFAULT 0, \
+             blocking_count BIGINT NOT NULL DEFAULT 0, \
+             started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
              completed_at TIMESTAMPTZ)"
             .to_owned(),
         // The seeded row differs by case, and that is the point. A row the real
@@ -4119,4 +4129,201 @@ async fn a_shadow_schema_cannot_capture_the_prepare_migrations_ddl(pool: PgPool)
     .await
     .unwrap();
     assert_eq!(owned, 10, "all ten ownership columns must land in public");
+}
+
+/// Validated CHECKs do not make up for a missing NOT NULL.
+///
+/// Codex, on `c54889e`. Comparing the seven CHECK expressions left the COLUMNS
+/// unchecked, and `CREATE TABLE IF NOT EXISTS` skips the whole declaration --
+/// so a table carrying all seven validated CHECKs with `rows_total` nullable was
+/// adopted and the NOT NULLs this protocol depends on silently never existed.
+///
+/// The CHECKs cannot substitute, which is the part worth stating: every one of
+/// them tolerates NULL by construction, so `rows_backfilled <= rows_total` is
+/// simply not false when either side is NULL, and a COMPLETED row with NULL
+/// counts satisfies all seven while meaning nothing.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_checkpoint_table_with_nullable_counts(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE TABLE public.tenancy_backfill_checkpoints ( \
+             id UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+             tranche TEXT NOT NULL, contract_digest TEXT NOT NULL, status TEXT NOT NULL, \
+             resume_cursor TEXT, \
+             rows_total BIGINT, rows_backfilled BIGINT NOT NULL DEFAULT 0, \
+             blocking_count BIGINT NOT NULL DEFAULT 0, \
+             started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
+             completed_at TIMESTAMPTZ)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (name, predicate) in CHECKPOINT_CHECK_SOURCE {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE public.tenancy_backfill_checkpoints \
+               ADD CONSTRAINT {name} CHECK ({predicate})"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // All seven are present and validated, so only the column arm can refuse.
+    let validated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint \
+          WHERE conrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND contype = 'c' AND convalidated",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        validated, 7,
+        "the decoy must satisfy the CHECK arm entirely"
+    );
+
+    // A COMPLETED row with a NULL count satisfies every one of them, which is why
+    // the NOT NULL is the thing actually carrying the guarantee.
+    sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_backfilled, blocking_count, completed_at) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'nullish', 'COMPLETED', \
+                 5, 0, NOW())",
+    )
+    .execute(&pool)
+    .await
+    .expect("a NULL rows_total slips past all seven CHECKs, which is the point");
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table whose declared columns differ",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("column rows_total is missing or not bigint NOT NULL"),
+        "the refusal must name the column and the shape it wanted: {message}"
+    );
+}
+
+/// The completion index must be bound to the checkpoint table, not just named.
+///
+/// Codex, on `c54889e`. Index names are unique per SCHEMA, not per table, so a
+/// same-named index on some other relation carrying `(tranche, contract_digest,
+/// status)` satisfied uniqueness, validity, predicate and columns -- every axis
+/// the shape arm checked -- and `CREATE UNIQUE INDEX IF NOT EXISTS` then skipped
+/// the name. Version 32 would be recorded with no uniqueness guarantee on the
+/// checkpoint table at all.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_completion_index_on_another_table(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE TABLE public.zz_impostor (tranche TEXT, contract_digest TEXT, status TEXT); \
+         CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+             ON public.zz_impostor (tranche, contract_digest) \
+             WHERE status = 'COMPLETED'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The impostor matches every axis except the table it sits on.
+    let (unique, valid, predicate): (bool, bool, String) = sqlx::query_as(
+        "SELECT i.indisunique, i.indisvalid, pg_get_expr(i.indpred, i.indrelid) \
+           FROM pg_index i \
+          WHERE i.indexrelid = 'public.tenancy_backfill_checkpoints_completed_key'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(unique && valid, "the impostor must be unique and valid");
+    assert_eq!(
+        predicate, "(status = 'COMPLETED'::text)",
+        "and must carry the same predicate, so only indrelid can refuse it"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a completion index that is not on the checkpoint table",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("on=zz_impostor"),
+        "the refusal must report the relation it actually found the index on: {message}"
+    );
+}
+
+/// A shadow schema must not capture the concurrent index builds either.
+///
+/// Codex, on `c54889e`: migrations 0033-0040 named their `ON` targets
+/// unqualified, so a schema ahead of `public` holding a decoy `archival_batches`
+/// captured the build. These are `-- no-transaction` migrations, which makes it
+/// worse than the 0032 case: sqlx records each version as it succeeds, then 0041
+/// searches only `public`, fails on the missing unique builds, and correcting
+/// `search_path` afterwards cannot re-run versions the ledger already claims.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_shadow_schema_cannot_capture_the_concurrent_index_builds(pool: PgPool) {
+    // Unwind the tranche so the builds have work to do, then re-apply PREPARE --
+    // the ownership columns must exist before the indexes can be built.
+    for script in [CONSTRAINTS_DOWN_SQL, INDEXES_DOWN_SQL, PREPARE_DOWN_SQL] {
+        sqlx::raw_sql(script).execute(&pool).await.expect("unwind");
+    }
+
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::raw_sql(
+        "CREATE SCHEMA zz_shadow; \
+         CREATE TABLE zz_shadow.archival_batches (id UUID, tenant_id UUID, agent_uuid UUID); \
+         CREATE TABLE zz_shadow.entities (id UUID, tenant_id UUID, agent_uuid UUID); \
+         SET search_path = zz_shadow, public",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("prepare must re-apply under a hostile search_path");
+    for build in BUILD_MIGRATIONS {
+        sqlx::raw_sql(*build)
+            .execute(&mut *conn)
+            .await
+            .expect("each concurrent build must resolve its target in public");
+    }
+
+    // Every one of the eight must be on a public table, not a shadow decoy.
+    let misplaced: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*) FROM pg_index i \
+           JOIN pg_class ic ON ic.oid = i.indexrelid \
+           JOIN pg_class tc ON tc.oid = i.indrelid \
+           JOIN pg_namespace tn ON tn.oid = tc.relnamespace \
+          WHERE ic.relname IN ({TRANCHE1_INDEXES}) AND tn.nspname <> 'public'"
+    )))
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        misplaced, 0,
+        "no tranche index may have been built against a shadow table"
+    );
+    let shadow_indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+          WHERE n.nspname = 'zz_shadow' AND c.relkind = 'i'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(shadow_indexes, 0, "the shadow schema must hold no indexes");
+
+    // And 0041 then applies, which is exactly what a captured build would break.
+    sqlx::raw_sql(CONSTRAINTS_UP)
+        .execute(&mut *conn)
+        .await
+        .expect("0041 must apply over builds that landed in public");
 }

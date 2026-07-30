@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_memory_graph_tenant
-    ON memory_graph (tenant_id, agent_uuid);
+    ON public.memory_graph (tenant_id, agent_uuid);

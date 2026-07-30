@@ -21,4 +21,4 @@
 -- ============================================================================
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS archival_batches_id_tenant_id_key
-    ON archival_batches (id, tenant_id);
+    ON public.archival_batches (id, tenant_id);

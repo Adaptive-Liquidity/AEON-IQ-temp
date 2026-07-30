@@ -272,6 +272,52 @@ BEGIN
 
             UNION ALL
 
+            -- The declared columns, their types and their nullability.
+            --
+            -- Codex, on c54889e: comparing only the CHECK constraints left the
+            -- COLUMNS unchecked, and `CREATE TABLE IF NOT EXISTS` skips the whole
+            -- declaration -- so a table carrying all seven validated CHECKs but
+            -- with `rows_total` nullable, or without `updated_at`, was adopted and
+            -- the NOT NULLs this protocol depends on silently never existed. The
+            -- CHECKs cannot substitute: every one of them is written to tolerate
+            -- NULL, so `rows_backfilled <= rows_total` says nothing when either
+            -- side is NULL.
+            --
+            -- Found from this repository's own test fixture, which is the
+            -- uncomfortable part: the positive control asserting that a
+            -- correctly-shaped occupant is ACCEPTED was built with nearly every
+            -- protocol column nullable, and it passed.
+            SELECT pg_catalog.format('column %s is missing or not %s %s',
+                                     expected.col, expected.typ,
+                                     CASE WHEN expected.must_be_notnull THEN 'NOT NULL'
+                                          ELSE 'NULL-able' END)
+              FROM (VALUES
+                      ('id',              'uuid',                     true),
+                      ('tranche',         'text',                     true),
+                      ('contract_digest', 'text',                     true),
+                      ('status',          'text',                     true),
+                      ('resume_cursor',   'text',                     false),
+                      ('rows_total',      'bigint',                   true),
+                      ('rows_backfilled', 'bigint',                   true),
+                      ('blocking_count',  'bigint',                   true),
+                      ('started_at',      'timestamp with time zone', true),
+                      ('updated_at',      'timestamp with time zone', true),
+                      ('completed_at',    'timestamp with time zone', false)
+                   ) AS expected(col, typ, must_be_notnull)
+             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM pg_catalog.pg_attribute a
+                      WHERE a.attrelid =
+                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                        AND a.attname   = expected.col
+                        AND a.attnum    > 0
+                        AND NOT a.attisdropped
+                        AND pg_catalog.format_type(a.atttypid, a.atttypmod) = expected.typ
+                        AND a.attnotnull = expected.must_be_notnull)
+
+            UNION ALL
+
             -- The partial unique index, by SHAPE.
             --
             -- Found by self-audit after Codex's P1, enumerating every
@@ -287,8 +333,8 @@ BEGIN
             SELECT pg_catalog.format(
                        'index tenancy_backfill_checkpoints_completed_key is not the '
                        'partial unique index this migration builds '
-                       '(indisunique=%s indisvalid=%s predicate=%L columns=%L)',
-                       i.indisunique, i.indisvalid,
+                       '(on=%s indisunique=%s indisvalid=%s predicate=%L columns=%L)',
+                       i.indrelid::regclass, i.indisunique, i.indisvalid,
                        COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
                        COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
                                    FROM pg_catalog.unnest(i.indkey::int2[])
@@ -299,7 +345,16 @@ BEGIN
               FROM pg_catalog.pg_index i
              WHERE i.indexrelid =
                    pg_catalog.to_regclass('public.tenancy_backfill_checkpoints_completed_key')
-               AND (NOT i.indisunique
+                 -- Codex, on c54889e: bound to the TABLE by OID, not merely to the
+                 -- index name. Index names are unique per schema, not per table, so
+                 -- a same-named index on some other relation that happens to carry
+                 -- (tranche, contract_digest, status) satisfied every other axis
+                 -- here, and `CREATE UNIQUE INDEX IF NOT EXISTS` then skipped the
+                 -- name -- leaving version 32 recorded with no uniqueness guarantee
+                 -- on the checkpoint table at all.
+               AND (i.indrelid IS DISTINCT FROM
+                    pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                    OR NOT i.indisunique
                     -- An INVALID index enforces nothing, so it must never be
                     -- adopted as the object that guarantees uniqueness. 0041's
                     -- adoption branch already refuses INVALID for the same
