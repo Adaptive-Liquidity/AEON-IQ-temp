@@ -35,6 +35,11 @@ pub mod inventory;
 // column, no index, no constraint and no migration file.
 pub mod plan;
 pub mod report;
+// Step 4B-1: the PREPARE stage's live behaviour. Separate from
+// `audit_db_tests` because it tests migrations rather than the audit, and
+// because the no-database CI path skips `tenancy::*_db_tests` by name.
+#[cfg(test)]
+mod tranche1_db_tests;
 
 use std::collections::BTreeMap;
 
@@ -774,16 +779,36 @@ mod db_tests {
         include_str!("../../rollback/0030_credential_agent_grants_down.sql");
     const GRANTS_HARDENING_ROLLBACK_SQL: &str =
         include_str!("../../rollback/0031_credential_agent_grants_hardening_down.sql");
+    const TRANCHE1_CONSTRAINTS_ROLLBACK_SQL: &str =
+        include_str!("../../rollback/0041_tenancy_tranche1_constraints_down.sql");
+    const TRANCHE1_INDEXES_ROLLBACK_SQL: &str =
+        include_str!("../../rollback/0033_tenancy_tranche1_indexes_down.sql");
+    const TRANCHE1_PREPARE_ROLLBACK_SQL: &str =
+        include_str!("../../rollback/0032_tenancy_tranche1_prepare_down.sql");
 
     /// Unwind to the 0027 baseline, in order.
     ///
-    /// Unwind order is 0031 -> 0030 -> 0028. 0030's agent-side foreign key
-    /// depends on `agents_tenant_id_id_key`, which the 0028 rollback drops, and
+    /// Unwind order is 0041 -> 0033-0040 -> 0032 -> 0031 -> 0030 -> 0028.
+    /// Tenancy tranche 1 hangs five composite foreign keys off
+    /// `agents_tenant_id_id_key`, and 0030's agent-side foreign key depends on
+    /// it too; the 0028 rollback drops it, so both have to come out first.
     /// 0030's rollback in turn refuses while 0031 is applied. Each script
     /// refuses up front and names the one to run first. Every test that rolls step 1
     /// back goes through here rather than reaching for `ROLLBACK_SQL` directly,
     /// so a future migration adding another dependency has one place to update.
     async fn rollback_to_0027(pool: &PgPool) {
+        sqlx::raw_sql(TRANCHE1_CONSTRAINTS_ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0041 rollback");
+        sqlx::raw_sql(TRANCHE1_INDEXES_ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0033-0040 rollback");
+        sqlx::raw_sql(TRANCHE1_PREPARE_ROLLBACK_SQL)
+            .execute(pool)
+            .await
+            .expect("0032 rollback");
         sqlx::raw_sql(GRANTS_HARDENING_ROLLBACK_SQL)
             .execute(pool)
             .await
@@ -1619,8 +1644,22 @@ mod db_tests {
         // (right for `psql -f`, where autocommit would otherwise leave a failed
         // rollback half-applied), so the RAISE leaves this connection in an
         // aborted transaction that must be cleared before it is reused.
-        // 0030 first, or the migration-order guard fires and this test would
-        // pass for the wrong reason.
+        // Tranche 1 and then 0030 first, or a migration-order guard fires and
+        // this test would pass for the wrong reason — it would prove the
+        // ordering guard works, which is a different test, rather than proving
+        // the identifier check refuses.
+        sqlx::raw_sql(TRANCHE1_CONSTRAINTS_ROLLBACK_SQL)
+            .execute(&pool)
+            .await
+            .expect("0041 rollback");
+        sqlx::raw_sql(TRANCHE1_INDEXES_ROLLBACK_SQL)
+            .execute(&pool)
+            .await
+            .expect("0033-0040 rollback");
+        sqlx::raw_sql(TRANCHE1_PREPARE_ROLLBACK_SQL)
+            .execute(&pool)
+            .await
+            .expect("0032 rollback");
         sqlx::raw_sql(GRANTS_HARDENING_ROLLBACK_SQL)
             .execute(&pool)
             .await
