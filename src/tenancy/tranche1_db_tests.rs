@@ -2362,15 +2362,23 @@ async fn an_unrelated_trigger_of_the_same_name_does_not_block_the_prepare_rollba
             .await
             .unwrap();
     }
-    let decoy_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
-         WHERE t.tgname = 'trg_entities_tenancy_bridge' AND c.relname = 'zz_trigger_decoy')",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    // Queried, not cached. The post-rollback check below asserts the decoy
+    // SURVIVED, so it has to read the catalog again after the rollback ran: a
+    // bool captured here and re-asserted there re-states what was already true
+    // before the script executed and cannot fail, whatever the rollback did to
+    // the decoy.
+    async fn decoy_exists(pool: &PgPool) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+             WHERE t.tgname = 'trg_entities_tenancy_bridge' AND c.relname = 'zz_trigger_decoy')",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
     assert!(
-        decoy_exists,
+        decoy_exists(&pool).await,
         "the decoy trigger must exist to be a real test"
     );
 
@@ -2397,8 +2405,9 @@ async fn an_unrelated_trigger_of_the_same_name_does_not_block_the_prepare_rollba
         "the rollback must have dropped the ownership columns"
     );
     assert!(
-        decoy_exists,
-        "and the decoy trigger is none of its business"
+        decoy_exists(&pool).await,
+        "and the decoy trigger is none of its business: the rollback drops triggers by (name, \
+         table), so one of the same name on an unrelated table must still be there afterwards"
     );
 }
 
@@ -2580,7 +2589,41 @@ async fn a_renamed_constraint_is_refused_by_shape_not_missed_by_name(pool: PgPoo
 /// is that function's.
 #[sqlx::test(migrations = "./migrations")]
 async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPool) {
-    let state = crate::test_support::test_state(pool.clone());
+    // The deleter gets a connection of its own, established before the gate opens.
+    //
+    // This is the only test in the suite that needs two connections held at the
+    // same instant: the worker keeps one open across the whole gate while
+    // `delete_agent` needs another. `#[sqlx::test]`'s pool cannot promise the
+    // second one. It is a CHILD of one master pool capped at 20 connections for
+    // the entire test binary, and it closes idle connections after one second
+    // (sqlx-postgres 0.9 `testing/mod.rs`), so a connection this test released
+    // earlier is reaped and its permit returned to the shared cap. At
+    // `--test-threads=16` fifteen other tests are drawing on those 20 permits, and
+    // this one can be starved of its second connection for as long as it is willing
+    // to wait.
+    //
+    // Measured on pg16 at `--test-threads=16`: the deleter's backend never appeared
+    // in `pg_stat_activity` at all for a full 60-second gate -- only the worker and
+    // one idle connection were present -- and then it completed `Ok(true)` the
+    // instant `drop(worker)` returned a permit. That is starvation, not slowness,
+    // and no gate budget can fix it: the wait ends only when the test stops
+    // waiting, which is precisely when the interleaving under test can no longer
+    // happen. Raising the budget from 5 seconds to 60 changed nothing.
+    //
+    // A separate pool with no parent, one connection, and no idle timeout to reap
+    // it makes the second connection this test's own from the start. It is the same
+    // database and the same `delete_agent`, so nothing about the interleaving under
+    // test changes -- only whether the deleter can reach the server while the
+    // worker holds its lock.
+    let deleter_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("the deleter must have a connection reserved before the worker takes its lock");
+    let state = crate::test_support::test_state(deleter_pool.clone());
     insert_agent(&pool, "doomed", Some(TENANT)).await;
     sqlx::query(
         "INSERT INTO rmk_policies (agent_id, pressure_a, pressure_b, kp, ki, \
@@ -2628,13 +2671,39 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     // lock, which carries neither column. `pg_stat_activity` does carry
     // `datname`, and `pg_blocking_pids` confirms the backend is blocked rather
     // than merely idle.
+    //
+    // THE BLOCKER MUST BE THIS WORKER, not merely someone. The predicate runs on
+    // the worker's own connection, so `pg_backend_pid()` IS the worker, and
+    // requiring it to appear in `pg_blocking_pids(a.pid)` is what turns "a backend
+    // in this database is stuck" into "the deleter is waiting on the lock this
+    // test is holding" -- the exact proposition the assertion below claims. It is
+    // strictly narrower than the same-database scope it replaces, so it cannot let
+    // anything through that the previous form caught.
+    //
+    // ENDS ON A DEFINITIVE EVENT, not on a budget. The loop stops when the deleter
+    // is seen blocked by this worker, or when the deleter has finished -- after
+    // which it can never block, so waiting longer only converts a fast, explainable
+    // failure into a slow, mysterious one.
+    //
+    // The remaining deadline is a backstop against a hang, not a latency budget,
+    // which is why it is generous rather than tuned. The previous form was a count
+    // of 200 iterations described as five seconds, which it is only when each query
+    // and each sleep are free; at `--test-threads=16` on four cores neither is. But
+    // the flake it was blamed for was not slowness -- see the reserved connection
+    // above -- and raising this number was not what fixed it. Elapsed time, the
+    // deleter's own result and the server's view are all reported on failure, so a
+    // future failure says which of the three it is rather than leaving it to be
+    // rediscovered.
+    let gate_started = tokio::time::Instant::now();
+    let gate_budget = std::time::Duration::from_secs(120);
     let mut blocked = false;
-    for _ in 0..200 {
+    let mut finished_early = false;
+    while gate_started.elapsed() < gate_budget {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity a \
               WHERE a.datname = current_database() \
                 AND a.pid <> pg_backend_pid() \
-                AND cardinality(pg_blocking_pids(a.pid)) > 0",
+                AND pg_backend_pid() = ANY (pg_blocking_pids(a.pid))",
         )
         .fetch_one(&mut *worker)
         .await
@@ -2643,8 +2712,34 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
             blocked = true;
             break;
         }
+        // The deleter cannot block after it has finished, so waiting out the rest
+        // of the budget would only turn a fast, explainable failure into a slow,
+        // mysterious one. Its result is reported below.
+        if deleter.is_finished() {
+            finished_early = true;
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
+    let gate_elapsed = gate_started.elapsed();
+
+    // What the server saw, captured while it is still true. A gate that failed has
+    // to say why: whether the deleter was absent, idle, running something else, or
+    // waiting on a lock held by somebody other than this worker.
+    let activity: Vec<(i32, String, String, String, String)> = if blocked {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT a.pid, a.state, \
+                    COALESCE(a.wait_event_type, '-'), COALESCE(a.wait_event, '-'), \
+                    COALESCE(array_to_string(pg_blocking_pids(a.pid), ','), '') \
+               FROM pg_stat_activity a \
+              WHERE a.datname = current_database()",
+        )
+        .fetch_all(&mut *worker)
+        .await
+        .unwrap_or_default()
+    };
 
     // Release the worker and join the task BEFORE asserting, so a failed gate
     // cannot leave the spawned task detached and still holding a pooled
@@ -2661,7 +2756,10 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     assert!(
         blocked,
         "the deleter must have been waiting on the worker's lock, or this test \
-         proves nothing about the interleaving"
+         proves nothing about the interleaving. Gave up after {gate_elapsed:?}; \
+         deleter finished before it ever blocked: {finished_early}; its result: \
+         {outcome:?}; backends in this database at that moment \
+         (pid, state, wait_event_type, wait_event, blocked_by): {activity:?}"
     );
     let deleted = outcome.expect("deletion must survive a policy inserted during cleanup");
     assert!(deleted, "the agent existed, so it must report a deletion");
@@ -2689,6 +2787,12 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     .unwrap();
     assert_eq!(episodes, 1, "the episode log is still retained");
     assert_eq!(orphaned, 1, "and its policy reference is still NULLed");
+
+    // The reserved connection is outside `#[sqlx::test]`'s bookkeeping, so it has
+    // to be handed back explicitly: the harness drops this test's database on the
+    // way out, and a connection still open against it would keep that from
+    // succeeding.
+    deleter_pool.close().await;
 }
 
 /// The lock must not change what deletion does when nothing is racing it.
@@ -3065,4 +3169,543 @@ async fn the_migration_also_refuses_an_index_whose_ordering_is_not_ours(pool: Pg
         adopted, 0,
         "the DESC index must not have become a constraint"
     );
+}
+
+// ── Ownership: idempotency markers are not ownership claims ──────────────────
+
+/// Unwind tranche 1 completely, leaving the schema at its 0031 baseline.
+///
+/// `PREPARE_UP_SQL` can then be replayed exactly as `sqlx migrate run` would
+/// after the rollback deleted version 32, which is the only way to put an
+/// occupant in place *before* migration 0032 runs -- `#[sqlx::test]` applies
+/// every migration before the test body gets the pool.
+async fn unwind_to_pre_prepare(pool: &PgPool) {
+    for (label, script) in [
+        ("0041", CONSTRAINTS_DOWN_SQL),
+        ("0033-0040", INDEXES_DOWN_SQL),
+        ("0032", PREPARE_DOWN_SQL),
+    ] {
+        sqlx::raw_sql(script)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label} rollback: {e}"));
+    }
+}
+
+async fn exec(pool: &PgPool, stmt: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(stmt.to_owned()))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+}
+
+/// How many of the tranche's twenty owned objects carry the ownership marker.
+async fn marked_objects(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_description \
+          WHERE description LIKE '%aeon-iq:tenancy:tranche1:0032:%'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Put a stripped ownership marker back, copied from a sibling that still carries
+/// it rather than re-typed here.
+///
+/// Re-typing the literal would make this file a fourth place the marker text has
+/// to agree -- and a test that restores the marker by repeating it cannot notice a
+/// marker that changed, because it changes with it. Copying the live value leaves
+/// migration 0032 and its rollback as the only two authorities, which is exactly
+/// what `the_tranche1_ownership_markers_do_not_drift` pins.
+///
+/// `suffix` selects which of the three markers to copy: all ten columns share one,
+/// all five functions another, all five triggers a third.
+async fn restore_marker(pool: &PgPool, comment_on: &str, suffix: &str) {
+    exec(
+        pool,
+        &format!(
+            "DO $do$ \
+             DECLARE m TEXT; \
+             BEGIN \
+                 SELECT d.description INTO STRICT m FROM pg_description d \
+                  WHERE d.description LIKE '%{suffix}' LIMIT 1; \
+                 EXECUTE format('COMMENT ON {comment_on} IS %L', m); \
+             END $do$"
+        ),
+    )
+    .await;
+}
+
+/// Migration 0032 must refuse every name it would otherwise silently adopt.
+///
+/// `ADD COLUMN IF NOT EXISTS` and `CREATE OR REPLACE` are idempotency
+/// constructs, and neither says whose object it found. Each case below occupies
+/// one of the twenty names with something the tranche did not create; measured
+/// before the guard, all three were adopted, version 32 was recorded over them,
+/// and `rollback/0032` was then armed to destroy them by name -- a column
+/// together with its data.
+///
+/// The function case is the sharpest: `CREATE OR REPLACE FUNCTION` preserves the
+/// existing OID, so every trigger already calling that function immediately
+/// starts executing migration 0032's body instead of its own. Nothing is dropped
+/// and nothing is renamed, so no error is raised anywhere -- the hijack is
+/// completely silent.
+///
+/// What is asserted is that NOTHING was applied: not one ownership column, not
+/// one bridge, not the checkpoint table, and the occupant is untouched. The
+/// SQLSTATE is asserted too -- a typo inside the guard would also raise, and
+/// would otherwise read as a pass.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_to_adopt_objects_it_did_not_create(pool: PgPool) {
+    // (label, occupant setup, the phrase the refusal must contain, teardown)
+    let cases: &[(&str, &[&str], &str, &[&str])] = &[
+        (
+            "a column of the same name the tranche never created",
+            &[
+                "ALTER TABLE entities ADD COLUMN tenant_id UUID",
+                "COMMENT ON COLUMN entities.tenant_id IS 'somebody else''s column'",
+            ],
+            "column public.entities.tenant_id exists without this migration's ownership marker",
+            &["ALTER TABLE entities DROP COLUMN tenant_id"],
+        ),
+        (
+            "a zero-argument trigger function whose OID would be hijacked",
+            &[
+                "CREATE FUNCTION public.fn_entities_tenancy_bridge() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+            ],
+            "function public.fn_entities_tenancy_bridge() exists without this migration's \
+             ownership marker",
+            &["DROP FUNCTION public.fn_entities_tenancy_bridge()"],
+        ),
+        (
+            "a trigger of the same name on the same bridged table",
+            &[
+                "CREATE FUNCTION zz_occupant_fn() RETURNS trigger LANGUAGE plpgsql \
+                 AS $$ BEGIN RETURN NEW; END $$",
+                "CREATE TRIGGER trg_entities_tenancy_bridge BEFORE INSERT ON entities \
+                 FOR EACH ROW EXECUTE FUNCTION zz_occupant_fn()",
+            ],
+            "trigger trg_entities_tenancy_bridge on public.entities exists without this \
+             migration's ownership marker",
+            &[
+                "DROP TRIGGER trg_entities_tenancy_bridge ON entities",
+                "DROP FUNCTION zz_occupant_fn()",
+            ],
+        ),
+    ];
+
+    for (label, setup, expected_phrase, teardown) in cases {
+        unwind_to_pre_prepare(&pool).await;
+        for stmt in *setup {
+            exec(&pool, stmt).await;
+        }
+
+        let (code, message) = expect_refusal(&pool, PREPARE_UP_SQL, label).await;
+        assert_eq!(
+            code, "42710",
+            "{label}: must be duplicate_object, got {code}: {message}"
+        );
+        assert!(
+            message.contains(expected_phrase),
+            "{label}: the refusal must name the occupant (expected {expected_phrase:?}): {message}"
+        );
+        assert!(
+            message.contains("Nothing has been changed"),
+            "{label}: {message}"
+        );
+
+        // Nothing was applied: not a single one of the twenty objects.
+        //
+        // `tenancy_backfill_checkpoints` is deliberately not asserted on.
+        // `rollback/0032` retains that table on purpose -- it is the record of why
+        // a rollback was needed -- so it survives `unwind_to_pre_prepare` and its
+        // presence here says nothing about whether this migration ran. The twenty
+        // objects and their markers are what the guard governs.
+        let (columns, bridges): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM information_schema.columns \
+                      WHERE table_schema = 'public' \
+                        AND column_name IN ('agent_uuid', 'tenant_id') \
+                        AND table_name IN ('archival_batches', 'audit_logs', 'entities', \
+                                           'memory_graph', 'rmk_policies')), \
+                    (SELECT count(*) FROM pg_trigger \
+                      WHERE tgname LIKE 'trg\\_%\\_tenancy\\_bridge' AND NOT tgisinternal)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // The occupying column is the one thing that may still be there, and it
+        // must be: the point is that the guard did not take it over.
+        let expected_columns = i64::from(label.starts_with("a column"));
+        assert_eq!(
+            columns, expected_columns,
+            "{label}: no ownership column may be created by a refused migration"
+        );
+        let expected_bridges = i64::from(label.starts_with("a trigger"));
+        assert_eq!(
+            bridges, expected_bridges,
+            "{label}: no bridge trigger may be installed by a refused migration"
+        );
+        assert_eq!(
+            marked_objects(&pool).await,
+            0,
+            "{label}: a refused migration must stamp nothing as its own"
+        );
+
+        for stmt in *teardown {
+            exec(&pool, stmt).await;
+        }
+        sqlx::raw_sql(PREPARE_UP_SQL)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: PREPARE must apply once the name is free: {e}"));
+        assert_eq!(
+            marked_objects(&pool).await,
+            20,
+            "{label}: a successful PREPARE must stamp all twenty objects"
+        );
+    }
+}
+
+/// An unrelated overload must not make migration 0032 refuse forever.
+///
+/// The counterpart to the ownership guard, and the reason it is pinned to the
+/// full zero-argument `trigger`-returning contract rather than to `proname`.
+/// PostgreSQL allows overloading, so `fn_entities_tenancy_bridge(integer)` can
+/// legitimately exist; `CREATE OR REPLACE FUNCTION ...()` cannot touch it and
+/// `rollback/0032` cannot drop it, so refusing over it would be a false refusal
+/// with no way out. The sibling
+/// `an_overloaded_bridge_function_name_does_not_block_step_one_rollback` pins the
+/// same property for 0028's guard.
+#[sqlx::test(migrations = "./migrations")]
+async fn an_unrelated_bridge_overload_does_not_block_the_prepare_migration(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    exec(
+        &pool,
+        "CREATE FUNCTION public.fn_entities_tenancy_bridge(integer) RETURNS integer \
+         LANGUAGE sql AS $$ SELECT $1 $$",
+    )
+    .await;
+
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&pool)
+        .await
+        .expect("an unrelated overload must not be mistaken for an occupied bridge name");
+
+    assert_eq!(
+        marked_objects(&pool).await,
+        20,
+        "PREPARE must have applied and stamped its own twenty objects"
+    );
+    // The overload is still there, unstamped: the migration neither adopted nor
+    // disturbed it.
+    let overload: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_proc WHERE proname = 'fn_entities_tenancy_bridge' \
+           AND pronargs = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        overload, 1,
+        "the overload is none of the migration's business"
+    );
+}
+
+/// The rollback must refuse to drop an object that is not marked as the
+/// tranche's, and must still tolerate one that is simply gone.
+///
+/// Every drop in `rollback/0032` names its object literally, so the marker is the
+/// only thing standing between "unwind the tranche" and "delete a column, with
+/// its data, that belonged to somebody else". Stripping one marker is exactly the
+/// state a database that applied 0032 before the marker existed is in, so the
+/// refusal has to carry a next action rather than only a complaint.
+///
+/// The second half is the part a guard like this usually breaks: absence must
+/// stay a no-op. The file promises to be re-runnable, and a second run has
+/// nothing left to check.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_rollback_refuses_an_object_without_its_ownership_marker(pool: PgPool) {
+    // Clear the later stages once, so every case below is refused by the ownership
+    // guard rather than by the ordering guard ahead of it.
+    for (label, script) in [
+        ("0041", CONSTRAINTS_DOWN_SQL),
+        ("0033-0040", INDEXES_DOWN_SQL),
+    ] {
+        sqlx::raw_sql(script)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{label} rollback: {e}"));
+    }
+
+    for (label, strip, restore, suffix, expected_phrase) in [
+        (
+            "an unmarked ownership column",
+            "COMMENT ON COLUMN entities.tenant_id IS NULL",
+            "COLUMN public.entities.tenant_id",
+            "ownership-column",
+            "column public.entities.tenant_id (comment: none)",
+        ),
+        (
+            "a column whose marker was overwritten",
+            "COMMENT ON COLUMN memory_graph.agent_uuid IS 'notes'",
+            "COLUMN public.memory_graph.agent_uuid",
+            "ownership-column",
+            "column public.memory_graph.agent_uuid (comment: 'notes')",
+        ),
+        (
+            "an unmarked bridge function",
+            "COMMENT ON FUNCTION public.fn_rmk_policies_tenancy_bridge() IS NULL",
+            "FUNCTION public.fn_rmk_policies_tenancy_bridge()",
+            "bridge-function",
+            "function public.fn_rmk_policies_tenancy_bridge() (comment: none)",
+        ),
+        (
+            "an unmarked bridge trigger",
+            "COMMENT ON TRIGGER trg_audit_logs_tenancy_bridge ON audit_logs IS NULL",
+            "TRIGGER trg_audit_logs_tenancy_bridge ON public.audit_logs",
+            "bridge-trigger",
+            "trigger trg_audit_logs_tenancy_bridge on public.audit_logs (comment: none)",
+        ),
+    ] {
+        exec(&pool, strip).await;
+
+        let (code, message) = expect_refusal(&pool, PREPARE_DOWN_SQL, label).await;
+        assert_eq!(
+            code, "42710",
+            "{label}: must be duplicate_object, got {code}: {message}"
+        );
+        assert!(
+            message.contains(expected_phrase),
+            "{label}: the refusal must name the object (expected {expected_phrase:?}): {message}"
+        );
+        assert!(
+            message.contains("Nothing has been changed"),
+            "{label}: {message}"
+        );
+        assert!(
+            message.contains("re-stamp them"),
+            "{label}: the refusal must name the remedy for a pre-marker database: {message}"
+        );
+
+        // Nothing was dropped -- including by the statements that run before the
+        // drops, which is why the guard sits ahead of the checkpoint retirement.
+        let (columns, bridges): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM information_schema.columns \
+                      WHERE table_schema = 'public' \
+                        AND column_name IN ('agent_uuid', 'tenant_id') \
+                        AND table_name IN ('archival_batches', 'audit_logs', 'entities', \
+                                           'memory_graph', 'rmk_policies')), \
+                    (SELECT count(*) FROM pg_trigger \
+                      WHERE tgname LIKE 'trg\\_%\\_tenancy\\_bridge' AND NOT tgisinternal)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns, 10,
+            "{label}: no column may be dropped by a refusal"
+        );
+        assert_eq!(bridges, 5, "{label}: no bridge may be dropped by a refusal");
+        assert_eq!(
+            marked_objects(&pool).await,
+            19,
+            "{label}: exactly the one stripped marker is missing, and the refusal neither \
+             restored it nor removed any other"
+        );
+        // The `_sqlx_migrations` row is deliberately not asserted, for the reason
+        // `a_same_named_object_of_the_wrong_shape_is_refused_not_adopted` records:
+        // sqlx writes that row, not these files. Failing the statement is what
+        // stops the ledger delete at the foot of the script, and the object counts
+        // above are what pin that.
+
+        // Hand the marker back before the next case, so each refusal is caused by
+        // exactly one stripped object and the message names only that one.
+        restore_marker(&pool, restore, suffix).await;
+        assert_eq!(
+            marked_objects(&pool).await,
+            20,
+            "{label}: the restored marker must leave all twenty owned again"
+        );
+    }
+
+    // Absence is not an ownership dispute: with every marker in place the script
+    // unwinds, and running it again over a schema that has none of the twenty
+    // objects left must stay a no-op rather than becoming a refusal.
+    sqlx::raw_sql(PREPARE_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("a fully marked tranche must unwind");
+    sqlx::raw_sql(PREPARE_DOWN_SQL)
+        .execute(&pool)
+        .await
+        .expect("re-running over an already-unwound schema must stay a no-op");
+    assert_eq!(
+        marked_objects(&pool).await,
+        0,
+        "dropping the objects must take their markers with them, so a later same-named \
+         column cannot inherit one"
+    );
+}
+
+/// A renamed ownership key must still block the 0032 rollback.
+///
+/// The ordering guard promised to refuse while any of 0041's five composite keys
+/// is attached, but found them by `conname`. `ALTER TABLE ... RENAME CONSTRAINT`
+/// leaves the key attached and still backed by `agents_tenant_id_id_key`, so it
+/// vanished from that filter -- and the miss is quiet rather than late, because
+/// `DROP COLUMN` removes the foreign keys over a column without needing CASCADE.
+/// Measured on pg16 against the previous head, with all five renamed and the
+/// index arm already satisfied: the script COMMITTED, dropped all ten ownership
+/// columns, destroyed all five renamed keys with them, and retired version 32
+/// while the ledger still claimed 41 was applied.
+///
+/// Found now by the two axes a rename cannot touch, matching the sibling 0033
+/// guard exactly: `conindid`, the OID of the parent's unique key that all five
+/// depend on, and `conrelid` scoped to the tranche's own tables. The table scope
+/// is load-bearing -- migration 0030's `credential_agent_grants_agent_fkey` has
+/// the identical shape through the identical `conindid`, so a shape-only test
+/// would refuse this rollback forever.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_renamed_ownership_key_still_blocks_the_prepare_rollback(pool: PgPool) {
+    // Rename all five. Leaving one under its own name would let the old
+    // name-scoped arm fire on that one alone and pass a test it should fail.
+    for table in [
+        "archival_batches",
+        "audit_logs",
+        "entities",
+        "memory_graph",
+        "rmk_policies",
+    ] {
+        exec(
+            &pool,
+            &format!(
+                "ALTER TABLE {table} RENAME CONSTRAINT {table}_tenant_agent_fkey \
+                 TO zz_{table}_renamed"
+            ),
+        )
+        .await;
+    }
+    // Satisfy the index arm, so the refusal can only come from the key arm.
+    exec(
+        &pool,
+        "DROP INDEX idx_archival_batches_tenant, idx_audit_logs_tenant, idx_entities_tenant, \
+         idx_memory_graph_tenant, idx_rmk_policies_tenant",
+    )
+    .await;
+    for table in ["archival_batches", "entities", "rmk_policies"] {
+        exec(
+            &pool,
+            &format!("ALTER TABLE {table} DROP CONSTRAINT {table}_id_tenant_id_key"),
+        )
+        .await;
+    }
+
+    let (code, message) = expect_refusal(&pool, PREPARE_DOWN_SQL, "renamed ownership keys").await;
+    assert_eq!(
+        code, "2BP01",
+        "must be dependent_objects_still_exist: {message}"
+    );
+    for table in [
+        "archival_batches",
+        "audit_logs",
+        "entities",
+        "memory_graph",
+        "rmk_policies",
+    ] {
+        assert!(
+            message.contains(&format!("zz_{table}_renamed on {table}")),
+            "the refusal must name the key under whatever it is called now: {message}"
+        );
+    }
+
+    // The columns the renamed keys reference are still there, and so are the keys.
+    let (columns, keys): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND column_name IN ('agent_uuid', 'tenant_id') \
+                    AND table_name IN ('archival_batches', 'audit_logs', 'entities', \
+                                       'memory_graph', 'rmk_policies')), \
+                (SELECT count(*) FROM pg_constraint WHERE conname LIKE 'zz\\_%\\_renamed')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        columns, 10,
+        "no ownership column may be dropped by a refusal"
+    );
+    assert_eq!(
+        keys, 5,
+        "and no renamed key may be destroyed along with them"
+    );
+}
+
+/// 0041's rerun diagnostic must name the axis that differs, on every axis it
+/// tests.
+///
+/// The already-exists branch tested ten axes of the backing index and printed
+/// five. A constraint whose index differed on any of the other five produced a
+/// refusal in which every named value was correct and nothing was named as wrong:
+/// `indisunique=t indisvalid=t total=t indnkeyatts=2 on archival_batches`. A
+/// refusal an operator cannot act on is most of the way to no refusal at all,
+/// which is why this is a defect rather than a wording preference.
+///
+/// `NULLS NOT DISTINCT` is the axis exercised because it is the one an operator
+/// can actually reach: measured on pg16, `ADD CONSTRAINT ... UNIQUE USING INDEX`
+/// accepts such an index, so the state needs no catalog surgery. The other four
+/// silent axes are unreachable without it -- PostgreSQL refuses to adopt a
+/// non-btree, DESC-ordered or non-default-opclass index in the first place -- so
+/// each is asserted through the guard's own source instead, which is what keeps
+/// the two branches from drifting apart again.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_0041_rerun_diagnostic_names_the_axis_that_differs(pool: PgPool) {
+    exec(
+        &pool,
+        "ALTER TABLE archival_batches DROP CONSTRAINT archival_batches_id_tenant_id_key",
+    )
+    .await;
+    exec(
+        &pool,
+        "CREATE UNIQUE INDEX archival_batches_id_tenant_id_key \
+         ON archival_batches (id, tenant_id) NULLS NOT DISTINCT",
+    )
+    .await;
+    exec(
+        &pool,
+        "ALTER TABLE archival_batches ADD CONSTRAINT archival_batches_id_tenant_id_key \
+         UNIQUE USING INDEX archival_batches_id_tenant_id_key",
+    )
+    .await;
+
+    let (code, message) = expect_refusal(&pool, CONSTRAINTS_UP, "NULLS NOT DISTINCT index").await;
+    assert_eq!(code, "42710", "must be duplicate_object: {message}");
+    assert!(
+        message.contains("its backing index is NULLS NOT DISTINCT"),
+        "the diagnostic must name the axis that differs rather than reporting the four axes \
+         that happen to be correct: {message}"
+    );
+
+    // Every axis the branch tests has a message of its own. Asserted against the
+    // guard's source because four of the ten cannot be reached through DDL, and
+    // an untestable axis is exactly where the two branches drifted apart before.
+    for axis in [
+        "its backing index is on ",
+        "its backing index is not unique",
+        "its backing index is INVALID",
+        "its backing index is partial",
+        "its backing index has ",
+        "its backing index access method is ",
+        "its backing index is NULLS NOT DISTINCT",
+        "its backing index column ordering is ",
+        "its backing index carries collations ",
+        "its backing index uses a non-default operator class",
+    ] {
+        assert!(
+            CONSTRAINTS_UP.contains(axis),
+            "the already-exists branch must report {axis:?} as its own problem, not fold it \
+             into a combined message that names none of the axes it tested"
+        );
+    }
 }

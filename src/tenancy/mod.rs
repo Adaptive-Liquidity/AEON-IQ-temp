@@ -757,6 +757,75 @@ mod tests {
             legacy_compat_agent_id(Uuid::parse_str(TENANT_A).unwrap())
         );
     }
+
+    /// Migration 0032 and its rollback must agree, character for character, on the
+    /// ownership markers that decide what the rollback may drop.
+    ///
+    /// The markers are compared with `IS DISTINCT FROM` against a literal spelled
+    /// out in both files -- SQL has no cross-statement constants and sqlx has no
+    /// include mechanism, so there is nothing to share. Drift is therefore a
+    /// one-character edit away, and it fails in the worst available direction:
+    /// migration 0032 stamps objects the rollback then declines to recognise, so a
+    /// correctly applied tranche cannot be unwound at all, and the refusal blames
+    /// the operator's schema. Nothing about that points at a typo.
+    ///
+    /// Deliberately in this module rather than beside the tranche's other tests:
+    /// `tenancy::tranche1_db_tests` is skipped by name in the no-database CI job
+    /// (.github/workflows/ci.yml), and this check needs no database, so putting it
+    /// there would mean the fast job never ran it.
+    ///
+    /// Each marker must appear exactly three times across the two files -- once in
+    /// the migration's pre-flight guard, once where it stamps the object, and once
+    /// in the rollback's guard. A count is asserted rather than mere presence
+    /// because a half-finished rename leaves both spellings in the tree, and every
+    /// occurrence found would still be "present".
+    #[test]
+    fn the_tranche1_ownership_markers_do_not_drift() {
+        const PREPARE_UP: &str = include_str!("../../migrations/0032_tenancy_tranche1_prepare.sql");
+        const PREPARE_DOWN: &str =
+            include_str!("../../rollback/0032_tenancy_tranche1_prepare_down.sql");
+
+        // The marker literals, as the two files spell them. plpgsql string
+        // continuation splits each across source lines, so the comparison is on
+        // the distinguishing final segment: it is the part a rename would change,
+        // and it is what makes each of the three markers different from the others.
+        for token in [
+            "aeon-iq:tenancy:tranche1:0032:ownership-column",
+            "aeon-iq:tenancy:tranche1:0032:bridge-function",
+            "aeon-iq:tenancy:tranche1:0032:bridge-trigger",
+        ] {
+            let up = PREPARE_UP.matches(token).count();
+            let down = PREPARE_DOWN.matches(token).count();
+            assert_eq!(
+                (up, down),
+                (2, 1),
+                "marker {token:?} must appear twice in migration 0032 (its guard and its \
+                 stamp) and once in the rollback's guard, found {up} and {down}. A marker the \
+                 two files spell differently makes a correctly applied tranche impossible to \
+                 roll back."
+            );
+        }
+
+        // And the prose around the token is part of the compared literal, so it has
+        // to match too. Taking the whole single-quoted plpgsql literal apart is
+        // more machinery than this needs: every marker line in both files is
+        // assembled from the same four fragments, so comparing the fragment set is
+        // equivalent and reads as what it checks.
+        for fragment in [
+            "AEON-IQ tenancy tranche 1 ownership column. Created and owned by ",
+            "AEON-IQ tenancy tranche 1 bridge function. Created and owned by ",
+            "AEON-IQ tenancy tranche 1 bridge trigger. Created and owned by ",
+            "migration 0032; rollback/0032_tenancy_tranche1_prepare_down.sql drops it ",
+            "only while this exact comment is present. ",
+        ] {
+            assert!(
+                PREPARE_UP.contains(fragment) && PREPARE_DOWN.contains(fragment),
+                "marker fragment {fragment:?} must be spelled identically in migration 0032 \
+                 and rollback/0032; the two guards compare the whole comment, not just the \
+                 trailing token"
+            );
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
