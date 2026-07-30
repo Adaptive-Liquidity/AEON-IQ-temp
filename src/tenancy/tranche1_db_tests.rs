@@ -2651,38 +2651,79 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
     // lock, which carries neither column. `pg_stat_activity` does carry
     // `datname`, and `pg_blocking_pids` confirms the backend is blocked rather
     // than merely idle.
-    // Bounded by WALL CLOCK, not by an iteration count.
+    // Bounded by WALL CLOCK, not by an iteration count, so the budget means what
+    // it says regardless of how slow each round trip to a shared cluster is.
+    // The cost of the wide bound is paid only on the failure path -- a healthy
+    // run leaves this loop on the first or second poll.
     //
-    // A fixed 200 x 25ms budget is only 5s of sleeping, and it measures the
-    // wrong thing: every iteration also pays for a round trip to a shared
-    // cluster and for whatever CPU the other tests are taking. Under
-    // `cargo test -- --test-threads=16` that made the gate expire before the
-    // deleter had even reached the lock -- reproduced at 1 failure in 6 runs,
-    // panicking on the `blocked` assertion below. CI runs `cargo test` at core
-    // count, so it could flake there too.
+    // KNOWN FLAKE, still open. Under `cargo test -- --test-threads=16` on a
+    // 10-core machine this gate expires roughly 1 run in 6. Widening the budget
+    // did NOT fix it and the original diagnosis -- "the 5s poll budget is too
+    // small" -- is wrong. What actually happens, measured on pg16 with the
+    // instrumentation below:
     //
-    // Nothing about the interleaving under test changed: the gate still waits
-    // for a backend in this test's own database to be genuinely blocked, and
-    // still fails loudly rather than proceeding, if that never happens. Only
-    // the patience did. The cost of the wider bound is paid ONLY on the failure
-    // path -- a healthy run leaves this loop on the first or second poll.
+    //   * the gate polls ~2250 times over the full 60s, so the loop is healthy;
+    //   * `delete_agent` DOES acquire a pooled connection (`pool[max=5 size=2
+    //     idle=0]`), and its backend sits `state=idle` with an EMPTY query --
+    //     it never sends even the `BEGIN`;
+    //   * it is therefore never blocked, so `pg_blocking_pids` correctly
+    //     reports nothing, and the gate correctly refuses to accept the run;
+    //   * the moment the test body stops and joins it, it returns `Ok(true)`
+    //     and every remaining assertion in this test passes.
+    //
+    // So the deletion contract is not in question -- only whether a given run
+    // exercised the interleaving. Replacing `tokio::spawn` with `tokio::join!`,
+    // so both futures are driven by the same task, did not change the rate
+    // either, which rules out plain task starvation; `#[sqlx::test]` builds a
+    // `new_current_thread` runtime (sqlx-core `rt/mod.rs::test_block_on`) and
+    // 16 of those oversubscribe 10 cores, but the stall is between acquiring a
+    // connection and writing the first byte on it.
+    //
+    // Deliberately NOT worked around by letting the gate pass when it sees
+    // nothing: that is the one change that would make this test stop proving
+    // the thing it exists to prove. Left failing loudly, with the diagnostics
+    // below, for whoever finishes it. CI runs `cargo test` at core count, where
+    // it has not been observed.
     const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
     let gate_started = std::time::Instant::now();
     let mut blocked = false;
     let mut polls = 0u32;
+    let mut peer_detail = String::new();
+    let mut finished_without_blocking = false;
     while gate_started.elapsed() < READINESS_BUDGET {
         polls += 1;
-        let waiting: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM pg_stat_activity a \
+        // Reports every peer backend in this test's database, not just the
+        // blocked count: a bare count cannot distinguish "the deleter never
+        // connected" from "it connected and is idle" from "it is blocked", and
+        // three rounds of diagnosis were spent because it did not.
+        let (waiting, detail): (i64, Option<String>) = sqlx::query_as(
+            "SELECT count(*) FILTER (WHERE cardinality(pg_blocking_pids(a.pid)) > 0), \
+                    string_agg(format('[state=%s wait=%s/%s blockers=%s q=%s]', \
+                                      a.state, a.wait_event_type, a.wait_event, \
+                                      pg_blocking_pids(a.pid), left(a.query, 60)), ' ') \
+               FROM pg_stat_activity a \
               WHERE a.datname = current_database() \
-                AND a.pid <> pg_backend_pid() \
-                AND cardinality(pg_blocking_pids(a.pid)) > 0",
+                AND a.pid <> pg_backend_pid()",
         )
         .fetch_one(&mut *worker)
         .await
         .unwrap();
+        peer_detail = format!(
+            "{} pool[max={} size={} idle={}]",
+            detail.unwrap_or_default(),
+            pool.options().get_max_connections(),
+            pool.size(),
+            pool.num_idle()
+        );
         if waiting > 0 {
             blocked = true;
+            break;
+        }
+        // Waiting past this point cannot change the answer: a finished task is
+        // never going to block, so the remaining budget would buy only a slower
+        // failure with less to say.
+        if deleter.is_finished() {
+            finished_without_blocking = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -2701,11 +2742,19 @@ async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPo
         .expect("the deletion must not hang once the worker has committed")
         .expect("the deleting task must not panic");
 
+    // Rendered before `outcome` is consumed below, so a failing gate reports
+    // what the deleter actually did rather than only that it was not seen.
+    let deleter_said = match &outcome {
+        Ok(deleted) => format!("Ok({deleted})"),
+        Err(e) => format!("Err({e})"),
+    };
     assert!(
         blocked,
         "the deleter must have been waiting on the worker's lock, or this test \
-         proves nothing about the interleaving (gave up after {polls} polls over \
-         {gate_waited:?})"
+         proves nothing about the interleaving ({polls} polls over {gate_waited:?}; \
+         finished_without_blocking={finished_without_blocking}; \
+         peers {peer_detail}; the deleter returned {deleter_said}). See the \
+         KNOWN FLAKE note above before concluding this is a regression."
     );
     let deleted = outcome.expect("deletion must survive a policy inserted during cleanup");
     assert!(deleted, "the agent existed, so it must report a deletion");
