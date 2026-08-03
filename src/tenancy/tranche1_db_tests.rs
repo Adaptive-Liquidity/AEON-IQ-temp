@@ -3964,6 +3964,13 @@ async fn replace_checkpoint_table_with_decoy(pool: &PgPool, not_valid: bool) {
         .await
         .unwrap_or_else(|e| panic!("attaching {name} must succeed: {e}"));
     }
+
+    // The fixture asserts its own equivalence rather than being trusted to have
+    // it. Every negative test below mutates exactly one axis away from this
+    // baseline, so if the baseline quietly stops matching the real table, those
+    // tests stop proving the axis they name -- which is precisely how the
+    // nullable-column and primary-key holes survived earlier rounds.
+    assert_decoy_is_contract_equivalent(pool).await;
 }
 
 /// A NOT VALID CHECK matches by expression and asserts nothing about the rows.
@@ -4206,6 +4213,337 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_nullable_counts(p
     assert!(
         message.contains("column rows_total is missing or not bigint NOT NULL"),
         "the refusal must name the column and the shape it wanted: {message}"
+    );
+}
+
+/// Every axis of the checkpoint contract the decoy is supposed to satisfy.
+///
+/// This exists because the fixture has now twice been the thing that hid a hole
+/// in the guard: it was built with nearly every column nullable and passed
+/// (Codex, on `c54889e`), and its equivalence has been asserted by reading it
+/// rather than by checking it ever since. A positive control is only evidence if
+/// it is provably the same shape as the real table, so the sameness is asserted
+/// against the catalog instead of against the source text.
+///
+/// Called from the fixture itself, so a future simplification of the decoy fails
+/// here rather than silently weakening every negative test that builds on it.
+async fn assert_decoy_is_contract_equivalent(pool: &PgPool) {
+    // Name, ordinal, type, nullability and default for all eleven, in order.
+    // `pg_get_expr` renders the default exactly as the guard reads it.
+    let shape: Vec<(i16, String, String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT a.attnum, a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+                a.attnotnull, pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
+           FROM pg_catalog.pg_attribute a \
+           LEFT JOIN pg_catalog.pg_attrdef d \
+                  ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+          WHERE a.attrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY a.attnum",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    let expected: &[(i16, &str, &str, bool, Option<&str>)] = &[
+        (1, "id", "uuid", true, Some("gen_random_uuid()")),
+        (2, "tranche", "text", true, None),
+        (3, "contract_digest", "text", true, None),
+        (4, "status", "text", true, None),
+        (5, "resume_cursor", "text", false, None),
+        (6, "rows_total", "bigint", true, Some("0")),
+        (7, "rows_backfilled", "bigint", true, Some("0")),
+        (8, "blocking_count", "bigint", true, Some("0")),
+        (
+            9,
+            "started_at",
+            "timestamp with time zone",
+            true,
+            Some("now()"),
+        ),
+        (
+            10,
+            "updated_at",
+            "timestamp with time zone",
+            true,
+            Some("now()"),
+        ),
+        (11, "completed_at", "timestamp with time zone", false, None),
+    ];
+    assert_eq!(
+        shape.len(),
+        expected.len(),
+        "the decoy must carry exactly the declared columns: {shape:#?}"
+    );
+    for (got, want) in shape.iter().zip(expected) {
+        assert_eq!(
+            (
+                got.0,
+                got.1.as_str(),
+                got.2.as_str(),
+                got.3,
+                got.4.as_deref()
+            ),
+            (want.0, want.1, want.2, want.3, want.4),
+            "the decoy diverges from the declared contract at column {}",
+            want.1
+        );
+    }
+
+    // And the primary key, since that is now an axis the guard checks.
+    let pk: Option<(String, bool, bool, String)> = sqlx::query_as(
+        "SELECT k.conname, k.convalidated, k.condeferrable, \
+                (SELECT string_agg(a.attname, ',' ORDER BY o.ord) \
+                   FROM unnest(k.conkey) WITH ORDINALITY AS o(attnum, ord) \
+                   JOIN pg_attribute a \
+                     ON a.attrelid = k.conrelid AND a.attnum = o.attnum) \
+           FROM pg_constraint k \
+          WHERE k.conrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND k.contype = 'p'",
+    )
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pk.as_ref().map(|(_, validated, deferrable, cols)| (
+            *validated,
+            *deferrable,
+            cols.as_str()
+        )),
+        Some((true, false, "id")),
+        "the decoy must carry the validated, non-deferrable primary key on (id): {pk:#?}"
+    );
+}
+
+/// A checkpoint table with no primary key at all must be refused.
+///
+/// CodeRabbit, blocking on `6f2311a`. The guard filtered `contype = 'c'`, so
+/// nothing in it looked at `contype = 'p'`. `id UUID PRIMARY KEY` lives inside
+/// the `CREATE TABLE IF NOT EXISTS` that adoption skips, so a table correct in
+/// every other respect was adopted without the unique index behind its surrogate
+/// row identity -- after which two checkpoint rows can share an `id` and every
+/// by-id read of the completion evidence is ambiguous.
+///
+/// Mutation-checked by deleting only the primary-key arm: without it the
+/// migration adopts this table and the test fails.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_checkpoint_table_without_a_primary_key(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    // Start from the fixture proved acceptable by
+    // `a_validated_equivalent_checkpoint_table_is_still_accepted`, then change
+    // exactly one axis. That is what makes the refusal below attributable to the
+    // primary key rather than to some other way the fixture is not equivalent.
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           DROP CONSTRAINT tenancy_backfill_checkpoints_pkey",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The dropped constraint takes its index with it, so nothing else can be
+    // supplying uniqueness on `id`.
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_index \
+          WHERE indrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND indisunique",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(indexes, 0, "the decoy must have no unique index left");
+
+    // Two rows sharing an id is what adoption would actually permit.
+    sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints \
+           (id, tranche, contract_digest, status, rows_total, rows_backfilled, blocking_count) \
+         VALUES ('11111111-1111-1111-1111-111111111111', \
+                 'TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'a', 'IN_PROGRESS', 0, 0, 0), \
+                ('11111111-1111-1111-1111-111111111111', \
+                 'TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'b', 'IN_PROGRESS', 0, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect("without the primary key a duplicate id is accepted, which is the point");
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table with no primary key",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("the primary key is not this migration's")
+            && message.contains("no primary key at all"),
+        "the refusal must say the primary key is absent: {message}"
+    );
+}
+
+/// A primary key on the wrong columns must be refused.
+///
+/// The sharper half of the finding: a table CAN have `contype = 'p'`, validated
+/// and non-deferrable, and still not be this table -- `PRIMARY KEY (id, tranche)`
+/// enforces uniqueness of the PAIR, so two rows may still share an `id`. A guard
+/// that only asked "is there a primary key" would pass this.
+///
+/// Mutation-checked by relaxing the ordered column comparison to a mere existence
+/// test: the decoy is then adopted and the test fails.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_wrong_shaped_primary_key(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           DROP CONSTRAINT tenancy_backfill_checkpoints_pkey; \
+         ALTER TABLE public.tenancy_backfill_checkpoints \
+           ADD CONSTRAINT tenancy_backfill_checkpoints_pkey PRIMARY KEY (id, tranche)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Assert up front that every OTHER axis of the primary key is satisfied, so
+    // the ordered column set is provably the only thing that can refuse it.
+    let (name, validated, deferrable): (String, bool, bool) = sqlx::query_as(
+        "SELECT conname, convalidated, condeferrable FROM pg_constraint \
+          WHERE conrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND contype = 'p'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (name.as_str(), validated, deferrable),
+        ("tenancy_backfill_checkpoints_pkey", true, false),
+        "the impostor must carry the right name, be validated and non-deferrable"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a primary key on the wrong columns",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("the primary key is not this migration's")
+            && message.contains("on (id,tranche)"),
+        "the refusal must report the columns it actually found: {message}"
+    );
+}
+
+/// A checkpoint table missing a declared default must be refused.
+///
+/// Codex, P1 on `6f2311a`. `CREATE TABLE IF NOT EXISTS` skips the declaration
+/// wholesale, so the defaults go with it. This is not a cosmetic loss: the
+/// protocol's own writers omit `id`, `started_at` and `updated_at` and rely on
+/// them, and all three are NOT NULL -- so on an adopted table the first
+/// checkpoint write raises 23502 and no completion can ever be recorded.
+///
+/// Mutation-checked by deleting only the defaults arm.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_checkpoint_table_missing_a_default(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           ALTER COLUMN started_at DROP DEFAULT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The column itself is untouched -- still there, still timestamptz, still
+    // NOT NULL -- so the column arm cannot be what refuses this.
+    let (typ, notnull): (String, bool) = sqlx::query_as(
+        "SELECT pg_catalog.format_type(atttypid, atttypmod), attnotnull \
+           FROM pg_attribute \
+          WHERE attrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND attname = 'started_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (typ.as_str(), notnull),
+        ("timestamp with time zone", true),
+        "only the default may differ, so the column arm stays satisfied"
+    );
+
+    // And this is the concrete break: the protocol's own write now fails.
+    let err = sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, blocking_count) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'd', 'IN_PROGRESS', 0, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("without its default, a NOT NULL started_at rejects the protocol's own insert");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23502"),
+        "the break is a not-null violation: {err}"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table missing a declared default",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("column started_at carries default <none>")
+            && message.contains("declares 'now()'"),
+        "the refusal must name the column and both default states: {message}"
+    );
+}
+
+/// A checkpoint table whose default is the WRONG expression must be refused.
+///
+/// The other half of the axis, and the reason the comparison is exact rather
+/// than a presence test: `started_at DEFAULT '2000-01-01'` satisfies "has a
+/// default" while silently backdating every checkpoint the protocol writes.
+///
+/// Mutation-checked by relaxing the comparison to `d.adbin IS NOT NULL`: the
+/// decoy is then adopted and the test fails.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_checkpoint_table_with_a_forged_default(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           ALTER COLUMN started_at SET DEFAULT '2000-01-01'::timestamptz",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // A default IS present, so nothing but an exact comparison can refuse it.
+    let present: bool = sqlx::query_scalar(
+        "SELECT count(*) > 0 FROM pg_attrdef d \
+           JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
+          WHERE d.adrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND a.attname = 'started_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(present, "the forged default must be present, not absent");
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table whose default is not the declared one",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("column started_at carries default")
+            && message.contains("2000-01-01")
+            && message.contains("declares 'now()'"),
+        "the refusal must report observed and expected: {message}"
     );
 }
 

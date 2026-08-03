@@ -318,6 +318,207 @@ BEGIN
 
             UNION ALL
 
+            -- The ordered presence of those columns.
+            --
+            -- Closure audit on 6f2311a: the arm above proves each column exists
+            -- with the right type and nullability, but not that it sits where
+            -- this migration puts it. Ordinal position is part of the declared
+            -- shape -- `INSERT INTO tenancy_backfill_checkpoints VALUES (...)`
+            -- with no column list binds by position, and so does any `SELECT *`
+            -- consumer -- so a table carrying the same eleven columns in a
+            -- different order is a different table.
+            --
+            -- Fires only when the column exists; a missing one is already
+            -- reported by the arm above, and reporting it twice would bury the
+            -- actual fault.
+            SELECT pg_catalog.format('column %s is at ordinal position %s, not %s',
+                                     expected.col, observed.attnum, expected.ord)
+              FROM (VALUES
+                      ('id', 1), ('tranche', 2), ('contract_digest', 3),
+                      ('status', 4), ('resume_cursor', 5), ('rows_total', 6),
+                      ('rows_backfilled', 7), ('blocking_count', 8),
+                      ('started_at', 9), ('updated_at', 10), ('completed_at', 11)
+                   ) AS expected(col, ord)
+              JOIN pg_catalog.pg_attribute observed
+                ON observed.attrelid =
+                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+               AND observed.attname = expected.col
+               AND observed.attnum > 0
+               AND NOT observed.attisdropped
+             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
+               AND observed.attnum <> expected.ord
+
+            UNION ALL
+
+            -- The column DEFAULTS, compared exactly.
+            --
+            -- Codex, P1 on 6f2311a: the arms above prove name, type,
+            -- nullability and position, and `CREATE TABLE IF NOT EXISTS` skips
+            -- the declaration wholesale -- so a table whose columns are all
+            -- correct but which carries none of the declared defaults is
+            -- adopted, and every insert relying on them fails. Not
+            -- hypothetical: this suite's own `insert_completed_checkpoint`
+            -- writes (tranche, contract_digest, status, rows_total,
+            -- rows_backfilled, blocking_count, completed_at) and leaves `id`,
+            -- `started_at` and `updated_at` to their defaults. All three are
+            -- NOT NULL, so on an adopted table without them the very first
+            -- checkpoint write raises 23502 and no completion can ever be
+            -- recorded.
+            --
+            -- The comparison runs BOTH ways. A column that should carry a
+            -- default and does not is the reported break; a column that should
+            -- carry none but does is equally a contract change, because a
+            -- surprise default silently substitutes a value where the protocol
+            -- expects the caller's -- `completed_at` defaulting to `now()`
+            -- would make every row satisfy the COMPLETED half of
+            -- `..._completed_shape_ck`. `IS DISTINCT FROM` catches both
+            -- directions in one predicate, and it is NULL-safe, which a plain
+            -- `<>` against a column with no default would not be.
+            --
+            -- Right-hand sides are PostgreSQL's own normalised rendering, read
+            -- back from `pg_attrdef` on pg16 after this migration builds the
+            -- table -- never the source text, which deparses differently
+            -- (`NOW()` below is stored as `now()`, and
+            -- `PRIMARY KEY DEFAULT gen_random_uuid()` as `gen_random_uuid()`).
+            -- Same pg16 pinning, and the same fail-closed behaviour on a
+            -- deparse change, as the CHECK arm above.
+            SELECT pg_catalog.format(
+                       'column %s carries default %s but this migration declares %s',
+                       expected.col,
+                       COALESCE(pg_catalog.quote_literal(observed.def), '<none>'),
+                       COALESCE(pg_catalog.quote_literal(expected.def), '<none>'))
+              FROM (VALUES
+                      ('id',              'gen_random_uuid()'),
+                      ('tranche',         NULL::text),
+                      ('contract_digest', NULL),
+                      ('status',          NULL),
+                      ('resume_cursor',   NULL),
+                      ('rows_total',      '0'),
+                      ('rows_backfilled', '0'),
+                      ('blocking_count',  '0'),
+                      ('started_at',      'now()'),
+                      ('updated_at',      'now()'),
+                      ('completed_at',    NULL)
+                   ) AS expected(col, def)
+              -- LATERAL rather than a scalar subquery so a column that does not
+              -- exist yields no row at all: its absence is the previous arms'
+              -- finding, not a default mismatch.
+              CROSS JOIN LATERAL (
+                    SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS def
+                      FROM pg_catalog.pg_attribute a
+                      LEFT JOIN pg_catalog.pg_attrdef d
+                             ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                     WHERE a.attrelid =
+                           pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                       AND a.attname = expected.col
+                       AND a.attnum > 0
+                       AND NOT a.attisdropped
+                   ) AS observed
+             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
+               AND observed.def IS DISTINCT FROM expected.def
+
+            UNION ALL
+
+            -- The PRIMARY KEY, by catalog identity rather than by name.
+            --
+            -- CodeRabbit, blocking on 6f2311a: the guard filtered
+            -- `contype = 'c'` and so proved nothing about `contype = 'p'`.
+            -- `id UUID PRIMARY KEY` is declared inline in the CREATE TABLE
+            -- below, which `IF NOT EXISTS` skips entirely, so a table with all
+            -- eleven columns, all seven validated CHECKs and a correct
+            -- completion index but NO primary key -- or one keyed on another
+            -- column -- was adopted. `inventory.rs` declares
+            -- `primary_key("tenancy_backfill_checkpoints_pkey", &["id"])` as
+            -- part of this table's schema contract, so the contract required
+            -- exactly what the guard did not check.
+            --
+            -- Losing it is not cosmetic: `id` is this table's surrogate row
+            -- identity (`row_identity: SURROGATE_ID`), and without the unique
+            -- index behind it two checkpoint rows can share an id, after which
+            -- every by-id read of the completion evidence is ambiguous.
+            --
+            -- Checked as a constraint AND as the index behind it, because
+            -- either half can be wrong on its own: `conindid` is followed into
+            -- `pg_index` and required to be primary, unique, valid, ready,
+            -- total (`indpred IS NULL`) and non-expressional
+            -- (`indexprs IS NULL`) over exactly `id`. Non-deferrability is
+            -- required too -- a DEFERRABLE primary key stops enforcing until
+            -- commit, and inside a transaction is exactly where BACKFILL
+            -- writes.
+            SELECT pg_catalog.format(
+                       'the primary key is not this migration''s: expected a validated, '
+                       'non-deferrable PRIMARY KEY on (id) whose backing index is primary, '
+                       'unique, valid, ready, total and non-expressional over exactly (id); '
+                       'found %s',
+                       COALESCE(
+                         (SELECT pg_catalog.format(
+                                   'constraint %s on (%s) validated=%s deferrable=%s '
+                                   'deferred=%s; index %s primary=%s unique=%s valid=%s '
+                                   'ready=%s over (%s) predicate=%s expressions=%s',
+                                   k.conname,
+                                   COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
+                                               FROM pg_catalog.unnest(k.conkey)
+                                                    WITH ORDINALITY AS o(attnum, ord)
+                                               JOIN pg_catalog.pg_attribute a
+                                                 ON a.attrelid = k.conrelid
+                                                AND a.attnum = o.attnum), '<none>'),
+                                   k.convalidated, k.condeferrable, k.condeferred,
+                                   COALESCE(k.conindid::regclass::text, '<none>'),
+                                   COALESCE(i.indisprimary::text, '-'),
+                                   COALESCE(i.indisunique::text, '-'),
+                                   COALESCE(i.indisvalid::text, '-'),
+                                   COALESCE(i.indisready::text, '-'),
+                                   COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
+                                               FROM pg_catalog.unnest(i.indkey::int2[])
+                                                    WITH ORDINALITY AS o(attnum, ord)
+                                               JOIN pg_catalog.pg_attribute a
+                                                 ON a.attrelid = i.indrelid
+                                                AND a.attnum = o.attnum), '<none>'),
+                                   COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
+                                   COALESCE((i.indexprs IS NOT NULL)::text, '-'))
+                            FROM pg_catalog.pg_constraint k
+                            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
+                           WHERE k.conrelid =
+                                 pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                             AND k.contype = 'p'),
+                         'no primary key at all'))
+             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM pg_catalog.pg_constraint k
+                       JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
+                      WHERE k.conrelid =
+                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                        AND k.contype = 'p'
+                        AND k.convalidated
+                        AND NOT k.condeferrable
+                        AND NOT k.condeferred
+                        AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
+                               FROM pg_catalog.unnest(k.conkey)
+                                    WITH ORDINALITY AS o(attnum, ord)
+                               JOIN pg_catalog.pg_attribute a
+                                 ON a.attrelid = k.conrelid
+                                AND a.attnum = o.attnum) = 'id'
+                        -- The index half, bound to this table by OID for the
+                        -- same reason the completion index is: an index name is
+                        -- unique per schema, not per table.
+                        AND i.indrelid =
+                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+                        AND i.indisprimary
+                        AND i.indisunique
+                        AND i.indisvalid
+                        AND i.indisready
+                        AND i.indpred IS NULL
+                        AND i.indexprs IS NULL
+                        AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
+                               FROM pg_catalog.unnest(i.indkey::int2[])
+                                    WITH ORDINALITY AS o(attnum, ord)
+                               JOIN pg_catalog.pg_attribute a
+                                 ON a.attrelid = i.indrelid
+                                AND a.attnum = o.attnum) = 'id')
+
+            UNION ALL
+
             -- The partial unique index, by SHAPE.
             --
             -- Found by self-audit after Codex's P1, enumerating every
