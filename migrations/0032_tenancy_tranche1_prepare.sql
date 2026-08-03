@@ -96,6 +96,306 @@ DECLARE
         'AEON tenancy tranche 1 (migration 0032). Provenance marker: rollback/0032 '
         'destroys only objects carrying exactly this comment, and refuses to touch '
         'any that do not.';
+    -- The idempotency stamp for the checkpoint table.  Deliberately NOT named
+    -- `marker`: `the_provenance_marker_is_identical_everywhere_it_appears`
+    -- matches on a `marker` declaration prefix and would otherwise read
+    -- this as a fourth declaration of a string that differs from the other
+    -- three.  Duplicated verbatim in the stamping block at the foot of this
+    -- file; `the_checkpoint_stamp_is_identical_in_both_places` fails on drift.
+    checkpoint_stamp CONSTANT TEXT :=
+        'AEON tenancy tranche 1 (migration 0032). Idempotency stamp for the checkpoint '
+        'table: it records that this migration created this table, so that a re-run over '
+        'its own work is a no-op. It is NOT evidence that the rows are authentic.';
+
+    -- THE authoritative DDL.  Written once and used twice: to build the real
+    -- table in `public`, and to build the canonical reference in `pg_temp`
+    -- that an occupant is compared against.  Two hand-maintained definitions
+    -- could drift, and a drifted reference would validate the wrong contract.
+    checkpoint_body CONSTANT TEXT := $ckbody$(
+    id              UUID        DEFAULT gen_random_uuid(),
+    tranche         TEXT        NOT NULL,
+    contract_digest TEXT        NOT NULL,
+    status          TEXT        NOT NULL,
+    -- NULL once the tranche completes: there is nothing left to resume.
+    resume_cursor   TEXT,
+    rows_total      BIGINT      NOT NULL DEFAULT 0,
+    rows_backfilled BIGINT      NOT NULL DEFAULT 0,
+    blocking_count  BIGINT      NOT NULL DEFAULT 0,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    -- Named explicitly.  An implicit PRIMARY KEY would be called
+    -- `<table>_pkey`, and the canonical reference is deliberately named
+    -- differently, so the two sides would otherwise disagree about this
+    -- constraint's name for no reason but the reference's name.
+    CONSTRAINT tenancy_backfill_checkpoints_pkey PRIMARY KEY (id),
+    CONSTRAINT tenancy_backfill_checkpoints_status_ck
+        CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'ABANDONED')),
+    -- `tranche` is backed by the closed `plan::Tranche` enum exactly as `status`
+    -- is backed by `CheckpointStatus`, so it gets the same treatment.  Without
+    -- this, a one-character typo produces a row no guard will ever match: the
+    -- backfill reports success, FINALIZE keeps refusing, and nothing says why.
+    -- It fails closed, which is why this is a legibility fix rather than a
+    -- soundness one — but an unmatched checkpoint is a bad way to learn that.
+    CONSTRAINT tenancy_backfill_checkpoints_tranche_ck
+        CHECK (tranche IN (
+            'TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN',
+            'TRANCHE_2_SESSIONS',
+            'TRANCHE_3_MEMORIES',
+            'TRANCHE_4_LINEAGE_AND_ARCHIVAL',
+            'TRANCHE_5_OPERATIONS',
+            'FINAL_CONSTRAINT_TIGHTENING'
+        )),
+    -- A completion is the only state that carries a completion time, and it is
+    -- the only state with nothing left to resume.  Stating both structurally
+    -- stops a half-written row from reading as authoritative evidence.
+    CONSTRAINT tenancy_backfill_checkpoints_completed_shape_ck
+        CHECK ((status = 'COMPLETED') = (completed_at IS NOT NULL)),
+    CONSTRAINT tenancy_backfill_checkpoints_completed_cursor_ck
+        CHECK (status <> 'COMPLETED' OR resume_cursor IS NULL),
+    CONSTRAINT tenancy_backfill_checkpoints_counts_ck
+        CHECK (rows_total >= 0 AND rows_backfilled >= 0 AND blocking_count >= 0
+               AND rows_backfilled <= rows_total),
+    -- FINALIZE_PRECONDITION.max_blocking_count = 0 is the gate the whole
+    -- three-stage protocol exists to protect.  Enforcing it here as well means
+    -- a COMPLETED row cannot exist while the tranche still has blocking
+    -- findings, so the guard is not the only thing standing between a dirty
+    -- tranche and a validated constraint.
+    CONSTRAINT tenancy_backfill_checkpoints_completed_clean_ck
+        CHECK (status <> 'COMPLETED' OR blocking_count = 0),
+    -- A completion claims the tranche is finished, so its accounting has to say
+    -- so too.  Without this a row can read COMPLETED with 3 of 1000 rows done
+    -- and satisfy every other constraint.  The backfill command reconciles
+    -- rows_total against the final count before it completes.
+    CONSTRAINT tenancy_backfill_checkpoints_completed_accounting_ck
+        CHECK (status <> 'COMPLETED' OR rows_backfilled = rows_total)
+)$ckbody$;
+
+    idx_completed_tmpl CONSTANT TEXT :=
+        'CREATE UNIQUE INDEX %s ON %s (tranche, contract_digest) '
+        'WHERE status = ''COMPLETED''';
+    idx_tranche_tmpl CONSTANT TEXT :=
+        'CREATE INDEX %s ON %s (tranche, started_at DESC)';
+
+    -- THE comparator, likewise written once and executed twice -- tolerant on
+    -- the first pass, zero-tolerance on the second.  $1 live oid, $2 reference
+    -- oid, $3 whether to tolerate an owned index that is absent entirely.
+    checkpoint_diff_sql CONSTANT TEXT := $ckdiff$
+WITH targets(side, relid) AS (
+    VALUES ('reference'::text, $2::oid), ('live'::text, $1::oid)
+),
+ident AS (
+    SELECT t.side, t.relid, n.nspname AS nsp, c.relname AS rel
+      FROM targets t
+      JOIN pg_catalog.pg_class c ON c.oid = t.relid
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+),
+rel AS (
+    SELECT i.side, 'relation'::text AS cat, 'self'::text AS obj,
+           jsonb_build_object(
+             'relkind',            c.relkind,
+             'relpersistence',     CASE WHEN i.side = 'reference' THEN 'p' ELSE c.relpersistence::text END,
+             'access_method',      COALESCE(am.amname, '<none>'),
+             'owner',              pg_catalog.pg_get_userbyid(c.relowner),
+             'replica_identity',   c.relreplident,
+             'replica_index',      COALESCE((SELECT ri.relname FROM pg_catalog.pg_index x
+                                               JOIN pg_catalog.pg_class ri ON ri.oid = x.indexrelid
+                                              WHERE x.indrelid = c.oid AND x.indisreplident), '<none>'),
+             'row_security',       c.relrowsecurity,
+             'force_row_security', c.relforcerowsecurity,
+             'is_partition',       c.relispartition,
+             'of_type',            COALESCE(c.reloftype::regtype::text, '<none>'),
+             'partition_key',      COALESCE(pg_catalog.pg_get_partkeydef(c.oid), '<none>')
+           ) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_class c ON c.oid = i.relid
+      LEFT JOIN pg_catalog.pg_am am ON am.oid = c.relam
+),
+col AS (
+    SELECT i.side, 'column'::text AS cat,
+           CASE WHEN a.attisdropped THEN 'attnum ' || a.attnum::text ELSE a.attname END AS obj,
+           jsonb_build_object(
+             'attnum',       a.attnum,
+             'dropped',      a.attisdropped,
+             'type',         CASE WHEN a.attisdropped THEN '<dropped>'
+                                  ELSE pg_catalog.format_type(a.atttypid, a.atttypmod) END,
+             'notnull',      a.attnotnull,
+             'identity',     a.attidentity,
+             'generated',    a.attgenerated,
+             'ndims',        a.attndims,
+             'islocal',      a.attislocal,
+             'inhcount',     a.attinhcount,
+             'collation',    COALESCE((SELECT cl.collname FROM pg_catalog.pg_collation cl
+                                        WHERE cl.oid = a.attcollation), '<none>'),
+             'default',      COALESCE(pg_catalog.pg_get_expr(ad.adbin, ad.adrelid), '<none>'),
+             'has_missing',  a.atthasmissing,
+             'missing_val',  COALESCE(a.attmissingval::text, '<none>')
+           ) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_attribute a ON a.attrelid = i.relid AND a.attnum > 0
+      LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+),
+con AS (
+    SELECT i.side, 'constraint'::text AS cat, k.conname AS obj,
+           jsonb_build_object(
+             'contype',     k.contype,
+             'definition',  pg_catalog.pg_get_constraintdef(k.oid),
+             'validated',   k.convalidated,
+             'deferrable',  k.condeferrable,
+             'deferred',    k.condeferred,
+             'columns',     COALESCE((SELECT pg_catalog.string_agg(at.attname, ',' ORDER BY o.ord)
+                                        FROM pg_catalog.unnest(k.conkey) WITH ORDINALITY AS o(attnum, ord)
+                                        JOIN pg_catalog.pg_attribute at
+                                          ON at.attrelid = k.conrelid AND at.attnum = o.attnum), '<none>'),
+             'index',       COALESCE((SELECT ci.relname FROM pg_catalog.pg_class ci
+                                       WHERE ci.oid = k.conindid), '<none>')
+           ) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_constraint k ON k.conrelid = i.relid
+),
+idx_names AS (
+    SELECT i.side, i.nsp, x.relname AS obj
+      FROM ident i
+      JOIN pg_catalog.pg_index ix ON ix.indrelid = i.relid
+      JOIN pg_catalog.pg_class x ON x.oid = ix.indexrelid
+    UNION
+    SELECT i.side, i.nsp, cand.nm
+      FROM ident i
+      CROSS JOIN (VALUES ('tenancy_backfill_checkpoints_completed_key'),
+                         ('idx_tenancy_backfill_checkpoints_tranche')) AS cand(nm)
+     WHERE pg_catalog.to_regclass(pg_catalog.quote_ident(i.nsp) || '.' || pg_catalog.quote_ident(cand.nm))
+           IS NOT NULL
+),
+idx AS (
+    SELECT n.side, 'index'::text AS cat, n.obj,
+           jsonb_build_object(
+             'holder_kind',   COALESCE(hc.relkind::text, '<absent>'),
+             'access_method', COALESCE(am.amname, '<none>'),
+             'owner',         COALESCE(pg_catalog.pg_get_userbyid(hc.relowner), '<none>'),
+             'definition',    COALESCE(pg_catalog.pg_get_indexdef(ix.indexrelid), '<none>'),
+             'unique',        COALESCE(ix.indisunique::text, '-'),
+             'primary',       COALESCE(ix.indisprimary::text, '-'),
+             'valid',         COALESCE(ix.indisvalid::text, '-'),
+             'ready',         COALESCE(ix.indisready::text, '-'),
+             'live',          COALESCE(ix.indislive::text, '-'),
+             'immediate',     COALESCE(ix.indimmediate::text, '-'),
+             'replident',     COALESCE(ix.indisreplident::text, '-'),
+             'keyatts',       COALESCE(ix.indnkeyatts::text, '-'),
+             'totalatts',     COALESCE(ix.indnatts::text, '-'),
+             'nulls_not_distinct', COALESCE(ix.indnullsnotdistinct::text, '-')
+           ) AS props
+      FROM idx_names n
+      LEFT JOIN pg_catalog.pg_class hc
+             ON hc.oid = pg_catalog.to_regclass(pg_catalog.quote_ident(n.nsp) || '.' || pg_catalog.quote_ident(n.obj))
+      LEFT JOIN pg_catalog.pg_index ix ON ix.indexrelid = hc.oid
+      LEFT JOIN pg_catalog.pg_am am ON am.oid = hc.relam
+),
+trg AS (
+    SELECT i.side, 'trigger'::text AS cat, tg.tgname AS obj,
+           jsonb_build_object('definition', pg_catalog.pg_get_triggerdef(tg.oid),
+                              'enabled',    tg.tgenabled) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = i.relid AND NOT tg.tgisinternal
+),
+pol AS (
+    SELECT i.side, 'policy'::text AS cat, p.polname AS obj,
+           jsonb_build_object(
+             'command',    p.polcmd,
+             'permissive', p.polpermissive,
+             'roles',      COALESCE((SELECT pg_catalog.string_agg(pg_catalog.pg_get_userbyid(r), ',' ORDER BY r)
+                                       FROM pg_catalog.unnest(p.polroles) AS r), '<public>'),
+             'using',      COALESCE(pg_catalog.pg_get_expr(p.polqual, p.polrelid), '<none>'),
+             'check',      COALESCE(pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid), '<none>')
+           ) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_policy p ON p.polrelid = i.relid
+),
+rul AS (
+    SELECT i.side, 'rule'::text AS cat, r.rulename AS obj,
+           jsonb_build_object('definition', pg_catalog.pg_get_ruledef(r.oid),
+                              'enabled',    r.ev_enabled,
+                              'event',      r.ev_type,
+                              'instead',    r.is_instead) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_rewrite r ON r.ev_class = i.relid
+),
+inh AS (
+    SELECT i.side, 'inheritance'::text AS cat, 'parent ' || p.relname AS obj,
+           jsonb_build_object('seqno', h.inhseqno) AS props
+      FROM ident i
+      JOIN pg_catalog.pg_inherits h ON h.inhrelid = i.relid
+      JOIN pg_catalog.pg_class p ON p.oid = h.inhparent
+    UNION ALL
+    SELECT i.side, 'inheritance'::text, 'child ' || ch.relname,
+           jsonb_build_object('seqno', h.inhseqno)
+      FROM ident i
+      JOIN pg_catalog.pg_inherits h ON h.inhparent = i.relid
+      JOIN pg_catalog.pg_class ch ON ch.oid = h.inhrelid
+),
+raw AS (
+    SELECT * FROM rel UNION ALL SELECT * FROM col UNION ALL SELECT * FROM con
+    UNION ALL SELECT * FROM idx UNION ALL SELECT * FROM trg UNION ALL SELECT * FROM pol
+    UNION ALL SELECT * FROM rul UNION ALL SELECT * FROM inh
+),
+fp AS (
+    SELECT r.side, r.cat, r.obj,
+           (SELECT jsonb_object_agg(
+                     e.key,
+                     to_jsonb(pg_catalog.regexp_replace(
+                                pg_catalog.regexp_replace(
+                                pg_catalog.regexp_replace(
+                                  CASE jsonb_typeof(e.value) WHEN 'string' THEN e.value #>> '{}'
+                                                             ELSE e.value::text END,
+                                  '\m' || i.rel || '\M', '<TARGET>', 'g'),
+                                '\m' || i.nsp || '\M', '<SCHEMA>', 'g'),
+                              '\mpg_temp\M', '<SCHEMA>', 'g')))
+              FROM jsonb_each(r.props) AS e) AS props
+      FROM raw r
+      JOIN ident i ON i.side = r.side
+),
+live_fp AS (SELECT cat, obj, props FROM fp WHERE side = 'live'),
+ref_fp  AS (SELECT cat, obj, props FROM fp WHERE side = 'reference'),
+joined AS (
+    SELECT COALESCE(l.cat, rf.cat) AS cat, COALESCE(l.obj, rf.obj) AS obj,
+           l.props AS live_props, rf.props AS ref_props
+      FROM live_fp l FULL OUTER JOIN ref_fp rf ON rf.cat = l.cat AND rf.obj = l.obj
+),
+lines AS (
+    SELECT pg_catalog.format('missing:    %s %s', j.cat, j.obj) AS line
+      FROM joined j
+     WHERE j.live_props IS NULL
+       AND NOT ($3 AND j.cat = 'index'
+                    AND j.obj IN ('tenancy_backfill_checkpoints_completed_key',
+                                  'idx_tenancy_backfill_checkpoints_tranche'))
+    UNION ALL
+    SELECT pg_catalog.format('unexpected: %s %s', j.cat, j.obj)
+      FROM joined j
+     WHERE j.ref_props IS NULL
+    UNION ALL
+    SELECT pg_catalog.format('differs:    %s %s %s: reference=%s live=%s',
+                             j.cat, j.obj, e.key,
+                             COALESCE(j.ref_props ->> e.key, '<absent>'),
+                             COALESCE(j.live_props ->> e.key, '<absent>'))
+      FROM joined j
+      CROSS JOIN LATERAL jsonb_each(j.ref_props || j.live_props) AS e
+     WHERE j.live_props IS NOT NULL AND j.ref_props IS NOT NULL
+       AND (j.ref_props ->> e.key) IS DISTINCT FROM (j.live_props ->> e.key)
+)
+-- Aggregated here, not by the caller: `EXECUTE ... INTO` binds only the FIRST
+-- row of a multi-row result, which would silently report one difference and
+-- hide the rest.
+SELECT pg_catalog.string_agg(line, pg_catalog.chr(10) ORDER BY line) FROM lines
+$ckdiff$;
+
+    live_oid OID;
+    ref_oid OID;
+    live_kind "char";
+    live_persistence "char";
+    diffs TEXT;
+    privileges TEXT;
+    saved_search_path TEXT;
+    live_has_rows BOOLEAN;
+    live_is_stamped BOOLEAN;
     occupied TEXT;
 BEGIN
     -- Ten ownership columns.
@@ -193,559 +493,283 @@ BEGIN
             USING ERRCODE = 'duplicate_object';
     END IF;
 
-    -- The checkpoint protocol table.
+    -- ── The checkpoint protocol table: COMPARED, never enumerated ───────────
     --
-    -- `CREATE TABLE IF NOT EXISTS` adopts exactly as silently as `ADD COLUMN IF
-    -- NOT EXISTS` does, and this is the worst object in the tranche to adopt:
-    -- skipping the CREATE also skips every CHECK inside it, so a pre-existing
-    -- table of this name enforces neither the `status` vocabulary, nor the
-    -- `tranche` vocabulary, nor `rows_backfilled <= rows_total`, nor
-    -- `COMPLETED => blocking_count = 0`, nor `COMPLETED => rows_backfilled =
-    -- rows_total`. A forged or merely malformed COMPLETED row then satisfies
-    -- FINALIZE_PRECONDITION -- the one piece of evidence FINALIZE trusts before
-    -- it validates constraints over data nobody backfilled.
+    -- Six review rounds and about two dozen findings preceded this block, and
+    -- every one was the same defect: the guard enumerated axes, and a reviewer
+    -- found an axis it did not enumerate.  CHECK expressions, then
+    -- `convalidated`, then schema qualification, then index shape, then
+    -- `indrelid`, then column types, then defaults, then the primary key, then
+    -- ordinal position, then the column SET, then expression index keys, then
+    -- the primary key's NAME, then the CHECK set, then generated columns, then
+    -- triggers, then non-index occupants of an index name.
     --
-    -- Checked by SHAPE rather than by the provenance marker used above, and the
-    -- difference is deliberate. The marker exists because dropping a column
-    -- destroys data, so this migration must know whose column it is; this table
-    -- is never dropped by rollback/0032 at all, so adopting it destroys
-    -- nothing. What adoption costs here is the constraints, and those are
-    -- exactly what shape can see. The table also already carries a documented
-    -- `COMMENT ON TABLE`, which a marker would have to overwrite.
+    -- Enumeration cannot terminate, because the set of ways a table can differ
+    -- is open.  So this stops enumerating and COMPARES: it builds a canonical
+    -- reference from the very DDL that builds the real table, and diffs the
+    -- occupant against it in both directions.  An axis nobody has thought of is
+    -- covered because it is present on one side and absent from the other, not
+    -- because somebody remembered to check it.
     --
-    -- Ownership is checked alongside, for the same reason it is checked above:
-    -- an object this migration cannot vouch for is not this migration's.
-    SELECT pg_catalog.string_agg(missing.what, ', ' ORDER BY missing.what)
-      INTO occupied
-      FROM (
-            -- Compared by EXPRESSION, not by name.
-            --
-            -- Codex, P1 on 9a6c279: matching `contype` and `conname` alone
-            -- establishes none of the invariants this guard exists to protect.
-            -- Seven constraints carrying these exact names and defined as
-            -- `CHECK (true)` satisfied a name-only test, `CREATE TABLE IF NOT
-            -- EXISTS` adopted the table, and a forged COMPLETED row still
-            -- reached FINALIZE. That is identity-by-name at an eighth object
-            -- kind, and the tranche's rule is that identity is by shape.
-            --
-            -- The right-hand sides are PostgreSQL's own normalised rendering,
-            -- read back out of `pg_get_expr` after this migration builds the
-            -- table -- not the source text above, which deparses differently.
-            -- Exact comparison is pinned to pg16, the only version in compose
-            -- and CI, exactly as `IndexPredicate::Exactly` already is. A major
-            -- upgrade that changed deparse output would fail closed here, with
-            -- a spurious refusal naming the constraint, rather than silently
-            -- passing.
-            SELECT pg_catalog.format('CHECK %s is missing or does not match', expected.con) AS what
-              FROM (VALUES
-                      ('tenancy_backfill_checkpoints_status_ck',
-                       '(status = ANY (ARRAY[''IN_PROGRESS''::text, ''COMPLETED''::text, ''ABANDONED''::text]))'),
-                      ('tenancy_backfill_checkpoints_tranche_ck',
-                       '(tranche = ANY (ARRAY[''TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN''::text, ''TRANCHE_2_SESSIONS''::text, ''TRANCHE_3_MEMORIES''::text, ''TRANCHE_4_LINEAGE_AND_ARCHIVAL''::text, ''TRANCHE_5_OPERATIONS''::text, ''FINAL_CONSTRAINT_TIGHTENING''::text]))'),
-                      ('tenancy_backfill_checkpoints_completed_shape_ck',
-                       '((status = ''COMPLETED''::text) = (completed_at IS NOT NULL))'),
-                      ('tenancy_backfill_checkpoints_completed_cursor_ck',
-                       '((status <> ''COMPLETED''::text) OR (resume_cursor IS NULL))'),
-                      ('tenancy_backfill_checkpoints_counts_ck',
-                       '((rows_total >= 0) AND (rows_backfilled >= 0) AND (blocking_count >= 0) AND (rows_backfilled <= rows_total))'),
-                      ('tenancy_backfill_checkpoints_completed_clean_ck',
-                       '((status <> ''COMPLETED''::text) OR (blocking_count = 0))'),
-                      ('tenancy_backfill_checkpoints_completed_accounting_ck',
-                       '((status <> ''COMPLETED''::text) OR (rows_backfilled = rows_total))')
-                   ) AS expected(con, expr)
-             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
-               AND NOT EXISTS (
-                     SELECT 1
-                       FROM pg_catalog.pg_constraint k
-                      WHERE k.conrelid =
-                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                        AND k.contype  = 'c'
-                        AND k.conname  = expected.con
-                        AND pg_catalog.pg_get_expr(k.conbin, k.conrelid) = expected.expr
-                        -- Codex, on 1f5cdda: the expressions match even when the
-                        -- constraint was added NOT VALID after malformed rows were
-                        -- already in the table, so `convalidated` is what makes this
-                        -- an assertion about the DATA and not just about the schema.
-                        -- 0032 declares these inline in CREATE TABLE, where they are
-                        -- always validated, so requiring it costs a clean apply nothing.
-                        AND k.convalidated)
+    -- Two things a reference cannot legitimately speak to get explicit policies
+    -- instead: PRIVILEGES (ALTER DEFAULT PRIVILEGES can grant on the reference
+    -- too, so a reference-versus-live comparison would be unsound) and the
+    -- AUTHENTICITY OF EXISTING ROWS (no schema comparison can establish that).
 
-            UNION ALL
+    -- Serialise concurrent runs.  Transaction-scoped, and it covers what the
+    -- table lock cannot: when the table does not exist there is nothing to
+    -- LOCK, and two sessions would race between the existence probe and the
+    -- bare CREATE.
+    --
+    -- Key allocation -- fixed literals rather than hashtext(), so a collision is
+    -- auditable rather than opaque:
+    --     1095979598 = 0x4145_4F4E  'AEON'  -- namespace for this repository
+    --        3276801 = 0x0032_0001          -- migration 0032, object 1
+    PERFORM pg_catalog.pg_advisory_xact_lock(1095979598, 3276801);
 
-            -- The declared columns, their types and their nullability.
-            --
-            -- Codex, on c54889e: comparing only the CHECK constraints left the
-            -- COLUMNS unchecked, and `CREATE TABLE IF NOT EXISTS` skips the whole
-            -- declaration -- so a table carrying all seven validated CHECKs but
-            -- with `rows_total` nullable, or without `updated_at`, was adopted and
-            -- the NOT NULLs this protocol depends on silently never existed. The
-            -- CHECKs cannot substitute: every one of them is written to tolerate
-            -- NULL, so `rows_backfilled <= rows_total` says nothing when either
-            -- side is NULL.
-            --
-            -- Found from this repository's own test fixture, which is the
-            -- uncomfortable part: the positive control asserting that a
-            -- correctly-shaped occupant is ACCEPTED was built with nearly every
-            -- protocol column nullable, and it passed.
-            SELECT pg_catalog.format('column %s is missing or not %s %s',
-                                     expected.col, expected.typ,
-                                     CASE WHEN expected.must_be_notnull THEN 'NOT NULL'
-                                          ELSE 'NULL-able' END)
-              FROM (VALUES
-                      ('id',              'uuid',                     true),
-                      ('tranche',         'text',                     true),
-                      ('contract_digest', 'text',                     true),
-                      ('status',          'text',                     true),
-                      ('resume_cursor',   'text',                     false),
-                      ('rows_total',      'bigint',                   true),
-                      ('rows_backfilled', 'bigint',                   true),
-                      ('blocking_count',  'bigint',                   true),
-                      ('started_at',      'timestamp with time zone', true),
-                      ('updated_at',      'timestamp with time zone', true),
-                      ('completed_at',    'timestamp with time zone', false)
-                   ) AS expected(col, typ, must_be_notnull)
-             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
-               AND NOT EXISTS (
-                     SELECT 1
-                       FROM pg_catalog.pg_attribute a
-                      WHERE a.attrelid =
-                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                        AND a.attname   = expected.col
-                        AND a.attnum    > 0
-                        AND NOT a.attisdropped
-                        AND pg_catalog.format_type(a.atttypid, a.atttypmod) = expected.typ
-                        AND a.attnotnull = expected.must_be_notnull)
+    live_oid := pg_catalog.to_regclass('public.tenancy_backfill_checkpoints');
 
-            UNION ALL
+    IF live_oid IS NOT NULL THEN
+        -- Kind check BEFORE the lock, not after: LOCK TABLE on a view or a
+        -- sequence fails with a message about the wrong problem, and a
+        -- partitioned table would take a very different lock.
+        SELECT c.relkind, c.relpersistence
+          INTO live_kind, live_persistence
+          FROM pg_catalog.pg_class c
+         WHERE c.oid = live_oid;
 
-            -- The ordered presence of those columns.
-            --
-            -- Closure audit on 6f2311a: the arm above proves each column exists
-            -- with the right type and nullability, but not that it sits where
-            -- this migration puts it. Ordinal position is part of the declared
-            -- shape -- `INSERT INTO tenancy_backfill_checkpoints VALUES (...)`
-            -- with no column list binds by position, and so does any `SELECT *`
-            -- consumer -- so a table carrying the same eleven columns in a
-            -- different order is a different table.
-            --
-            -- Fires only when the column exists; a missing one is already
-            -- reported by the arm above, and reporting it twice would bury the
-            -- actual fault.
-            SELECT pg_catalog.format('column %s is at ordinal position %s, not %s',
-                                     expected.col, observed.attnum, expected.ord)
-              FROM (VALUES
-                      ('id', 1), ('tranche', 2), ('contract_digest', 3),
-                      ('status', 4), ('resume_cursor', 5), ('rows_total', 6),
-                      ('rows_backfilled', 7), ('blocking_count', 8),
-                      ('started_at', 9), ('updated_at', 10), ('completed_at', 11)
-                   ) AS expected(col, ord)
-              JOIN pg_catalog.pg_attribute observed
-                ON observed.attrelid =
-                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-               AND observed.attname = expected.col
-               AND observed.attnum > 0
-               AND NOT observed.attisdropped
-             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
-               AND observed.attnum <> expected.ord
+        IF live_kind <> 'r' OR live_persistence <> 'p' THEN
+            RAISE EXCEPTION
+                'public.tenancy_backfill_checkpoints exists but is not an ordinary '
+                'permanent table (relkind=%, relpersistence=%). This migration will not '
+                'adopt it and will not lock it. Nothing has been changed.',
+                live_kind, live_persistence
+                USING ERRCODE = 'duplicate_table';
+        END IF;
 
-            UNION ALL
+        -- Held for the rest of the transaction, so the occupant cannot change
+        -- shape between the fingerprint, the decision, the index repair and the
+        -- re-fingerprint.  rollback/0032 takes SHARE ROW EXCLUSIVE on this same
+        -- table; nothing in this tranche takes the two in the opposite order.
+        LOCK TABLE public.tenancy_backfill_checkpoints IN ACCESS EXCLUSIVE MODE;
 
-            -- No column the contract does not declare.
-            --
-            -- Codex P1 and CodeRabbit, both independently on 2a68a78: every arm
-            -- above asks "is each declared column present and correct" and none
-            -- asks "are these the ONLY columns". A twelfth column leaves
-            -- ordinals 1-11 untouched, so the ordinal arm passes too, and
-            -- `CREATE TABLE IF NOT EXISTS` adopts the table.
-            --
-            -- Reproduced: a twelfth `foreign_required TEXT NOT NULL` with no
-            -- default is adopted, and then every checkpoint write fails, because
-            -- the protocol's writers use named column lists that cannot mention
-            -- a column they do not know about. Migration 0032 is recorded as
-            -- applied over a table on which the protocol cannot record anything.
-            --
-            -- Stated as set difference in this direction only: extra columns.
-            -- Missing ones are the first column arm's finding, and duplicating
-            -- them here would report the same fault twice.
-            SELECT pg_catalog.format(
-                       'column %s is not declared by this migration (%s)',
-                       a.attname,
-                       CASE WHEN a.attnotnull AND ad.adbin IS NULL
-                            THEN 'NOT NULL with no default, so every checkpoint '
-                                 'insert would fail'
-                            ELSE 'undeclared' END)
-              FROM pg_catalog.pg_attribute a
-              LEFT JOIN pg_catalog.pg_attrdef ad
-                     ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-             WHERE a.attrelid =
-                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-               AND a.attnum > 0
-               AND NOT a.attisdropped
-               AND a.attname <> ALL (ARRAY[
-                     'id', 'tranche', 'contract_digest', 'status', 'resume_cursor',
-                     'rows_total', 'rows_backfilled', 'blocking_count',
-                     'started_at', 'updated_at', 'completed_at'])
+        -- The name may have been dropped and recreated between the probe above
+        -- and the lock being granted.  A different table wearing the same name
+        -- is not the table that was inspected.
+        IF pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+           IS DISTINCT FROM live_oid THEN
+            RAISE EXCEPTION
+                'public.tenancy_backfill_checkpoints was replaced while this migration '
+                'waited for its lock. Nothing has been changed; re-run.'
+                USING ERRCODE = 'duplicate_table';
+        END IF;
+    END IF;
 
-            UNION ALL
+    -- The canonical reference, built from the same DDL as the real table.
+    --
+    -- DISTINCTLY NAMED on purpose.  An identically named temp table would be
+    -- resolved before `public` by every unqualified reference for the rest of
+    -- the session, and making the comparison depend on the two names being
+    -- equal is precisely the fragility this block exists to remove.  The cost is
+    -- that the primary key can no longer be implicit -- PostgreSQL would derive
+    -- `<table>_pkey` and the two sides would disagree about its name -- which is
+    -- why the shared DDL below names every constraint explicitly.
+    --
+    -- ON COMMIT DROP is the cleanup proof: the reference cannot outlive this
+    -- transaction on any path, because a RAISE aborts the transaction and the
+    -- drop happens on abort exactly as it does on commit.
+    EXECUTE pg_catalog.format('CREATE TEMPORARY TABLE %I %s ON COMMIT DROP',
+                              'tenancy_backfill_checkpoints_reference', checkpoint_body);
+    EXECUTE pg_catalog.format(idx_completed_tmpl,
+                              'tenancy_backfill_checkpoints_completed_key',
+                              pg_catalog.quote_ident('tenancy_backfill_checkpoints_reference'));
+    EXECUTE pg_catalog.format(idx_tranche_tmpl,
+                              'idx_tenancy_backfill_checkpoints_tranche',
+                              pg_catalog.quote_ident('tenancy_backfill_checkpoints_reference'));
 
-            -- The column DEFAULTS, compared exactly.
-            --
-            -- Codex, P1 on 6f2311a: the arms above prove name, type,
-            -- nullability and position, and `CREATE TABLE IF NOT EXISTS` skips
-            -- the declaration wholesale -- so a table whose columns are all
-            -- correct but which carries none of the declared defaults is
-            -- adopted, and every insert relying on them fails. Not
-            -- hypothetical: this suite's own `insert_completed_checkpoint`
-            -- writes (tranche, contract_digest, status, rows_total,
-            -- rows_backfilled, blocking_count, completed_at) and leaves `id`,
-            -- `started_at` and `updated_at` to their defaults. All three are
-            -- NOT NULL, so on an adopted table without them the very first
-            -- checkpoint write raises 23502 and no completion can ever be
-            -- recorded.
-            --
-            -- The comparison runs BOTH ways. A column that should carry a
-            -- default and does not is the reported break; a column that should
-            -- carry none but does is equally a contract change, because a
-            -- surprise default silently substitutes a value where the protocol
-            -- expects the caller's -- `completed_at` defaulting to `now()`
-            -- would make every row satisfy the COMPLETED half of
-            -- `..._completed_shape_ck`. `IS DISTINCT FROM` catches both
-            -- directions in one predicate, and it is NULL-safe, which a plain
-            -- `<>` against a column with no default would not be.
-            --
-            -- Right-hand sides are PostgreSQL's own normalised rendering, read
-            -- back from `pg_attrdef` on pg16 after this migration builds the
-            -- table -- never the source text, which deparses differently
-            -- (`NOW()` below is stored as `now()`, and
-            -- `PRIMARY KEY DEFAULT gen_random_uuid()` as `gen_random_uuid()`).
-            -- Same pg16 pinning, and the same fail-closed behaviour on a
-            -- deparse change, as the CHECK arm above.
-            SELECT pg_catalog.format(
-                       'column %s carries default %s but this migration declares %s',
-                       expected.col,
-                       COALESCE(pg_catalog.quote_literal(observed.def), '<none>'),
-                       COALESCE(pg_catalog.quote_literal(expected.def), '<none>'))
-              FROM (VALUES
-                      ('id',              'gen_random_uuid()'),
-                      ('tranche',         NULL::text),
-                      ('contract_digest', NULL),
-                      ('status',          NULL),
-                      ('resume_cursor',   NULL),
-                      ('rows_total',      '0'),
-                      ('rows_backfilled', '0'),
-                      ('blocking_count',  '0'),
-                      ('started_at',      'now()'),
-                      ('updated_at',      'now()'),
-                      ('completed_at',    NULL)
-                   ) AS expected(col, def)
-              -- LATERAL rather than a scalar subquery so a column that does not
-              -- exist yields no row at all: its absence is the previous arms'
-              -- finding, not a default mismatch.
-              CROSS JOIN LATERAL (
-                    SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS def
-                      FROM pg_catalog.pg_attribute a
-                      LEFT JOIN pg_catalog.pg_attrdef d
-                             ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                     WHERE a.attrelid =
-                           pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                       AND a.attname = expected.col
-                       AND a.attnum > 0
-                       AND NOT a.attisdropped
-                   ) AS observed
-             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
-               AND observed.def IS DISTINCT FROM expected.def
+    ref_oid := pg_catalog.to_regclass(
+                   pg_catalog.quote_ident(
+                       pg_catalog.pg_my_temp_schema()::regnamespace::text)
+                   || '.tenancy_backfill_checkpoints_reference');
 
-            UNION ALL
-
-            -- The PRIMARY KEY, by catalog identity rather than by name.
-            --
-            -- CodeRabbit, blocking on 6f2311a: the guard filtered
-            -- `contype = 'c'` and so proved nothing about `contype = 'p'`.
-            -- `id UUID PRIMARY KEY` is declared inline in the CREATE TABLE
-            -- below, which `IF NOT EXISTS` skips entirely, so a table with all
-            -- eleven columns, all seven validated CHECKs and a correct
-            -- completion index but NO primary key -- or one keyed on another
-            -- column -- was adopted. `inventory.rs` declares
-            -- `primary_key("tenancy_backfill_checkpoints_pkey", &["id"])` as
-            -- part of this table's schema contract, so the contract required
-            -- exactly what the guard did not check.
-            --
-            -- Losing it is not cosmetic: `id` is this table's surrogate row
-            -- identity (`row_identity: SURROGATE_ID`), and without the unique
-            -- index behind it two checkpoint rows can share an id, after which
-            -- every by-id read of the completion evidence is ambiguous.
-            --
-            -- Checked as a constraint AND as the index behind it, because
-            -- either half can be wrong on its own: `conindid` is followed into
-            -- `pg_index` and required to be primary, unique, valid, ready,
-            -- total (`indpred IS NULL`) and non-expressional
-            -- (`indexprs IS NULL`) over exactly `id`. Non-deferrability is
-            -- required too -- a DEFERRABLE primary key stops enforcing until
-            -- commit, and inside a transaction is exactly where BACKFILL
-            -- writes.
-            SELECT pg_catalog.format(
-                       'the primary key is not this migration''s: expected a validated, '
-                       'non-deferrable PRIMARY KEY named tenancy_backfill_checkpoints_pkey '
-                       'on (id) whose backing index is primary, unique, valid, ready, total '
-                       'and non-expressional over exactly (id); found %s',
-                       COALESCE(
-                         (SELECT pg_catalog.format(
-                                   'constraint %s on (%s) validated=%s deferrable=%s '
-                                   'deferred=%s; index %s primary=%s unique=%s valid=%s '
-                                   'ready=%s over (%s) predicate=%s expressions=%s',
-                                   k.conname,
-                                   COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
-                                               FROM pg_catalog.unnest(k.conkey)
-                                                    WITH ORDINALITY AS o(attnum, ord)
-                                               JOIN pg_catalog.pg_attribute a
-                                                 ON a.attrelid = k.conrelid
-                                                AND a.attnum = o.attnum), '<none>'),
-                                   k.convalidated, k.condeferrable, k.condeferred,
-                                   COALESCE(k.conindid::regclass::text, '<none>'),
-                                   COALESCE(i.indisprimary::text, '-'),
-                                   COALESCE(i.indisunique::text, '-'),
-                                   COALESCE(i.indisvalid::text, '-'),
-                                   COALESCE(i.indisready::text, '-'),
-                                   COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
-                                               FROM pg_catalog.unnest(i.indkey::int2[])
-                                                    WITH ORDINALITY AS o(attnum, ord)
-                                               JOIN pg_catalog.pg_attribute a
-                                                 ON a.attrelid = i.indrelid
-                                                AND a.attnum = o.attnum), '<none>'),
-                                   COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
-                                   COALESCE((i.indexprs IS NOT NULL)::text, '-'))
-                            FROM pg_catalog.pg_constraint k
-                            LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
-                           WHERE k.conrelid =
-                                 pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                             AND k.contype = 'p'),
-                         'no primary key at all'))
-             WHERE pg_catalog.to_regclass('public.tenancy_backfill_checkpoints') IS NOT NULL
-               AND NOT EXISTS (
-                     SELECT 1
-                       FROM pg_catalog.pg_constraint k
-                       JOIN pg_catalog.pg_index i ON i.indexrelid = k.conindid
-                      WHERE k.conrelid =
-                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                        AND k.contype = 'p'
-                        -- Codex P2 on 2a68a78: the NAME is load-bearing here,
-                        -- which is the one place this tranche's "identity by
-                        -- shape, never by name" rule inverts. `inventory.rs`
-                        -- declares `primary_key("tenancy_backfill_checkpoints_pkey",
-                        -- &["id"])` and `audit.rs::verify_schema_contract` looks
-                        -- constraints up by `(table, name)`, so a renamed but
-                        -- otherwise perfect primary key is adopted here, version
-                        -- 32 is recorded, and the post-migration schema audit
-                        -- then reports contract drift against a schema nothing
-                        -- will fix. Shape identity is about not trusting a name;
-                        -- it does not license ignoring a name the contract
-                        -- itself specifies.
-                        AND k.conname = 'tenancy_backfill_checkpoints_pkey'
-                        AND k.convalidated
-                        AND NOT k.condeferrable
-                        AND NOT k.condeferred
-                        AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
-                               FROM pg_catalog.unnest(k.conkey)
-                                    WITH ORDINALITY AS o(attnum, ord)
-                               JOIN pg_catalog.pg_attribute a
-                                 ON a.attrelid = k.conrelid
-                                AND a.attnum = o.attnum) = 'id'
-                        -- The index half, bound to this table by OID for the
-                        -- same reason the completion index is: an index name is
-                        -- unique per schema, not per table.
-                        AND i.indrelid =
-                            pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                        AND i.indisprimary
-                        AND i.indisunique
-                        AND i.indisvalid
-                        AND i.indisready
-                        AND i.indpred IS NULL
-                        AND i.indexprs IS NULL
-                        AND (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY o.ord)
-                               FROM pg_catalog.unnest(i.indkey::int2[])
-                                    WITH ORDINALITY AS o(attnum, ord)
-                               JOIN pg_catalog.pg_attribute a
-                                 ON a.attrelid = i.indrelid
-                                AND a.attnum = o.attnum) = 'id')
-
-            UNION ALL
-
-            -- The partial unique index, by SHAPE.
-            --
-            -- Found by self-audit after Codex's P1, enumerating every
-            -- `IF NOT EXISTS` in the tranche and asking what identifies the
-            -- object. This one was checked for ownership and nothing else, and
-            -- it is not decorative: it is what makes "at most one authoritative
-            -- completion per tranche and digest" true, and its
-            -- `WHERE status = 'COMPLETED'` scoping is what keeps ABANDONED
-            -- history retained rather than overwritten. A non-unique occupant
-            -- lets two COMPLETED rows coexist, which is the evidence FINALIZE
-            -- reads; a total occupant blocks the ABANDONED history the rollback
-            -- deliberately keeps; different columns key it on the wrong thing.
-            SELECT pg_catalog.format(
-                       'index tenancy_backfill_checkpoints_completed_key is not the '
-                       'partial unique index this migration builds '
-                       '(on=%s indisunique=%s indisvalid=%s expressions=%s '
-                       'keyatts=%s totalatts=%s predicate=%L columns=%L)',
-                       i.indrelid::regclass, i.indisunique, i.indisvalid,
-                       (i.indexprs IS NOT NULL), i.indnkeyatts, i.indnatts,
-                       COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
-                       COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
-                                   FROM pg_catalog.unnest(i.indkey::int2[])
-                                        WITH ORDINALITY AS k(attnum, ord)
-                                   JOIN pg_catalog.pg_attribute a
-                                     ON a.attrelid = i.indrelid AND a.attnum = k.attnum),
-                                '<none>'))
-              FROM pg_catalog.pg_index i
-             WHERE i.indexrelid =
-                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints_completed_key')
-                 -- Codex, on c54889e: bound to the TABLE by OID, not merely to the
-                 -- index name. Index names are unique per schema, not per table, so
-                 -- a same-named index on some other relation that happens to carry
-                 -- (tranche, contract_digest, status) satisfied every other axis
-                 -- here, and `CREATE UNIQUE INDEX IF NOT EXISTS` then skipped the
-                 -- name -- leaving version 32 recorded with no uniqueness guarantee
-                 -- on the checkpoint table at all.
-               AND (i.indrelid IS DISTINCT FROM
-                    pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
-                    OR NOT i.indisunique
-                    -- An INVALID index enforces nothing, so it must never be
-                    -- adopted as the object that guarantees uniqueness. 0041's
-                    -- adoption branch already refuses INVALID for the same
-                    -- reason; note this is the opposite of the rollback guards,
-                    -- which deliberately ignore `indisvalid` so an interrupted
-                    -- concurrent build stays droppable. Adopting and dropping
-                    -- want different answers here.
-                    OR NOT i.indisvalid
-                    -- Codex P1 on 2a68a78: the column comparison below resolves
-                    -- `indkey` through an INNER join to `pg_attribute`, and an
-                    -- expression key is stored as attnum 0, which matches no
-                    -- attribute -- so the join silently DROPS it and a
-                    -- three-key index aggregates to the two names expected.
-                    -- Reproduced: a unique index on
-                    -- `(tranche, contract_digest, (id::text)) WHERE status =
-                    -- 'COMPLETED'` passed every check here and was adopted,
-                    -- after which two COMPLETED rows for the same tranche and
-                    -- digest coexist -- the exact guarantee this index exists
-                    -- to provide, and the evidence FINALIZE reads.
-                    --
-                    -- Counted rather than inferred from the aggregate:
-                    -- `indnkeyatts` is the number of KEY columns and `indnatts`
-                    -- the total, so requiring both to be 2 rejects an extra key
-                    -- column and an INCLUDE payload alike. `indexprs IS NULL`
-                    -- then makes the two keys ordinary columns rather than
-                    -- expressions, which is what lets the name comparison below
-                    -- mean what it appears to mean.
-                    OR i.indexprs IS NOT NULL
-                    OR i.indnkeyatts <> 2
-                    OR i.indnatts <> 2
-                    OR pg_catalog.pg_get_expr(i.indpred, i.indrelid)
-                       IS DISTINCT FROM '(status = ''COMPLETED''::text)'
-                    OR (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
-                          FROM pg_catalog.unnest(i.indkey::int2[])
-                               WITH ORDINALITY AS k(attnum, ord)
-                          JOIN pg_catalog.pg_attribute a
-                            ON a.attrelid = i.indrelid AND a.attnum = k.attnum)
-                       IS DISTINCT FROM 'tranche,contract_digest')
-
-            UNION ALL
-
-            SELECT pg_catalog.format('%s is owned by a role this migration cannot vouch for',
-                                     expected.rel)
-              FROM (VALUES
-                      ('tenancy_backfill_checkpoints'),
-                      ('tenancy_backfill_checkpoints_completed_key'),
-                      ('idx_tenancy_backfill_checkpoints_tranche')
-                   ) AS expected(rel)
-              JOIN pg_catalog.pg_class c
-                ON c.oid = pg_catalog.to_regclass(pg_catalog.format('public.%I', expected.rel))
-             WHERE NOT pg_catalog.pg_has_role(current_user, c.relowner, 'USAGE')
-           ) AS missing;
-
-    IF occupied IS NOT NULL THEN
+    IF ref_oid IS NULL THEN
         RAISE EXCEPTION
-            'tenancy_backfill_checkpoints already exists but is not the table this migration '
-            'creates: %. CREATE TABLE IF NOT EXISTS would adopt it, and adopting it skips '
-            'every CHECK this migration puts on it -- after which a COMPLETED row that no '
-            'backfill ever earned satisfies the FINALIZE precondition. Nothing has been '
-            'changed. Drop or rename the occupant, then re-run.',
-            occupied
+            'the canonical reference table could not be resolved after creation; this '
+            'migration cannot validate the checkpoint table without it. Nothing has '
+            'been changed.'
+            USING ERRCODE = 'internal_error';
+    END IF;
+
+    IF live_oid IS NULL THEN
+        -- Fresh creation.  No IF NOT EXISTS anywhere below: that primitive IS
+        -- the silent adoption this block exists to remove, and existence is
+        -- already known.  A colliding CREATE raises, which is the correct
+        -- outcome for a concurrent creator.
+        EXECUTE pg_catalog.format('CREATE TABLE public.%I %s',
+                                  'tenancy_backfill_checkpoints', checkpoint_body);
+        EXECUTE pg_catalog.format(idx_completed_tmpl,
+                                  'tenancy_backfill_checkpoints_completed_key',
+                                  'public.tenancy_backfill_checkpoints');
+        EXECUTE pg_catalog.format(idx_tranche_tmpl,
+                                  'idx_tenancy_backfill_checkpoints_tranche',
+                                  'public.tenancy_backfill_checkpoints');
+        live_oid := pg_catalog.to_regclass('public.tenancy_backfill_checkpoints');
+    ELSE
+        -- PASS 1.  Tolerant of exactly ONE thing: one of the two indexes this
+        -- migration owns resolving to nothing at all.  A table that is otherwise
+        -- exactly right is not refused merely because its migration-owned
+        -- indexes have not been built yet.  A wrong-shaped index, or a non-index
+        -- relation wearing either name, is a difference like any other.
+        saved_search_path := pg_catalog.current_setting('search_path', true);
+        PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+        EXECUTE checkpoint_diff_sql INTO diffs USING live_oid, ref_oid, TRUE;
+        PERFORM pg_catalog.set_config('search_path',
+                                      COALESCE(saved_search_path, ''), true);
+
+        IF diffs IS NOT NULL THEN
+            RAISE EXCEPTION
+                'public.tenancy_backfill_checkpoints exists but is not the table this '
+                'migration builds. It is compared against a canonical reference built '
+                'from this migration''s own DDL, so the list below is exhaustive rather '
+                'than a set of remembered checks:
+%
+Nothing has been changed. Drop or rename the occupant, then re-run.',
+                diffs
+                USING ERRCODE = 'duplicate_table';
+        END IF;
+
+        -- Repair, restricted BY NAME to the two indexes this migration owns.
+        -- Not "create whatever is missing": a general repair step would turn the
+        -- single tolerance above into a fresh adoption hole.
+        IF pg_catalog.to_regclass('public.tenancy_backfill_checkpoints_completed_key')
+           IS NULL THEN
+            EXECUTE pg_catalog.format(idx_completed_tmpl,
+                                      'tenancy_backfill_checkpoints_completed_key',
+                                      'public.tenancy_backfill_checkpoints');
+        END IF;
+        IF pg_catalog.to_regclass('public.idx_tenancy_backfill_checkpoints_tranche')
+           IS NULL THEN
+            EXECUTE pg_catalog.format(idx_tranche_tmpl,
+                                      'idx_tenancy_backfill_checkpoints_tranche',
+                                      'public.tenancy_backfill_checkpoints');
+        END IF;
+    END IF;
+
+    -- The ZERO-TOLERANCE comparison, on EVERY path including fresh creation.
+    --
+    -- Running it after our own CREATE is not redundant: it proves the DDL
+    -- actually produced the contract in `public`, rather than assuming it did.
+    -- A hostile search_path, a shadow schema or an event trigger rewriting DDL
+    -- all surface here, and this tranche has already shipped one fix for
+    -- exactly that class of capture.
+    --
+    -- search_path is saved and restored around the rendering, because
+    -- `pg_get_indexdef` and friends qualify names according to it.  SET LOCAL is
+    -- transaction-scoped rather than statement-scoped and cannot take a
+    -- parameter, so `set_config(..., true)` is used for both the set and the
+    -- restore.
+    saved_search_path := pg_catalog.current_setting('search_path', true);
+    PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+    EXECUTE checkpoint_diff_sql INTO diffs USING live_oid, ref_oid, FALSE;
+    PERFORM pg_catalog.set_config('search_path', COALESCE(saved_search_path, ''), true);
+
+    IF diffs IS NOT NULL THEN
+        RAISE EXCEPTION
+            'the checkpoint table does not match the contract this migration builds:
+%
+Nothing has been changed.',
+            diffs
             USING ERRCODE = 'duplicate_table';
     END IF;
+
+    -- PRIVILEGES, by absolute policy rather than by comparison.
+    --
+    -- The reference cannot serve as the standard here: ALTER DEFAULT PRIVILEGES
+    -- -- global, or scoped to a schema -- grants on newly created tables, so the
+    -- reference can acquire the very grants that ought to be refused, and the
+    -- two sides would agree while both were wrong.  The live object is therefore
+    -- held to an absolute rule: the only privileges permitted are the owner's
+    -- own, granted by the owner, not grantable onward.  A NULL acl (the
+    -- owner-implicit default) satisfies this trivially; PUBLIC appears as
+    -- grantee 0 and is refused.
+    SELECT pg_catalog.string_agg(p.line, E'\n' ORDER BY p.line)
+      INTO privileges
+      FROM (
+            SELECT pg_catalog.format(
+                       'privilege:  table grants %s to %s',
+                       a.privilege_type,
+                       CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                            ELSE pg_catalog.pg_get_userbyid(a.grantee) END) AS line
+              FROM pg_catalog.pg_class c
+              CROSS JOIN pg_catalog.aclexplode(c.relacl) AS a
+             WHERE c.oid = live_oid
+               AND NOT (a.grantee = c.relowner AND a.grantor = c.relowner
+                        AND NOT a.is_grantable)
+            UNION ALL
+            SELECT pg_catalog.format(
+                       'privilege:  column %s grants %s to %s',
+                       at.attname, a.privilege_type,
+                       CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                            ELSE pg_catalog.pg_get_userbyid(a.grantee) END)
+              FROM pg_catalog.pg_attribute at
+              JOIN pg_catalog.pg_class c ON c.oid = at.attrelid
+              CROSS JOIN pg_catalog.aclexplode(at.attacl) AS a
+             WHERE at.attrelid = live_oid AND at.attnum > 0 AND NOT at.attisdropped
+               AND NOT (a.grantee = c.relowner AND a.grantor = c.relowner
+                        AND NOT a.is_grantable)
+           ) AS p;
+
+    IF privileges IS NOT NULL THEN
+        RAISE EXCEPTION
+            'the checkpoint table carries privileges this migration does not grant. Only '
+            'the owner''s own, non-grantable privileges are permitted, because this table '
+            'holds the evidence FINALIZE reads:
+%
+Nothing has been changed. Revoke them, or drop the occupant, then re-run.',
+            privileges
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+
+    -- EXISTING ROWS.  Structure and privileges are settled by this point; what
+    -- remains is whether rows already in the table may be left in place.
+    --
+    -- WHAT THE STAMP IS: migration-idempotency provenance, and nothing else.  It
+    -- records that THIS migration created THIS table, so that re-running 0032
+    -- after BACKFILL has written real rows stays the no-op this file's
+    -- idempotency contract promises.
+    --
+    -- WHAT THE STAMP IS NOT: it is NOT evidence that the rows are authentic, and
+    -- must never be read as such.  A role able to create objects in `public` can
+    -- also write the comment, so a privileged actor can forge it -- the same
+    -- limitation already documented for the other three markers, where the
+    -- load-bearing control is PostgreSQL 15+ not granting CREATE on `public` to
+    -- PUBLIC rather than anything in this file.
+    --
+    -- FINALIZE's writer-authority requirements are SEPARATE and UNCHANGED.  This
+    -- stamp does not satisfy, weaken or substitute for any part of
+    -- FINALIZE_PRECONDITION, which continues to assert its own conditions over
+    -- checkpoint evidence independently of anything decided here.
+    EXECUTE 'SELECT EXISTS (SELECT 1 FROM public.tenancy_backfill_checkpoints)'
+       INTO live_has_rows;
+
+    IF live_has_rows THEN
+        SELECT pg_catalog.col_description(live_oid, a.attnum) IS NOT DISTINCT FROM
+               checkpoint_stamp
+          INTO live_is_stamped
+          FROM pg_catalog.pg_attribute a
+         WHERE a.attrelid = live_oid AND a.attname = 'id';
+
+        IF NOT COALESCE(live_is_stamped, FALSE) THEN
+            RAISE EXCEPTION
+                'public.tenancy_backfill_checkpoints already holds rows and does not carry '
+                'this migration''s idempotency stamp. Its structure matches, but this '
+                'migration did not create it, so the rows in it are checkpoint evidence of '
+                'unknown origin and FINALIZE reads exactly this table. Nothing has been '
+                'changed. Empty it, drop it, or rename it, then re-run.'
+                USING ERRCODE = 'duplicate_table';
+        END IF;
+    END IF;
 END $provenance_guard$;
-
--- ── The backfill checkpoint protocol table ──────────────────────────────────
--- Typed as `plan::TENANCY_BACKFILL_CHECKPOINTS`.  `agent_tenancy_migrations`
--- cannot serve this purpose: it has no tranche, no digest, no cursor and no
--- status, so a FINALIZE guard reading it would assert against the wrong
--- evidence and pass.
-CREATE TABLE IF NOT EXISTS public.tenancy_backfill_checkpoints (
-    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tranche         TEXT        NOT NULL,
-    contract_digest TEXT        NOT NULL,
-    status          TEXT        NOT NULL,
-    -- NULL once the tranche completes: there is nothing left to resume.
-    resume_cursor   TEXT,
-    rows_total      BIGINT      NOT NULL DEFAULT 0,
-    rows_backfilled BIGINT      NOT NULL DEFAULT 0,
-    blocking_count  BIGINT      NOT NULL DEFAULT 0,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at    TIMESTAMPTZ,
-    CONSTRAINT tenancy_backfill_checkpoints_status_ck
-        CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'ABANDONED')),
-    -- `tranche` is backed by the closed `plan::Tranche` enum exactly as `status`
-    -- is backed by `CheckpointStatus`, so it gets the same treatment.  Without
-    -- this, a one-character typo produces a row no guard will ever match: the
-    -- backfill reports success, FINALIZE keeps refusing, and nothing says why.
-    -- It fails closed, which is why this is a legibility fix rather than a
-    -- soundness one — but an unmatched checkpoint is a bad way to learn that.
-    CONSTRAINT tenancy_backfill_checkpoints_tranche_ck
-        CHECK (tranche IN (
-            'TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN',
-            'TRANCHE_2_SESSIONS',
-            'TRANCHE_3_MEMORIES',
-            'TRANCHE_4_LINEAGE_AND_ARCHIVAL',
-            'TRANCHE_5_OPERATIONS',
-            'FINAL_CONSTRAINT_TIGHTENING'
-        )),
-    -- A completion is the only state that carries a completion time, and it is
-    -- the only state with nothing left to resume.  Stating both structurally
-    -- stops a half-written row from reading as authoritative evidence.
-    CONSTRAINT tenancy_backfill_checkpoints_completed_shape_ck
-        CHECK ((status = 'COMPLETED') = (completed_at IS NOT NULL)),
-    CONSTRAINT tenancy_backfill_checkpoints_completed_cursor_ck
-        CHECK (status <> 'COMPLETED' OR resume_cursor IS NULL),
-    CONSTRAINT tenancy_backfill_checkpoints_counts_ck
-        CHECK (rows_total >= 0 AND rows_backfilled >= 0 AND blocking_count >= 0
-               AND rows_backfilled <= rows_total),
-    -- FINALIZE_PRECONDITION.max_blocking_count = 0 is the gate the whole
-    -- three-stage protocol exists to protect.  Enforcing it here as well means
-    -- a COMPLETED row cannot exist while the tranche still has blocking
-    -- findings, so the guard is not the only thing standing between a dirty
-    -- tranche and a validated constraint.
-    CONSTRAINT tenancy_backfill_checkpoints_completed_clean_ck
-        CHECK (status <> 'COMPLETED' OR blocking_count = 0),
-    -- A completion claims the tranche is finished, so its accounting has to say
-    -- so too.  Without this a row can read COMPLETED with 3 of 1000 rows done
-    -- and satisfy every other constraint.  The backfill command reconciles
-    -- rows_total against the final count before it completes.
-    CONSTRAINT tenancy_backfill_checkpoints_completed_accounting_ck
-        CHECK (status <> 'COMPLETED' OR rows_backfilled = rows_total)
-);
-
--- The partial scope is load-bearing and cannot be left implicit.  A plain
--- UNIQUE (tranche, contract_digest) would reject the second row an operator
--- creates when restarting a tranche against the same digest — but ABANDONED
--- exists precisely so the superseded attempt is retained rather than
--- overwritten.  Only WHERE status = 'COMPLETED' gives "at most one
--- authoritative completion" while leaving the history alone.
-CREATE UNIQUE INDEX IF NOT EXISTS tenancy_backfill_checkpoints_completed_key
-    ON public.tenancy_backfill_checkpoints (tranche, contract_digest)
-    WHERE status = 'COMPLETED';
-
-CREATE INDEX IF NOT EXISTS idx_tenancy_backfill_checkpoints_tranche
-    ON public.tenancy_backfill_checkpoints (tranche, started_at DESC);
 
 COMMENT ON TABLE public.tenancy_backfill_checkpoints IS
     'Per-tranche, per-contract backfill evidence (plan §4 step 4B). BACKFILL writes progress '
@@ -1206,4 +1230,24 @@ BEGIN
         EXECUTE pg_catalog.format('COMMENT ON TRIGGER %I ON public.%I IS %L',
                                   target.trg, target.tbl, marker);
     END LOOP;
+
+    -- The checkpoint table's idempotency stamp.
+    --
+    -- On the `id` COLUMN rather than the table, deliberately: the table already
+    -- carries a documented `COMMENT ON TABLE` that a stamp would have to
+    -- overwrite, and that prose is exactly why a marker was originally declined
+    -- for this object.  A column comment leaves it intact.
+    --
+    -- Duplicated verbatim from the guard block at the head of this file.  This
+    -- is idempotency provenance only: it says this migration created this
+    -- table, so a re-run over its own rows is a no-op.  It says NOTHING about
+    -- whether those rows are authentic -- a role that can create objects in
+    -- `public` can write this comment too -- and it neither satisfies nor
+    -- weakens any part of FINALIZE_PRECONDITION, which asserts its own
+    -- conditions over checkpoint evidence independently.
+    EXECUTE pg_catalog.format(
+        'COMMENT ON COLUMN public.tenancy_backfill_checkpoints.id IS %L',
+        'AEON tenancy tranche 1 (migration 0032). Idempotency stamp for the checkpoint '
+        'table: it records that this migration created this table, so that a re-run over '
+        'its own work is a no-op. It is NOT evidence that the rows are authentic.');
 END $provenance_stamp$;

@@ -3793,14 +3793,14 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_vacuous_checks(po
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     for named in [
-        "tenancy_backfill_checkpoints_status_ck is missing or does not match",
-        "tenancy_backfill_checkpoints_counts_ck is missing or does not match",
-        "tenancy_backfill_checkpoints_completed_accounting_ck is missing or does not match",
+        "tenancy_backfill_checkpoints_status_ck",
+        "tenancy_backfill_checkpoints_counts_ck",
+        "tenancy_backfill_checkpoints_completed_accounting_ck",
     ] {
         assert!(
-            message.contains(named),
-            "the refusal must name each constraint whose expression differs; \
-             '{named}' is absent from: {message}"
+            message.contains(&format!("differs:    constraint {named} definition")),
+            "the refusal must name every constraint whose expression differs, and \
+             {named} is absent from: {message}"
         );
     }
 
@@ -3856,9 +3856,8 @@ async fn the_prepare_migration_refuses_a_total_index_where_a_partial_one_belongs
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("tenancy_backfill_checkpoints_completed_key is not the partial unique")
-            && message.contains("<total>"),
-        "the refusal must name the index and say what shape it actually found: {message}"
+        message.contains("differs:    index tenancy_backfill_checkpoints_completed_key definition"),
+        "the refusal must report the index definition that differs: {message}"
     );
 }
 
@@ -4010,8 +4009,11 @@ async fn the_prepare_migration_refuses_checkpoint_checks_that_were_never_validat
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("tenancy_backfill_checkpoints_counts_ck is missing or does not match"),
-        "the refusal must name the unvalidated constraints: {message}"
+        message.contains(
+            "differs:    constraint tenancy_backfill_checkpoints_completed_clean_ck \
+             validated: reference=true live=false",
+        ),
+        "the refusal must report the unvalidated constraint: {message}"
     );
 
     // The row that would have reached FINALIZE is still there, still illegal.
@@ -4025,18 +4027,109 @@ async fn the_prepare_migration_refuses_checkpoint_checks_that_were_never_validat
     assert_eq!(forged, 1, "the occupant is refused, not repaired");
 }
 
-/// The same decoy with VALIDATED constraints is still accepted.
+/// The same decoy with VALIDATED constraints, and EMPTY, is still accepted.
 ///
-/// Pins the axis. Without this, the test above would keep passing even if the
-/// guard had started refusing every pre-existing table for an unrelated reason.
+/// Pins the axis. Without this, the tests above would keep passing even if the
+/// comparator had started refusing every pre-existing table for an unrelated
+/// reason -- which, against a whole-contract comparison, is a live risk rather
+/// than a theoretical one.
+///
+/// Emptied first, deliberately. The fixture seeds an honest row so that the
+/// NOT VALID variant has something for its constraints to be invalid against,
+/// and a structurally perfect but UNSTAMPED table holding rows is refused by
+/// the row gate -- see the test immediately below, which is the other half of
+/// this pair.
 #[sqlx::test(migrations = "./migrations")]
-async fn a_validated_equivalent_checkpoint_table_is_still_accepted(pool: PgPool) {
+async fn an_empty_equivalent_checkpoint_table_is_still_accepted(pool: PgPool) {
     unwind_to_pre_prepare(&pool).await;
     replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql("DELETE FROM public.tenancy_backfill_checkpoints")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     sqlx::raw_sql(PREPARE_UP_SQL)
         .execute(&pool)
         .await
-        .expect("a validated, correctly shaped table is this tranche's own and must be adopted");
+        .expect("an empty, contract-equivalent table must be adopted");
+}
+
+/// A contract-equivalent table that already holds rows, without this
+/// migration's stamp, must be refused.
+///
+/// New in round 7, and a deliberate behaviour change: before this, a
+/// structurally equivalent FOREIGN table containing rows was adopted, and its
+/// rows became checkpoint evidence that FINALIZE reads. Structure cannot
+/// establish where rows came from, so the row gate asks a different question --
+/// did this migration create this table?
+///
+/// The stamp answers only that question. It is idempotency provenance, not row
+/// authentication: a role that can create objects in `public` can write the
+/// comment too. It is checked here so that a re-run over this migration's OWN
+/// rows stays a no-op, which is the next test.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_non_empty_unstamped_checkpoint_table_is_refused(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+
+    // The fixture asserts its own contract equivalence, and it seeded one
+    // honest row, so structure cannot be what refuses this.
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.tenancy_backfill_checkpoints")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "the occupant must hold a row for this test to mean anything"
+    );
+    let stamp: Option<String> = sqlx::query_scalar(
+        "SELECT pg_catalog.col_description('public.tenancy_backfill_checkpoints'::regclass, \
+                (SELECT attnum FROM pg_attribute \
+                  WHERE attrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+                    AND attname = 'id')::int)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        stamp.is_none(),
+        "the foreign decoy must carry no stamp: {stamp:?}"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a structurally equivalent table whose rows it did not write",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("already holds rows and does not carry"),
+        "the refusal must say the rows are of unknown origin: {message}"
+    );
+}
+
+/// Re-running over this migration's OWN rows stays a no-op.
+///
+/// The other side of the row gate. Migration 0032 creates the table and stamps
+/// it, BACKFILL writes real checkpoint rows, and a later re-run must not refuse
+/// its own work -- that is the idempotency contract stated at the head of the
+/// file.
+#[sqlx::test(migrations = "./migrations")]
+async fn re_running_over_this_migrations_own_checkpoint_rows_is_a_no_op(pool: PgPool) {
+    // The suite's migrations have already run 0032, so the table is stamped.
+    insert_completed_checkpoint(&pool, "sha256:round-seven").await;
+
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&pool)
+        .await
+        .expect("a stamped table holding this migration's own rows must re-run cleanly");
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM public.tenancy_backfill_checkpoints")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "a no-op re-run must not disturb the rows");
 }
 
 /// An INVALID unique index enforces nothing and must not be adopted.
@@ -4065,7 +4158,10 @@ async fn the_prepare_migration_refuses_an_invalid_completion_index(pool: PgPool)
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("indisvalid=f"),
+        message.contains(
+            "differs:    index tenancy_backfill_checkpoints_completed_key valid: \
+             reference=true live=false",
+        ),
         "the refusal must report the validity it actually found: {message}"
     );
 }
@@ -4211,8 +4307,8 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_nullable_counts(p
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("column rows_total is missing or not bigint NOT NULL"),
-        "the refusal must name the column and the shape it wanted: {message}"
+        message.contains("differs:    column rows_total notnull: reference=true live=false"),
+        "the refusal must name the column and the axis that differs: {message}"
     );
 }
 
@@ -4374,9 +4470,8 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_without_a_primary_key(
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("the primary key is not this migration's")
-            && message.contains("no primary key at all"),
-        "the refusal must say the primary key is absent: {message}"
+        message.contains("missing:    constraint tenancy_backfill_checkpoints_pkey"),
+        "the refusal must report the primary key as missing: {message}"
     );
 }
 
@@ -4427,9 +4522,11 @@ async fn the_prepare_migration_refuses_a_wrong_shaped_primary_key(pool: PgPool) 
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("the primary key is not this migration's")
-            && message.contains("on (id,tranche)"),
-        "the refusal must report the columns it actually found: {message}"
+        message.contains(
+            "differs:    constraint tenancy_backfill_checkpoints_pkey columns: \
+             reference=id live=id,tranche",
+        ),
+        "the refusal must report the key columns it actually found: {message}"
     );
 }
 
@@ -4494,8 +4591,7 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_missing_a_default(pool
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("column started_at carries default <none>")
-            && message.contains("declares 'now()'"),
+        message.contains("differs:    column started_at default: reference=now() live=<none>"),
         "the refusal must name the column and both default states: {message}"
     );
 }
@@ -4533,7 +4629,7 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_a_forged_default(
     // message, escaped inner quotes and all -- comparing against the bare
     // rendering would never match.
     let observed: String = sqlx::query_scalar(
-        "SELECT pg_catalog.quote_literal(pg_catalog.pg_get_expr(d.adbin, d.adrelid)) \
+        "SELECT pg_catalog.pg_get_expr(d.adbin, d.adrelid) \
            FROM pg_attrdef d \
            JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
           WHERE d.adrelid = 'public.tenancy_backfill_checkpoints'::regclass \
@@ -4551,9 +4647,8 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_a_forged_default(
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("column started_at carries default")
-            && message.contains(&observed)
-            && message.contains("declares 'now()'"),
+        message.contains("differs:    column started_at default: reference=now() live=")
+            && message.contains(&observed),
         "the refusal must report the observed default ({observed}) and the expected one: {message}"
     );
 }
@@ -4628,7 +4723,7 @@ async fn the_prepare_migration_refuses_an_undeclared_checkpoint_column(pool: PgP
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("column foreign_required is not declared by this migration"),
+        message.contains("unexpected: column foreign_required"),
         "the refusal must name the undeclared column: {message}"
     );
 }
@@ -4704,8 +4799,11 @@ async fn the_prepare_migration_refuses_an_expression_keyed_completion_index(pool
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("expressions=t") && message.contains("keyatts=3"),
-        "the refusal must report the expression key and the key count: {message}"
+        message.contains(
+            "differs:    index tenancy_backfill_checkpoints_completed_key keyatts: \
+             reference=2 live=3",
+        ),
+        "the refusal must report the extra (expression) key: {message}"
     );
 }
 
@@ -4768,8 +4866,11 @@ async fn the_prepare_migration_refuses_a_completion_index_with_included_columns(
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("keyatts=2") && message.contains("totalatts=3"),
-        "the refusal must distinguish key columns from the payload: {message}"
+        message.contains(
+            "differs:    index tenancy_backfill_checkpoints_completed_key totalatts: \
+             reference=2 live=3",
+        ),
+        "the refusal must separate key columns from the INCLUDE payload: {message}"
     );
 }
 
@@ -4827,8 +4928,8 @@ async fn the_prepare_migration_refuses_a_renamed_primary_key(pool: PgPool) {
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("named tenancy_backfill_checkpoints_pkey")
-            && message.contains("zz_renamed_pkey"),
+        message.contains("missing:    constraint tenancy_backfill_checkpoints_pkey")
+            && message.contains("unexpected: constraint zz_renamed_pkey"),
         "the refusal must name both the required and the found constraint: {message}"
     );
 }
@@ -4878,8 +4979,9 @@ async fn the_prepare_migration_refuses_a_completion_index_on_another_table(pool:
     .await;
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
-        message.contains("on=zz_impostor"),
-        "the refusal must report the relation it actually found the index on: {message}"
+        message.contains("already exists"),
+        "with IF NOT EXISTS removed, a relation already holding the index name collides \
+         instead of being silently skipped: {message}"
     );
 }
 
@@ -4950,4 +5052,555 @@ async fn a_shadow_schema_cannot_capture_the_concurrent_index_builds(pool: PgPool
         .execute(&mut *conn)
         .await
         .expect("0041 must apply over builds that landed in public");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round 7: the whole-contract comparator.
+//
+// Every negative below starts from `replace_checkpoint_table_with_decoy`, which
+// asserts its own contract equivalence, and mutates exactly ONE property. The
+// refusal is therefore attributable to that property and not to some other way
+// the fixture failed to be equivalent -- the trap that hid the nullable-column
+// and primary-key holes in earlier rounds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Plant a decoy, apply one mutation, and assert the refusal names `expected`.
+async fn refuse_after(
+    pool: &PgPool,
+    mutation: &'static str,
+    expected: &str,
+    label: &str,
+) -> String {
+    unwind_to_pre_prepare(pool).await;
+    replace_checkpoint_table_with_decoy(pool, false).await;
+    sqlx::raw_sql("DELETE FROM public.tenancy_backfill_checkpoints")
+        .execute(pool)
+        .await
+        .unwrap();
+    // raw_sql, not query: several mutations below are multi-statement batches and
+    // a prepared statement cannot carry more than one command.
+    sqlx::raw_sql(mutation)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("the mutation must apply: {e}"));
+
+    let (code, message) = expect_refusal(pool, PREPARE_UP_SQL, label).await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains(expected),
+        "the refusal must report {expected:?}: {message}"
+    );
+    message
+}
+
+/// An undeclared CHECK constraint must be refused. (Codex P1 on `7d0733c`.)
+///
+/// The old guard looked its seven CHECKs up one way -- are the expected ones
+/// present -- so an eighth was invisible. `CHECK (false) NOT VALID` leaves the
+/// seven intact and rejects every subsequent insert, so 0032 records as applied
+/// over a table BACKFILL cannot write to.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_an_undeclared_check_constraint(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           ADD CONSTRAINT zz_extra CHECK (false) NOT VALID",
+        "unexpected: constraint zz_extra",
+        "0032 must refuse a checkpoint table carrying an undeclared CHECK",
+    )
+    .await;
+}
+
+/// A generated protocol column must be refused. (Codex P1 on `7d0733c`.)
+///
+/// `rows_total BIGINT GENERATED ALWAYS AS (0) STORED` deparses its generation
+/// expression as the expected default `0` and keeps name, type and nullability,
+/// so every axis the old guard checked agreed. The protocol supplies
+/// `rows_total` explicitly, and a generated column accepts only DEFAULT, so
+/// every checkpoint write fails.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_generated_protocol_column(pool: PgPool) {
+    let message = refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints DROP COLUMN rows_total; \
+         ALTER TABLE public.tenancy_backfill_checkpoints \
+           ADD COLUMN rows_total BIGINT GENERATED ALWAYS AS (0) STORED NOT NULL",
+        "differs:    column rows_total generated: reference= live=s",
+        "0032 must refuse a generated protocol column",
+    )
+    .await;
+    // Dropping and re-adding also moves the column and leaves a dropped slot;
+    // both are reported, which is the comparator being exhaustive rather than
+    // stopping at the first difference.
+    assert!(
+        message.contains("differs:    column rows_total attnum:"),
+        "the moved ordinal must be reported too: {message}"
+    );
+}
+
+/// An identity protocol column must be refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_an_identity_protocol_column(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints ALTER COLUMN rows_total DROP DEFAULT; \
+         ALTER TABLE public.tenancy_backfill_checkpoints \
+           ALTER COLUMN rows_total ADD GENERATED BY DEFAULT AS IDENTITY",
+        "differs:    column rows_total identity:",
+        "0032 must refuse an identity protocol column",
+    )
+    .await;
+}
+
+/// An undeclared user trigger must be refused. (Codex P1 on `7d0733c`.)
+///
+/// Nothing in the old guard read `pg_trigger` for this table, so a BEFORE INSERT
+/// trigger could rewrite an IN_PROGRESS write into a constraint-valid COMPLETED
+/// row and FINALIZE would accept evidence no backfill earned.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_an_undeclared_trigger(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE FUNCTION zz_forge() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ \
+           LANGUAGE plpgsql; \
+         CREATE TRIGGER zz_forge_trg BEFORE INSERT ON public.tenancy_backfill_checkpoints \
+           FOR EACH ROW EXECUTE FUNCTION zz_forge()",
+        "unexpected: trigger zz_forge_trg",
+        "0032 must refuse a checkpoint table carrying an undeclared trigger",
+    )
+    .await;
+}
+
+/// A row-security policy must be refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_row_security_policy(pool: PgPool) {
+    let message = refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints ENABLE ROW LEVEL SECURITY; \
+         CREATE POLICY zz_policy ON public.tenancy_backfill_checkpoints USING (true)",
+        "unexpected: policy zz_policy",
+        "0032 must refuse a checkpoint table carrying a policy",
+    )
+    .await;
+    assert!(
+        message.contains("differs:    relation self row_security: reference=false live=true"),
+        "the relation-level flag must be reported as well: {message}"
+    );
+}
+
+/// A rewrite rule must be refused, by definition and enabled state.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_rewrite_rule(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE RULE zz_rule AS ON DELETE TO public.tenancy_backfill_checkpoints \
+           DO INSTEAD NOTHING",
+        "unexpected: rule zz_rule",
+        "0032 must refuse a checkpoint table carrying a rewrite rule",
+    )
+    .await;
+}
+
+/// A table INHERITING FROM the checkpoint table must be refused.
+///
+/// Added because the mutation check found the `inheritance` category was not
+/// load-bearing, and then that the obvious test for it did not fix that: an
+/// occupant inheriting from a PARENT is already refused by the column category,
+/// because inheriting changes `attislocal` and `attinhcount` on the inherited
+/// columns.
+///
+/// A CHILD is the axis only `inheritance` can see. It changes no column of the
+/// checkpoint table at all, and it is not cosmetic: a child makes every
+/// unqualified `SELECT`/`UPDATE`/`DELETE` on this table also read and write the
+/// child's rows, so checkpoint evidence could come from a relation FINALIZE
+/// never looks at. PostgreSQL's own `relhassubclass` is deliberately NOT used
+/// for this -- it is sticky and is not reliably cleared when the child goes
+/// away, so it would produce false refusals.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_table_inheriting_from_the_checkpoint_table(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE TABLE public.zz_child () INHERITS (public.tenancy_backfill_checkpoints)",
+        "unexpected: inheritance child zz_child",
+        "0032 must refuse a checkpoint table that has an inheritance child",
+    )
+    .await;
+}
+
+/// A permuted column order must be refused.
+///
+/// No test covered this before round 7. Ordinal position is part of the shape:
+/// a positional `INSERT` and any `SELECT *` consumer bind to it.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_permuted_column_order(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints DROP COLUMN completed_at; \
+         ALTER TABLE public.tenancy_backfill_checkpoints ADD COLUMN completed_at TIMESTAMPTZ",
+        "differs:    column completed_at attnum:",
+        "0032 must refuse a checkpoint table whose columns are in another order",
+    )
+    .await;
+}
+
+/// A dropped column must be refused.
+///
+/// A dropped column still occupies its attnum and physical slot, and is evidence
+/// the occupant is not the table this migration builds.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_table_carrying_a_dropped_column(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints ADD COLUMN zz_temp TEXT; \
+         ALTER TABLE public.tenancy_backfill_checkpoints DROP COLUMN zz_temp",
+        "unexpected: column attnum 12",
+        "0032 must refuse a checkpoint table that carries a dropped column",
+    )
+    .await;
+}
+
+/// A mis-shaped tranche lookup index must be refused.
+///
+/// Newly compared in round 7 by owner ruling. Earlier rounds deliberately left
+/// this index ownership-checked only, on the reasoning that a mis-shaped
+/// occupant is a performance question; a whole-contract comparison does not
+/// carve out exceptions.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_mis_shaped_tranche_index(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE INDEX idx_tenancy_backfill_checkpoints_tranche \
+           ON public.tenancy_backfill_checkpoints (tranche)",
+        "differs:    index idx_tenancy_backfill_checkpoints_tranche keyatts: reference=2 live=1",
+        "0032 must refuse a mis-shaped tranche lookup index",
+    )
+    .await;
+}
+
+/// A non-default replica identity must be refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_changed_replica_identity(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "ALTER TABLE public.tenancy_backfill_checkpoints REPLICA IDENTITY FULL",
+        "differs:    relation self replica_identity: reference=d live=f",
+        "0032 must refuse a checkpoint table whose replica identity was changed",
+    )
+    .await;
+}
+
+/// A non-index relation squatting an index name must be refused.
+/// (Codex P1 on `7d0733c`.)
+///
+/// The old arm read `pg_index`, so a TABLE wearing the index name produced no
+/// row and the arm was vacuous. `holder_kind` compares what actually holds the
+/// name.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_non_index_squatting_the_completion_index_name(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE TABLE public.tenancy_backfill_checkpoints_completed_key (x int)",
+        "differs:    index tenancy_backfill_checkpoints_completed_key holder_kind: \
+         reference=i live=r",
+        "0032 must refuse a table squatting the completion index name",
+    )
+    .await;
+}
+
+/// The same, for the tranche lookup index name.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_comparator_refuses_a_non_index_squatting_the_tranche_index_name(pool: PgPool) {
+    refuse_after(
+        &pool,
+        "CREATE SEQUENCE public.idx_tenancy_backfill_checkpoints_tranche",
+        "differs:    index idx_tenancy_backfill_checkpoints_tranche holder_kind: \
+         reference=i live=S",
+        "0032 must refuse a sequence squatting the tranche index name",
+    )
+    .await;
+}
+
+/// The checkpoint stamp must be spelled identically in both places it appears.
+///
+/// It is declared in the guard block and written again by the stamping block at
+/// the foot of the file. SQL has no cross-statement constants and sqlx has no
+/// include mechanism, so there is nothing to share and drift is a one-character
+/// edit away -- and it fails in the worst direction: 0032 would stamp a string
+/// its own guard no longer recognises, so a legitimate re-run over its own rows
+/// would be refused as evidence of unknown origin.
+///
+/// Deliberately separate from `the_provenance_marker_is_identical_everywhere_it_
+/// appears`: this is a different string with a different meaning, and folding it
+/// into that test's `marker CONSTANT TEXT :=` parse is what would make either
+/// test ambiguous.
+#[test]
+fn the_checkpoint_stamp_is_identical_in_both_places() {
+    const STAMP_TAIL: &str =
+        "Idempotency stamp for the checkpoint table: it records that this migration \
+         created this table, so that a re-run over its own work is a no-op. It is NOT \
+         evidence that the rows are authentic.";
+
+    // The literal is wrapped across source lines in both places, so the
+    // comparison is on the distinguishing fragments rather than the whole.
+    for fragment in [
+        "AEON tenancy tranche 1 (migration 0032). Idempotency stamp for the checkpoint ",
+        "table: it records that this migration created this table, so that a re-run over ",
+        "its own work is a no-op. It is NOT evidence that the rows are authentic.",
+    ] {
+        assert_eq!(
+            PREPARE_UP_SQL.matches(fragment).count(),
+            2,
+            "the stamp fragment {fragment:?} must appear exactly twice -- once where the \
+             guard reads it and once where the stamping block writes it"
+        );
+    }
+
+    // And the assembled text is what this test claims it is, so a rename that
+    // updated both places but changed the meaning still shows up here.
+    assert!(
+        STAMP_TAIL.contains("NOT evidence that the rows are authentic"),
+        "the stamp must keep saying what it is not"
+    );
+}
+
+/// A non-table wearing the checkpoint name is refused BEFORE any lock is taken.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_view_wearing_the_checkpoint_name(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE VIEW public.tenancy_backfill_checkpoints AS SELECT 1 AS id",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a view wearing the checkpoint table's name",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("is not an ordinary permanent table (relkind=v"),
+        "the refusal must name the kind it found, before locking: {message}"
+    );
+}
+
+/// A grant to PUBLIC on the checkpoint table is refused.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_privilege_policy_refuses_a_table_grant_to_public(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "DELETE FROM public.tenancy_backfill_checkpoints; \
+         GRANT SELECT ON public.tenancy_backfill_checkpoints TO PUBLIC",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table granted to PUBLIC",
+    )
+    .await;
+    assert_eq!(code, "42501", "insufficient_privilege is the SQLSTATE");
+    assert!(
+        message.contains("privilege:  table grants SELECT to PUBLIC"),
+        "the refusal must name the privilege and the grantee: {message}"
+    );
+}
+
+/// A column-level grant is refused too.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_privilege_policy_refuses_a_column_grant(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "DELETE FROM public.tenancy_backfill_checkpoints; \
+         GRANT SELECT (tranche) ON public.tenancy_backfill_checkpoints TO PUBLIC",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a column-level grant on the checkpoint table",
+    )
+    .await;
+    assert!(
+        message.contains("privilege:  column tranche grants SELECT to PUBLIC"),
+        "the refusal must name the column, the privilege and the grantee: {message}"
+    );
+}
+
+/// GLOBAL default privileges are caught, on a table this migration creates itself.
+///
+/// This is why the privilege policy is absolute rather than a comparison against
+/// the reference. Nobody runs GRANT here: `ALTER DEFAULT PRIVILEGES` silently
+/// attaches the grant to every table the role subsequently creates -- including
+/// both the table 0032 builds AND the canonical reference it is compared
+/// against -- so a reference-versus-live comparison would find the two identical
+/// and pass while both carried a grant the contract never intended.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_privilege_policy_refuses_global_default_privileges(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO PUBLIC",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse when global default privileges grant on the table it creates",
+    )
+    .await;
+    assert_eq!(code, "42501", "insufficient_privilege is the SQLSTATE");
+    assert!(
+        message.contains("privilege:  table grants SELECT to PUBLIC"),
+        "the refusal must name the grant default privileges attached: {message}"
+    );
+}
+
+/// SCHEMA-SCOPED default privileges are caught by the same absolute policy.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_privilege_policy_refuses_schema_default_privileges(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO PUBLIC",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse when schema default privileges grant on the table it creates",
+    )
+    .await;
+    assert_eq!(code, "42501", "insufficient_privilege is the SQLSTATE");
+    assert!(
+        message.contains("privilege:  table grants SELECT to PUBLIC"),
+        "the refusal must name the grant default privileges attached: {message}"
+    );
+}
+
+/// The canonical reference leaves nothing behind -- checked in the SAME session.
+///
+/// This assertion is only meaningful on the connection that ran the migration.
+/// A temp schema is per-session, so querying `pg_temp%` from another pooled
+/// connection would inspect somebody else's namespace and pass trivially --
+/// exactly the kind of vacuous check this PR has spent six rounds removing.
+/// `pg_my_temp_schema()` binds the question to this backend.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_canonical_reference_is_cleaned_up_in_the_running_session(pool: PgPool) {
+    let mut conn = pool.acquire().await.unwrap();
+
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("a re-run over this migration's own work must succeed");
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c \
+          WHERE c.relnamespace = pg_my_temp_schema() AND c.relkind = 'r'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        left, 0,
+        "the reference must not survive a successful commit"
+    );
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION zz_cleanup_probe() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ \
+           LANGUAGE plpgsql; \
+         CREATE TRIGGER zz_cleanup_trg BEFORE INSERT ON public.tenancy_backfill_checkpoints \
+           FOR EACH ROW EXECUTE FUNCTION zz_cleanup_probe()",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect_err("the planted trigger must be refused");
+    sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.ok();
+
+    let after_refusal: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c \
+          WHERE c.relnamespace = pg_my_temp_schema() AND c.relkind = 'r'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        after_refusal, 0,
+        "the reference must not survive a refusal either"
+    );
+
+    let schemas: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_namespace \
+          WHERE nspname NOT LIKE 'pg\\_%' AND nspname NOT IN ('public', 'information_schema')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(schemas, 0, "no scratch schema may be left behind");
+}
+
+/// Two concurrent runs of 0032 must BOTH commit.
+///
+/// The second blocks on the advisory lock, then finds the table present,
+/// stamped and equivalent, and completes as a clean no-op.
+///
+/// Failure of either run is a test failure, deliberately: "one succeeded and the
+/// other errored" would be an alternative success condition that hides exactly
+/// the race this test exists to disprove.
+#[sqlx::test(migrations = "./migrations")]
+async fn two_concurrent_runs_of_the_prepare_migration_both_commit(pool: PgPool) {
+    // Both connections are reserved BEFORE either run starts. `#[sqlx::test]`'s
+    // pool is a child of one capped master pool, so acquiring lazily can starve
+    // the second task and turn a lock test into a pool test.
+    let mut first = pool.acquire().await.unwrap();
+    let mut second = pool.acquire().await.unwrap();
+
+    let (a, b) = tokio::join!(
+        async { sqlx::raw_sql(PREPARE_UP_SQL).execute(&mut *first).await },
+        async { sqlx::raw_sql(PREPARE_UP_SQL).execute(&mut *second).await },
+    );
+    a.expect("the first concurrent run must commit");
+    b.expect("the second must wait on the advisory lock, then complete as a no-op");
+
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class \
+          WHERE relname = 'tenancy_backfill_checkpoints' AND relkind = 'r'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tables, 1, "exactly one checkpoint table may exist");
+
+    let indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_index \
+          WHERE indrelid = 'public.tenancy_backfill_checkpoints'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes, 3,
+        "the primary key and both declared indexes, created exactly once"
+    );
 }
