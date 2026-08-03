@@ -350,6 +350,44 @@ BEGIN
 
             UNION ALL
 
+            -- No column the contract does not declare.
+            --
+            -- Codex P1 and CodeRabbit, both independently on 2a68a78: every arm
+            -- above asks "is each declared column present and correct" and none
+            -- asks "are these the ONLY columns". A twelfth column leaves
+            -- ordinals 1-11 untouched, so the ordinal arm passes too, and
+            -- `CREATE TABLE IF NOT EXISTS` adopts the table.
+            --
+            -- Reproduced: a twelfth `foreign_required TEXT NOT NULL` with no
+            -- default is adopted, and then every checkpoint write fails, because
+            -- the protocol's writers use named column lists that cannot mention
+            -- a column they do not know about. Migration 0032 is recorded as
+            -- applied over a table on which the protocol cannot record anything.
+            --
+            -- Stated as set difference in this direction only: extra columns.
+            -- Missing ones are the first column arm's finding, and duplicating
+            -- them here would report the same fault twice.
+            SELECT pg_catalog.format(
+                       'column %s is not declared by this migration (%s)',
+                       a.attname,
+                       CASE WHEN a.attnotnull AND ad.adbin IS NULL
+                            THEN 'NOT NULL with no default, so every checkpoint '
+                                 'insert would fail'
+                            ELSE 'undeclared' END)
+              FROM pg_catalog.pg_attribute a
+              LEFT JOIN pg_catalog.pg_attrdef ad
+                     ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+             WHERE a.attrelid =
+                   pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+               AND a.attname <> ALL (ARRAY[
+                     'id', 'tranche', 'contract_digest', 'status', 'resume_cursor',
+                     'rows_total', 'rows_backfilled', 'blocking_count',
+                     'started_at', 'updated_at', 'completed_at'])
+
+            UNION ALL
+
             -- The column DEFAULTS, compared exactly.
             --
             -- Codex, P1 on 6f2311a: the arms above prove name, type,
@@ -447,9 +485,9 @@ BEGIN
             -- writes.
             SELECT pg_catalog.format(
                        'the primary key is not this migration''s: expected a validated, '
-                       'non-deferrable PRIMARY KEY on (id) whose backing index is primary, '
-                       'unique, valid, ready, total and non-expressional over exactly (id); '
-                       'found %s',
+                       'non-deferrable PRIMARY KEY named tenancy_backfill_checkpoints_pkey '
+                       'on (id) whose backing index is primary, unique, valid, ready, total '
+                       'and non-expressional over exactly (id); found %s',
                        COALESCE(
                          (SELECT pg_catalog.format(
                                    'constraint %s on (%s) validated=%s deferrable=%s '
@@ -490,6 +528,19 @@ BEGIN
                       WHERE k.conrelid =
                             pg_catalog.to_regclass('public.tenancy_backfill_checkpoints')
                         AND k.contype = 'p'
+                        -- Codex P2 on 2a68a78: the NAME is load-bearing here,
+                        -- which is the one place this tranche's "identity by
+                        -- shape, never by name" rule inverts. `inventory.rs`
+                        -- declares `primary_key("tenancy_backfill_checkpoints_pkey",
+                        -- &["id"])` and `audit.rs::verify_schema_contract` looks
+                        -- constraints up by `(table, name)`, so a renamed but
+                        -- otherwise perfect primary key is adopted here, version
+                        -- 32 is recorded, and the post-migration schema audit
+                        -- then reports contract drift against a schema nothing
+                        -- will fix. Shape identity is about not trusting a name;
+                        -- it does not license ignoring a name the contract
+                        -- itself specifies.
+                        AND k.conname = 'tenancy_backfill_checkpoints_pkey'
                         AND k.convalidated
                         AND NOT k.condeferrable
                         AND NOT k.condeferred
@@ -534,8 +585,10 @@ BEGIN
             SELECT pg_catalog.format(
                        'index tenancy_backfill_checkpoints_completed_key is not the '
                        'partial unique index this migration builds '
-                       '(on=%s indisunique=%s indisvalid=%s predicate=%L columns=%L)',
+                       '(on=%s indisunique=%s indisvalid=%s expressions=%s '
+                       'keyatts=%s totalatts=%s predicate=%L columns=%L)',
                        i.indrelid::regclass, i.indisunique, i.indisvalid,
+                       (i.indexprs IS NOT NULL), i.indnkeyatts, i.indnatts,
                        COALESCE(pg_catalog.pg_get_expr(i.indpred, i.indrelid), '<total>'),
                        COALESCE((SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)
                                    FROM pg_catalog.unnest(i.indkey::int2[])
@@ -564,6 +617,28 @@ BEGIN
                     -- concurrent build stays droppable. Adopting and dropping
                     -- want different answers here.
                     OR NOT i.indisvalid
+                    -- Codex P1 on 2a68a78: the column comparison below resolves
+                    -- `indkey` through an INNER join to `pg_attribute`, and an
+                    -- expression key is stored as attnum 0, which matches no
+                    -- attribute -- so the join silently DROPS it and a
+                    -- three-key index aggregates to the two names expected.
+                    -- Reproduced: a unique index on
+                    -- `(tranche, contract_digest, (id::text)) WHERE status =
+                    -- 'COMPLETED'` passed every check here and was adopted,
+                    -- after which two COMPLETED rows for the same tranche and
+                    -- digest coexist -- the exact guarantee this index exists
+                    -- to provide, and the evidence FINALIZE reads.
+                    --
+                    -- Counted rather than inferred from the aggregate:
+                    -- `indnkeyatts` is the number of KEY columns and `indnatts`
+                    -- the total, so requiring both to be 2 rejects an extra key
+                    -- column and an INCLUDE payload alike. `indexprs IS NULL`
+                    -- then makes the two keys ordinary columns rather than
+                    -- expressions, which is what lets the name comparison below
+                    -- mean what it appears to mean.
+                    OR i.indexprs IS NOT NULL
+                    OR i.indnkeyatts <> 2
+                    OR i.indnatts <> 2
                     OR pg_catalog.pg_get_expr(i.indpred, i.indrelid)
                        IS DISTINCT FROM '(status = ''COMPLETED''::text)'
                     OR (SELECT pg_catalog.string_agg(a.attname, ',' ORDER BY k.ord)

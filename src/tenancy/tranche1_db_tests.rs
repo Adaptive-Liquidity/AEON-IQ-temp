@@ -4521,16 +4521,27 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_a_forged_default(
     .unwrap();
 
     // A default IS present, so nothing but an exact comparison can refuse it.
-    let present: bool = sqlx::query_scalar(
-        "SELECT count(*) > 0 FROM pg_attrdef d \
+    //
+    // Read back rather than assumed, and asserted against below instead of a
+    // hardcoded literal. CodeRabbit, on 2a68a78: `pg_get_expr` renders a
+    // timestamptz Const through that type's output function, which uses the
+    // session `TimeZone` -- so this same default renders `2000-01-01
+    // 00:00:00+00` under UTC and `1999-12-31 16:00:00-08` under
+    // America/Los_Angeles. Asserting the literal string would make the test
+    // pass or fail on the runner's timezone rather than on the guard.
+    // `quote_literal` because that is how the guard renders it into the
+    // message, escaped inner quotes and all -- comparing against the bare
+    // rendering would never match.
+    let observed: String = sqlx::query_scalar(
+        "SELECT pg_catalog.quote_literal(pg_catalog.pg_get_expr(d.adbin, d.adrelid)) \
+           FROM pg_attrdef d \
            JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
           WHERE d.adrelid = 'public.tenancy_backfill_checkpoints'::regclass \
             AND a.attname = 'started_at'",
     )
     .fetch_one(&pool)
     .await
-    .unwrap();
-    assert!(present, "the forged default must be present, not absent");
+    .expect("the forged default must be present, not absent");
 
     let (code, message) = expect_refusal(
         &pool,
@@ -4541,9 +4552,284 @@ async fn the_prepare_migration_refuses_a_checkpoint_table_with_a_forged_default(
     assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
     assert!(
         message.contains("column started_at carries default")
-            && message.contains("2000-01-01")
+            && message.contains(&observed)
             && message.contains("declares 'now()'"),
-        "the refusal must report observed and expected: {message}"
+        "the refusal must report the observed default ({observed}) and the expected one: {message}"
+    );
+}
+
+/// A column the contract does not declare must be refused.
+///
+/// Codex P1 and CodeRabbit, both independently on `2a68a78`. Every column arm
+/// asked whether each declared column is present and correct; none asked
+/// whether they are the ONLY columns. A twelfth column leaves ordinals 1-11
+/// untouched, so even the ordinal arm passes.
+///
+/// The break is total rather than partial: the protocol's writers use named
+/// column lists, so they cannot mention a column they do not know about, and a
+/// `NOT NULL` one with no default rejects every checkpoint insert. Migration 32
+/// is recorded as applied over a table the protocol cannot write to at all.
+///
+/// Mutation-checked by deleting only the undeclared-column arm.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_an_undeclared_checkpoint_column(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    // Added WITH a default and then stripped of it, because the decoy already
+    // holds a row and `ADD COLUMN ... NOT NULL` cannot backfill one without a
+    // default. The end state is the occupant being modelled: a NOT NULL column
+    // with no default, which existing rows satisfy and new named-list inserts
+    // cannot.
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           ADD COLUMN foreign_required TEXT NOT NULL DEFAULT 'pre-existing'; \
+         ALTER TABLE public.tenancy_backfill_checkpoints \
+           ALTER COLUMN foreign_required DROP DEFAULT",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The eleven declared columns are untouched and still at ordinals 1-11, so
+    // no other column arm can be what refuses this.
+    let declared_intact: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_attribute \
+          WHERE attrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND attnum BETWEEN 1 AND 11 AND NOT attisdropped",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        declared_intact, 11,
+        "the declared eleven must be undisturbed"
+    );
+
+    // And this is the break, asserted rather than described.
+    let err = sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, blocking_count) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'x', 'IN_PROGRESS', 0, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("a named-column insert cannot supply an undeclared NOT NULL column");
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23502"),
+        "every checkpoint write would fail: {err}"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a checkpoint table carrying an undeclared column",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("column foreign_required is not declared by this migration"),
+        "the refusal must name the undeclared column: {message}"
+    );
+}
+
+/// An expression-keyed completion index must be refused.
+///
+/// Codex P1 on `2a68a78`, and the sharpest finding of the round. The column
+/// comparison resolves `indkey` through an INNER join to `pg_attribute`, and an
+/// expression key is stored as attnum 0 -- which matches no attribute, so the
+/// join silently DROPS it and a three-key index aggregates to exactly the two
+/// names expected. Every other axis passed.
+///
+/// The consequence is the guarantee itself: with `(id::text)` in the key, two
+/// COMPLETED rows for the same tranche and digest coexist, which is precisely
+/// the evidence FINALIZE reads.
+///
+/// Mutation-checked by deleting only `i.indexprs IS NOT NULL` and the two
+/// attribute-count predicates.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_an_expression_keyed_completion_index(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+           ON public.tenancy_backfill_checkpoints (tranche, contract_digest, (id::text)) \
+         WHERE status = 'COMPLETED'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The impostor satisfies every axis that existed before this fix -- unique,
+    // valid, right table, right predicate, and its resolved column names
+    // aggregate to exactly the expected pair, because the expression key
+    // vanishes in the join. That is what makes the new axes provably the only
+    // thing refusing it.
+    let (unique, valid, resolved): (bool, bool, String) = sqlx::query_as(
+        "SELECT i.indisunique, i.indisvalid, \
+                (SELECT string_agg(a.attname, ',' ORDER BY o.ord) \
+                   FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS o(attnum, ord) \
+                   JOIN pg_attribute a \
+                     ON a.attrelid = i.indrelid AND a.attnum = o.attnum) \
+           FROM pg_index i \
+          WHERE i.indexrelid = \
+                'public.tenancy_backfill_checkpoints_completed_key'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (unique, valid, resolved.as_str()),
+        (true, true, "tranche,contract_digest"),
+        "the impostor must look identical to the real index under the old checks"
+    );
+
+    // And it does not deliver the uniqueness the real index exists for.
+    sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints \
+           (tranche, contract_digest, status, rows_total, rows_backfilled, blocking_count, \
+            completed_at) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'dup', 'COMPLETED', 7, 7, 0, NOW()), \
+                ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'dup', 'COMPLETED', 7, 7, 0, NOW())",
+    )
+    .execute(&pool)
+    .await
+    .expect("distinct ids make the expression key unique, so both COMPLETED rows are accepted");
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse an expression-keyed completion index",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("expressions=t") && message.contains("keyatts=3"),
+        "the refusal must report the expression key and the key count: {message}"
+    );
+}
+
+/// A completion index carrying an INCLUDE payload must be refused.
+///
+/// The other half of "exactly two ordinary key columns": `indnkeyatts` counts
+/// key columns and `indnatts` the total, so an INCLUDE payload passes a key
+/// count check on its own. Included columns are not part of the declared index,
+/// and adopting one means `CREATE UNIQUE INDEX IF NOT EXISTS` skips the name
+/// while the object on disk is not what the contract describes.
+///
+/// Honest note on what carries this test, because the mutation check said
+/// something different from what was expected. Deleting `i.indnatts <> 2`
+/// alone does NOT make this pass: an INCLUDE payload puts its attribute into
+/// `indkey` too, so the ordered-column comparison already aggregates to
+/// `tranche,contract_digest,status` and refuses. The explicit count is
+/// therefore redundant against this decoy rather than load-bearing.
+///
+/// It is kept deliberately: it states the "exactly two, nothing included"
+/// intent where a reader looks for it, it fails with a diagnostic that
+/// separates key columns from the payload, and it does not depend on the
+/// column comparison continuing to be exact. What this test proves on its own
+/// is that an INCLUDE payload is refused -- not which predicate refuses it.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_completion_index_with_included_columns(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX tenancy_backfill_checkpoints_completed_key \
+           ON public.tenancy_backfill_checkpoints (tranche, contract_digest) \
+           INCLUDE (status) \
+         WHERE status = 'COMPLETED'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Two KEY columns and no expressions, so only the total-attribute count can
+    // refuse this one.
+    let (keyatts, natts, exprs): (i16, i16, bool) = sqlx::query_as(
+        "SELECT i.indnkeyatts, i.indnatts, (i.indexprs IS NOT NULL) \
+           FROM pg_index i \
+          WHERE i.indexrelid = \
+                'public.tenancy_backfill_checkpoints_completed_key'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (keyatts, natts, exprs),
+        (2, 3, false),
+        "the payload must be the only difference: two key columns, three total"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a completion index carrying an INCLUDE payload",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("keyatts=2") && message.contains("totalatts=3"),
+        "the refusal must distinguish key columns from the payload: {message}"
+    );
+}
+
+/// A renamed primary key must be refused, even though it is otherwise perfect.
+///
+/// Codex P2 on `2a68a78`. This is the one place the tranche's "identity by
+/// shape, never by name" rule inverts, and it is worth being explicit about
+/// why: shape identity exists so a name cannot be *trusted*, not so a name the
+/// contract itself specifies can be *ignored*. `inventory.rs` declares
+/// `primary_key("tenancy_backfill_checkpoints_pkey", &["id"])` and
+/// `audit.rs::verify_schema_contract` looks constraints up by `(table, name)`,
+/// so a renamed key is adopted here, version 32 is recorded, and the schema
+/// audit then reports contract drift nothing will repair.
+///
+/// Mutation-checked by deleting only the `conname` predicate.
+#[sqlx::test(migrations = "./migrations")]
+async fn the_prepare_migration_refuses_a_renamed_primary_key(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+    replace_checkpoint_table_with_decoy(&pool, false).await;
+    sqlx::raw_sql(
+        "ALTER TABLE public.tenancy_backfill_checkpoints \
+           RENAME CONSTRAINT tenancy_backfill_checkpoints_pkey TO zz_renamed_pkey",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Every structural axis still holds -- it is the same constraint over the
+    // same column, still validated and non-deferrable -- so the name is
+    // provably the only axis that can refuse it.
+    let (cols, validated, deferrable): (String, bool, bool) = sqlx::query_as(
+        "SELECT (SELECT string_agg(a.attname, ',' ORDER BY o.ord) \
+                   FROM unnest(k.conkey) WITH ORDINALITY AS o(attnum, ord) \
+                   JOIN pg_attribute a \
+                     ON a.attrelid = k.conrelid AND a.attnum = o.attnum), \
+                k.convalidated, k.condeferrable \
+           FROM pg_constraint k \
+          WHERE k.conrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND k.contype = 'p'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (cols.as_str(), validated, deferrable),
+        ("id", true, false),
+        "only the name may differ"
+    );
+
+    let (code, message) = expect_refusal(
+        &pool,
+        PREPARE_UP_SQL,
+        "0032 must refuse a primary key that does not carry the contract's name",
+    )
+    .await;
+    assert_eq!(code, "42P07", "duplicate_table is the refusal's SQLSTATE");
+    assert!(
+        message.contains("named tenancy_backfill_checkpoints_pkey")
+            && message.contains("zz_renamed_pkey"),
+        "the refusal must name both the required and the found constraint: {message}"
     );
 }
 
