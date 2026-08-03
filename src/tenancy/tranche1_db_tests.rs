@@ -2601,6 +2601,34 @@ async fn a_renamed_constraint_is_refused_by_shape_not_missed_by_name(pool: PgPoo
 ///
 /// Driven through the real `store::delete_agent`, because the ordering under test
 /// is that function's.
+///
+/// ── SERIALIZED LANE (issue #27) ─────────────────────────────────────────────
+///
+/// `#[ignore]` here removes this test from the ORDINARY PARALLEL SUITE only. It
+/// is not skipped: `.github/workflows/benchmarks.yml` runs it, by this exact
+/// name, with `--ignored --exact --test-threads=1`, as a required job that fails
+/// if the filter matches no test.
+///
+/// The gate below is UNCHANGED and stays strict. It must keep failing when it
+/// observes nothing blocked -- letting it pass on an unobserved interleaving is
+/// what would make the concurrency proof vacuous, and that was explicitly
+/// rejected. What is intermittent is not the contract but whether a given run
+/// exercises the interleaving the proof depends on: at `--test-threads=16` on a
+/// 10-core box, `delete_agent` acquires a pooled connection and then sits
+/// `state=idle` with an empty query, never sending its `BEGIN`, so it is
+/// genuinely unblocked and correctly absent from `pg_blocking_pids`.
+///
+/// The record in issue #27 previously said this had never appeared at CI's
+/// parallelism. That is no longer true: the required Benchmark Proof job failed
+/// on it at `2a68a78` and again at `67ba097`, so the parallelism argument no
+/// longer holds and repeated reruns are not a resolution. Serializing this one
+/// test is the owner-sanctioned lowest-risk remedy; the deeper tokio/sqlx
+/// root-cause investigation remains open in #27 and is not closed by this.
+///
+/// Deliberately narrow: this attribute serializes exactly one test. It does not
+/// pin the suite's parallelism, which was the other rejected option.
+#[ignore = "issue #27: run serialized via the dedicated Benchmark Proof job \
+            (--ignored --exact --test-threads=1); the strict gate is unchanged"]
 #[sqlx::test(migrations = "./migrations")]
 async fn a_policy_inserted_during_cleanup_cannot_break_agent_deletion(pool: PgPool) {
     let state = crate::test_support::test_state(pool.clone());
