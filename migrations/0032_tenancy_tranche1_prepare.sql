@@ -389,6 +389,7 @@ $ckdiff$;
 
     live_oid OID;
     ref_oid OID;
+    ref_ident TEXT;
     live_kind "char";
     live_persistence "char";
     diffs TEXT;
@@ -516,6 +517,36 @@ BEGIN
     -- too, so a reference-versus-live comparison would be unsound) and the
     -- AUTHENTICITY OF EXISTING ROWS (no schema comparison can establish that).
 
+    -- ── The trusted resolution path, pinned BEFORE anything is created ──────
+    --
+    -- `checkpoint_body` writes `gen_random_uuid()` and `NOW()` unqualified, and
+    -- a stored default is resolved to a specific function AT CREATE TIME.  A
+    -- caller whose search_path names pg_catalog explicitly and late --
+    -- `hostile, public, pg_catalog` -- moves pg_catalog out of its implicit
+    -- first position, so an attacker-owned `gen_random_uuid()` in `hostile` is
+    -- what gets bound into the column default.
+    --
+    -- The comparison CANNOT catch this, and that is the point: the same DDL
+    -- builds both sides, so the same hostile function is bound into the
+    -- reference and into the live table, the two agree exactly, and the
+    -- migration reports success over a table whose `id` default is
+    -- attacker-controlled.  Measured consequence: a shadow returning a constant
+    -- UUID makes the second defaulted insert die on the primary key.  This is
+    -- the same blind-spot class that privileges are held to an ABSOLUTE policy
+    -- for -- anything poisoning both sides identically is invisible to a
+    -- two-sided diff, so it has to be excluded before either side is built
+    -- rather than detected afterwards.
+    --
+    -- Pinned here, ahead of the lock, and held through reference creation,
+    -- public creation, both index creations, the index repair, fingerprint
+    -- rendering and the final comparison; restored once after the last of them.
+    -- SET LOCAL is transaction-scoped rather than statement-scoped and cannot
+    -- take a parameter, so `set_config(..., true)` is used for both directions.
+    -- Every relation target below stays explicitly schema-qualified regardless:
+    -- neither the pin nor the qualification is load-bearing alone.
+    saved_search_path := pg_catalog.current_setting('search_path', true);
+    PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+
     -- Serialise concurrent runs.  Transaction-scoped, and it covers what the
     -- table lock cannot: when the table does not exist there is nothing to
     -- LOCK, and two sessions would race between the existence probe and the
@@ -580,17 +611,16 @@ BEGIN
     -- drop happens on abort exactly as it does on commit.
     EXECUTE pg_catalog.format('CREATE TEMPORARY TABLE %I %s ON COMMIT DROP',
                               'tenancy_backfill_checkpoints_reference', checkpoint_body);
-    EXECUTE pg_catalog.format(idx_completed_tmpl,
-                              'tenancy_backfill_checkpoints_completed_key',
-                              pg_catalog.quote_ident('tenancy_backfill_checkpoints_reference'));
-    EXECUTE pg_catalog.format(idx_tranche_tmpl,
-                              'idx_tenancy_backfill_checkpoints_tranche',
-                              pg_catalog.quote_ident('tenancy_backfill_checkpoints_reference'));
 
-    ref_oid := pg_catalog.to_regclass(
-                   pg_catalog.quote_ident(
-                       pg_catalog.pg_my_temp_schema()::regnamespace::text)
-                   || '.tenancy_backfill_checkpoints_reference');
+    -- Resolved BEFORE the reference's indexes are built, so that they too can
+    -- name their target explicitly.  `pg_my_temp_schema()` cannot be read any
+    -- earlier: it returns 0 until this session actually owns a temp schema, and
+    -- the CREATE above is what creates one.
+    ref_ident := pg_catalog.quote_ident(
+                     pg_catalog.pg_my_temp_schema()::regnamespace::text)
+                 || '.' || pg_catalog.quote_ident(
+                               'tenancy_backfill_checkpoints_reference');
+    ref_oid := pg_catalog.to_regclass(ref_ident);
 
     IF ref_oid IS NULL THEN
         RAISE EXCEPTION
@@ -599,6 +629,15 @@ BEGIN
             'been changed.'
             USING ERRCODE = 'internal_error';
     END IF;
+
+    -- Qualified by the resolved temp schema rather than left bare.  A bare name
+    -- would resolve through the implicit pg_temp-first rule, which is a rule
+    -- about precedence -- exactly the kind of ambient resolution the pinned
+    -- search_path above exists to stop this block from depending on.
+    EXECUTE pg_catalog.format(idx_completed_tmpl,
+                              'tenancy_backfill_checkpoints_completed_key', ref_ident);
+    EXECUTE pg_catalog.format(idx_tranche_tmpl,
+                              'idx_tenancy_backfill_checkpoints_tranche', ref_ident);
 
     IF live_oid IS NULL THEN
         -- Fresh creation.  No IF NOT EXISTS anywhere below: that primitive IS
@@ -620,11 +659,11 @@ BEGIN
         -- exactly right is not refused merely because its migration-owned
         -- indexes have not been built yet.  A wrong-shaped index, or a non-index
         -- relation wearing either name, is a difference like any other.
-        saved_search_path := pg_catalog.current_setting('search_path', true);
-        PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+        --
+        -- Rendered under the trusted path pinned above: `pg_get_indexdef` and
+        -- friends qualify names according to search_path, so a hostile path
+        -- would change how both sides are spelled.
         EXECUTE checkpoint_diff_sql INTO diffs USING live_oid, ref_oid, TRUE;
-        PERFORM pg_catalog.set_config('search_path',
-                                      COALESCE(saved_search_path, ''), true);
 
         IF diffs IS NOT NULL THEN
             RAISE EXCEPTION
@@ -659,18 +698,19 @@ Nothing has been changed. Drop or rename the occupant, then re-run.',
     --
     -- Running it after our own CREATE is not redundant: it proves the DDL
     -- actually produced the contract in `public`, rather than assuming it did.
-    -- A hostile search_path, a shadow schema or an event trigger rewriting DDL
-    -- all surface here, and this tranche has already shipped one fix for
-    -- exactly that class of capture.
+    -- An event trigger rewriting DDL, or a shadow schema capturing a relation
+    -- name, surfaces here.  A hostile search_path is NOT among the things this
+    -- comparison can catch -- it poisons both sides identically -- which is why
+    -- the trusted path is pinned before either side is built instead.
     --
-    -- search_path is saved and restored around the rendering, because
-    -- `pg_get_indexdef` and friends qualify names according to it.  SET LOCAL is
-    -- transaction-scoped rather than statement-scoped and cannot take a
-    -- parameter, so `set_config(..., true)` is used for both the set and the
-    -- restore.
-    saved_search_path := pg_catalog.current_setting('search_path', true);
-    PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
+    -- Rendered under that same pinned path, because `pg_get_indexdef` and
+    -- friends qualify names according to search_path.
     EXECUTE checkpoint_diff_sql INTO diffs USING live_oid, ref_oid, FALSE;
+
+    -- Last consumer of the trusted path; everything after this point is either
+    -- explicitly qualified or reads no names at all.  Restored rather than left
+    -- pinned so that the rest of this migration, and anything sharing the
+    -- transaction, sees the search_path it was invoked with.
     PERFORM pg_catalog.set_config('search_path', COALESCE(saved_search_path, ''), true);
 
     IF diffs IS NOT NULL THEN

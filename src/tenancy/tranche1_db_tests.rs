@@ -4234,6 +4234,246 @@ async fn a_shadow_schema_cannot_capture_the_prepare_migrations_ddl(pool: PgPool)
     assert_eq!(owned, 10, "all ten ownership columns must land in public");
 }
 
+/// Every function bound into any DEFAULT of `$1`, as `(column, function schema)`.
+///
+/// Read from `pg_attrdef.adbin` -- the stored, already-resolved expression --
+/// rather than from `pg_get_expr`, whose rendering is itself search_path
+/// dependent and so cannot be trusted to answer a search_path question. Every
+/// `:funcid` in the tree is followed, so a capture nested inside a cast or a
+/// wrapper is seen too.
+///
+/// `pg_depend` deliberately is not used: PostgreSQL records no dependency rows
+/// for PINNED system objects, so a correctly-bound `pg_catalog.gen_random_uuid`
+/// leaves no trace there at all, and absence would have to stand in for proof.
+const DEFAULT_BINDINGS_SQL: &str = "SELECT a.attname::text, n.nspname::text \
+       FROM pg_catalog.pg_attrdef ad \
+       JOIN pg_catalog.pg_attribute a \
+         ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum \
+       CROSS JOIN LATERAL pg_catalog.regexp_matches(ad.adbin::text, ':funcid (\\d+)', 'g') \
+            AS m(parts) \
+       JOIN pg_catalog.pg_proc p ON p.oid = m.parts[1]::oid \
+       JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+      WHERE ad.adrelid = $1::regclass";
+
+/// A hostile `search_path` must not choose which functions the checkpoint
+/// table's DEFAULTs are bound to.
+///
+/// Codex, on `67ba097`, against the canonical comparator itself. `checkpoint_body`
+/// writes `gen_random_uuid()` and `NOW()` unqualified, and a stored default is
+/// resolved to a specific function AT CREATE TIME. `pg_catalog` is searched first
+/// only while it is *implicit*; a caller who names it explicitly and late --
+/// `hostile, public, pg_catalog` -- demotes it, and an attacker-owned
+/// `gen_random_uuid()` is what gets bound.
+///
+/// The comparator cannot catch this, which is why it is worth its own test. The
+/// same DDL builds both sides, so the identical hostile function is bound into
+/// the reference AND the live table, the diff is empty, the migration reports
+/// success -- and the table is wrong. Measured on `67ba097` before the fix: both
+/// tables' `id` defaults depended on `zz_hostile.gen_random_uuid`, both
+/// timestamp defaults on `zz_hostile.now`, the migration applied clean, and the
+/// second defaulted insert died on the primary key.
+///
+/// This is the general blind spot of a two-sided diff -- anything poisoning both
+/// sides identically -- and it is the same reason privileges are held to an
+/// absolute policy rather than compared. The remedy is likewise not a better
+/// comparison: it is pinning `search_path` to `pg_catalog` BEFORE either side is
+/// built, so the hostile function is never in scope to be bound.
+///
+/// Evidence is taken from the catalog as well as from behaviour: the function
+/// actually bound into each default is read back out of `pg_attrdef`, so this
+/// asserts the identity of the bound function rather than merely that the values
+/// it produces happen to look distinct.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_hostile_search_path_cannot_capture_the_checkpoint_table_defaults(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    // One connection throughout: search_path is a session setting, and it has to
+    // be the session that applies the migration.
+    let mut conn = pool.acquire().await.unwrap();
+
+    // `pg_catalog` named EXPLICITLY and LAST. Leaving it out would make it
+    // implicitly first and no shadow could ever win -- the demotion IS the
+    // attack, and the test would be vacuous without it.
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE SCHEMA zz_hostile; \
+         CREATE FUNCTION zz_hostile.gen_random_uuid() RETURNS uuid \
+             LANGUAGE sql IMMUTABLE AS $f$ \
+                 SELECT '11111111-1111-4111-8111-111111111111'::uuid $f$; \
+         CREATE FUNCTION zz_hostile.now() RETURNS timestamptz \
+             LANGUAGE sql STABLE AS $f$ \
+                 SELECT '2000-01-01T00:00:00Z'::timestamptz $f$; \
+         SET search_path = zz_hostile, public, pg_catalog",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    // POTENCY CONTROL, before the migration runs. The shadows above are only a
+    // real attack if unqualified DDL under this exact path actually binds them.
+    // If PostgreSQL resolved past them for any reason, every assertion below
+    // would pass while proving nothing. This plants a table with the same two
+    // unqualified defaults and confirms the capture really happens.
+    sqlx::raw_sql(
+        "CREATE TABLE public.zz_potency_control ( \
+             id UUID DEFAULT gen_random_uuid(), at TIMESTAMPTZ DEFAULT NOW())",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let captured: Vec<(String, String)> = sqlx::query_as(DEFAULT_BINDINGS_SQL)
+        .bind("public.zz_potency_control")
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+    assert!(
+        captured.iter().any(|(_, schema)| schema == "zz_hostile"),
+        "the planted shadows must actually capture unqualified DDL under this \
+         search_path, or this test proves nothing: {captured:?}"
+    );
+    sqlx::raw_sql("DROP TABLE public.zz_potency_control")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    // The migration runs inside an EXPLICIT transaction so that the canonical
+    // reference -- `ON COMMIT DROP` in `pg_temp` -- is still alive to be
+    // inspected. Both tables are built by the same DDL, so both have to be shown
+    // clean; checking only the live one would leave the reference unproven.
+    sqlx::raw_sql("BEGIN").execute(&mut *conn).await.unwrap();
+
+    // The comparator must stay CLEAN. A refusal here is a failure of this test:
+    // the point is that the migration succeeds and is correct, not that it
+    // learns to refuse a hostile path.
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("a hostile search_path must not stop the migration, and must not capture it");
+
+    let temp_reference: String = sqlx::query_scalar(
+        "SELECT pg_catalog.quote_ident(pg_catalog.pg_my_temp_schema()::regnamespace::text) \
+             || '.tenancy_backfill_checkpoints_reference'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+
+    for target in [
+        "public.tenancy_backfill_checkpoints",
+        temp_reference.as_str(),
+    ] {
+        let bindings: Vec<(String, String)> = sqlx::query_as(DEFAULT_BINDINGS_SQL)
+            .bind(target)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+
+        // Every function reachable from every default, not just the first: a
+        // default is an expression tree, and a capture anywhere in it counts.
+        assert!(
+            bindings.iter().all(|(_, schema)| schema == "pg_catalog"),
+            "{target} must bind every default to pg_catalog, not to a shadow: {bindings:?}"
+        );
+        // ...and the three that matter must still be there, so that a default
+        // silently vanishing cannot satisfy the assertion above by leaving
+        // nothing to check.
+        for column in ["id", "started_at", "updated_at"] {
+            assert!(
+                bindings.iter().any(|(col, _)| col == column),
+                "{target}.{column} must still carry a function-backed default: {bindings:?}"
+            );
+        }
+    }
+
+    // Named exactly, on the live table: `id` bound to pg_catalog's
+    // `gen_random_uuid`, both timestamps to pg_catalog's `now`.
+    let named: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT a.attname::text, n.nspname::text, p.proname::text \
+           FROM pg_catalog.pg_attrdef ad \
+           JOIN pg_catalog.pg_attribute a \
+             ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum \
+           CROSS JOIN LATERAL pg_catalog.regexp_matches(ad.adbin::text, ':funcid (\\d+)', 'g') \
+                AS m(parts) \
+           JOIN pg_catalog.pg_proc p ON p.oid = m.parts[1]::oid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+          WHERE ad.adrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND a.attname IN ('id', 'started_at', 'updated_at')",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    for expected in [
+        ("id", "pg_catalog", "gen_random_uuid"),
+        ("started_at", "pg_catalog", "now"),
+        ("updated_at", "pg_catalog", "now"),
+    ] {
+        assert!(
+            named
+                .iter()
+                .any(|(c, s, f)| (c.as_str(), s.as_str(), f.as_str()) == expected),
+            "the stored default for {} must depend on {}.{}: {named:?}",
+            expected.0,
+            expected.1,
+            expected.2
+        );
+    }
+
+    sqlx::raw_sql("COMMIT").execute(&mut *conn).await.unwrap();
+
+    // BEHAVIOURAL confirmation on top of the catalog evidence: the constant-UUID
+    // shadow's signature failure is the second defaulted insert colliding on the
+    // primary key. Two defaulted inserts, two distinct ids.
+    sqlx::raw_sql(
+        "INSERT INTO public.tenancy_backfill_checkpoints (tranche, contract_digest, status) \
+         VALUES ('TRANCHE_1_ROOTS_AND_DIRECT_AGENT_CHILDREN', 'digest-1', 'IN_PROGRESS'); \
+         INSERT INTO public.tenancy_backfill_checkpoints (tranche, contract_digest, status) \
+         VALUES ('TRANCHE_2_SESSIONS', 'digest-2', 'IN_PROGRESS')",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("two defaulted inserts must not collide on a constant shadow uuid");
+
+    let (rows, distinct_ids, constant_ids): (i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*), count(DISTINCT id), \
+                count(*) FILTER (WHERE id = '11111111-1111-4111-8111-111111111111'::uuid) \
+           FROM public.tenancy_backfill_checkpoints",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(rows, 2, "both defaulted inserts must have landed");
+    assert_eq!(distinct_ids, 2, "each must have received its own id");
+    assert_eq!(
+        constant_ids, 0,
+        "no row may carry the shadow's constant uuid"
+    );
+
+    // The timestamp shadow leaves its own fingerprint: a frozen year 2000.
+    let frozen: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.tenancy_backfill_checkpoints \
+          WHERE started_at < '2020-01-01T00:00:00Z'::timestamptz \
+             OR updated_at < '2020-01-01T00:00:00Z'::timestamptz",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        frozen, 0,
+        "no row may carry the shadow now()'s frozen clock"
+    );
+
+    // The migration restores the path it was handed rather than leaving its own
+    // pinned behind.
+    let path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        path, "zz_hostile, public, pg_catalog",
+        "the migration must restore the caller's search_path, not keep its own"
+    );
+}
+
 /// Validated CHECKs do not make up for a missing NOT NULL.
 ///
 /// Codex, on `c54889e`. Comparing the seven CHECK expressions left the COLUMNS
