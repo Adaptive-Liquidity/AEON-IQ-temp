@@ -1260,9 +1260,13 @@ async fn an_unlock_that_cannot_be_confirmed_discards_the_connection(pool: PgPool
 
 /// The backend pid behind whichever pooled connection serves one query.
 ///
-/// Stable while the pool keeps handing back the same connection, and it changes
-/// the moment one is discarded and replaced -- which is exactly the difference
-/// between returning a connection and burning it.
+/// Only a proof of connection *identity* when the caller has arranged for the
+/// pool to have exactly one connection left to offer. `fetch_one(pool)` takes
+/// any idle connection, so against a pool holding several this reads an
+/// arbitrary member of the set: two equal readings are then a coincidence and
+/// two unequal ones are not evidence of a discard. See
+/// `a_contended_acquire_returns_its_connection_instead_of_burning_it`, which
+/// caps its pool so that only one connection can ever be idle.
 async fn pool_backend_pid(pool: &PgPool) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(pool)
@@ -1282,39 +1286,70 @@ async fn a_contended_acquire_returns_its_connection_instead_of_burning_it(pool: 
     // Getting that wrong is not cosmetic: every refused run would permanently
     // burn a connection, so a busy deployment would drain its own pool by
     // politely declining to start.
-    let holder = TrancheLock::acquire(&pool).await.expect("first acquire");
-    assert!(tranche_lock_is_held(&pool).await);
 
-    // Compared by backend pid rather than by `pool.size()`. Size does detect
-    // this -- nothing refills after the final refusal, so a burn leaves the
-    // count low -- but it detects it by way of the pool's replacement timing,
-    // which is a property of sqlx rather than of this code. A returned
-    // connection keeps its backend; a burned one is replaced by a new one, and
-    // the pid says so directly.
-    let before = pool_backend_pid(&pool).await;
+    // Run against a pool capped at exactly `MIN_BACKFILL_CONNECTIONS`, which is
+    // what turns the backend-pid comparison below into a proof. `holder` keeps
+    // one of the two checked out for the whole contended stretch, so the pool
+    // has at most *one* connection to offer and every query in that stretch is
+    // necessarily served by the same backend unless something discards it.
+    //
+    // The `#[sqlx::test]` pool is not capped that tightly, and against it
+    // `fetch_one(pool)` is served by whichever connection happens to be idle.
+    // Reading a pid from it twice compares two arbitrary draws, which is why the
+    // first version of this assertion passed locally and failed in CI -- not a
+    // flake, an assertion that was never testing what it claimed.
+    //
+    // Two is also the smallest pool the engine accepts, so the final
+    // `run_tranche_backfill` below still exercises a supported configuration.
+    let connect_options = (*pool.connect_options()).clone();
+    let pinned = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(MIN_BACKFILL_CONNECTIONS)
+        .connect_with(connect_options)
+        .await
+        .expect("two-connection pool");
+
+    let holder = TrancheLock::acquire(&pinned).await.expect("first acquire");
+    assert!(tranche_lock_is_held(&pinned).await);
+
+    let before = pool_backend_pid(&pinned).await;
     for _ in 0..3 {
-        let err = match TrancheLock::acquire(&pool).await {
+        let err = match TrancheLock::acquire(&pinned).await {
             Ok(_) => panic!("the lock is held; a second acquire must be refused"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("already running"), "{err}");
     }
+    // Read the pool's own accounting first, and *before* anything else touches
+    // the pool. That ordering is load-bearing, not stylistic: `detach` lowers
+    // the count, but the next borrower opens a replacement and restores it, so
+    // this assertion only sees a burn while nothing has asked for a connection
+    // since the final refusal. Measured both ways with the `take` removed --
+    // placed here it fails, placed after the pid read below it passes.
     assert_eq!(
-        pool_backend_pid(&pool).await,
+        pinned.size(),
+        MIN_BACKFILL_CONNECTIONS,
+        "a refused acquire must leave the pool's connection count alone; `detach` is the only \
+         thing here that lowers it"
+    );
+    assert_eq!(
+        pool_backend_pid(&pinned).await,
         before,
-        "a refused acquire must hand its connection back, not burn it; a new backend pid means \
-         the pool replaced a connection that was discarded"
+        "a refused acquire must hand its connection back, not burn it; the pool had exactly one \
+         connection to offer, so a different backend pid means the one it offered was discarded \
+         and replaced"
     );
 
     assert!(matches!(holder.release().await, LockCleanup::Unlocked));
-    assert!(!tranche_lock_is_held(&pool).await);
+    assert!(!tranche_lock_is_held(&pinned).await);
 
     // And the pool is still usable for real work.
-    insert_agent(&pool, "agent-a", Some(TENANT)).await;
-    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+    insert_agent(&pinned, "agent-a", Some(TENANT)).await;
+    let done = run_tranche_backfill(&pinned, TRANCHE, options(10, None))
         .await
         .expect("the pool was not drained");
     assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+
+    pinned.close().await;
 }
 
 #[sqlx::test]
