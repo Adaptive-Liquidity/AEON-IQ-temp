@@ -37,6 +37,19 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 uuid    = { version = "1", features = ["v4", "serde"] }
 chrono  = { version = "0.4", features = ["serde"] }
 
+# Command-line interface
+# `default-features = false` drops the colour/suggestion machinery (anstream,
+# anstyle, strsim) that a non-interactive operator command has no use for, and
+# keeps the dependency surface cargo-deny has to clear as small as the feature
+# set allows.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
 # Error handling
 anyhow    = "1"
 thiserror = "1"

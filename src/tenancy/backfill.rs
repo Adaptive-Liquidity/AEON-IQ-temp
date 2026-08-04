@@ -148,12 +148,6 @@ impl BackfillTarget {
 /// root and owns itself; `credentials` and `credential_agent_grants` are already
 /// tenant-scoped; `tenancy_backfill_checkpoints` describes the migration rather
 /// than an owner. None of them declare a bridge, so none of them appear.
-/// Step 4B-2 wires its CLI subcommand in the next increment and a management
-/// endpoint in a later one, so this entry point has no production caller yet
-/// and the tests are its only consumer. Narrow allowance on the entry points
-/// rather than the module, so anything that becomes *genuinely* unreachable
-/// still shows up.
-#[allow(dead_code)]
 pub fn targets_for(tranche: Tranche) -> Result<Vec<BackfillTarget>> {
     let mut targets = Vec::new();
 
@@ -349,6 +343,17 @@ pub enum BackfillOutcome {
     Paused,
 }
 
+impl BackfillOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyCompleted => "ALREADY_COMPLETED",
+            Self::Completed => "COMPLETED",
+            Self::Blocked => "BLOCKED",
+            Self::Paused => "PAUSED",
+        }
+    }
+}
+
 /// The result of one run, and the state of the checkpoint it leaves behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrancheBackfillReport {
@@ -371,7 +376,6 @@ pub struct TrancheBackfillReport {
 
 impl TrancheBackfillReport {
     /// Whether FINALIZE would accept this tranche now.
-    #[allow(dead_code)]
     pub fn is_finalizable(&self) -> bool {
         self.status == plan::FINALIZE_PRECONDITION.required_status
             && self.blocking_count <= plan::FINALIZE_PRECONDITION.max_blocking_count
@@ -400,12 +404,6 @@ pub struct CheckpointRow {
 /// nothing, a re-run over a partially-done one resumes from the persisted
 /// cursor, and the `UPDATE` itself writes values the bridge would write anyway,
 /// so re-walking a settled row is a no-op rather than a second assignment.
-/// Step 4B-2 wires its CLI subcommand in the next increment and a management
-/// endpoint in a later one, so this entry point has no production caller yet
-/// and the tests are its only consumer. Narrow allowance on the entry points
-/// rather than the module, so anything that becomes *genuinely* unreachable
-/// still shows up.
-#[allow(dead_code)]
 pub async fn run_tranche_backfill(
     pool: &PgPool,
     tranche: Tranche,
@@ -432,12 +430,6 @@ pub async fn run_tranche_backfill(
 /// it got is the interesting part of that history. `completed_at` stays NULL,
 /// which `tenancy_backfill_checkpoints_completed_shape_ck` requires and which
 /// keeps an abandoned row from ever reading as evidence of completion.
-/// Step 4B-2 wires its CLI subcommand in the next increment and a management
-/// endpoint in a later one, so this entry point has no production caller yet
-/// and the tests are its only consumer. Narrow allowance on the entry points
-/// rather than the module, so anything that becomes *genuinely* unreachable
-/// still shows up.
-#[allow(dead_code)]
 pub async fn abandon_tranche_backfill(
     pool: &PgPool,
     tranche: Tranche,
@@ -493,12 +485,6 @@ pub async fn abandon_tranche_backfill(
 ///
 /// Prefers a completion at the current digest — that is the state FINALIZE
 /// cares about — and falls back to an in-progress row.
-/// Step 4B-2 wires its CLI subcommand in the next increment and a management
-/// endpoint in a later one, so this entry point has no production caller yet
-/// and the tests are its only consumer. Narrow allowance on the entry points
-/// rather than the module, so anything that becomes *genuinely* unreachable
-/// still shows up.
-#[allow(dead_code)]
 pub async fn tranche_backfill_status(
     pool: &PgPool,
     tranche: Tranche,

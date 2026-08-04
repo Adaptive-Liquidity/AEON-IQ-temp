@@ -2,6 +2,7 @@ mod api;
 mod archival;
 mod attestation;
 mod auth;
+mod cli;
 mod config;
 mod credentials;
 mod db;
@@ -65,6 +66,21 @@ async fn main() -> anyhow::Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    // Before every startup check below, deliberately.
+    //
+    // Those checks are the *server's* preconditions -- an upstream provider, an
+    // embedding endpoint, a management-key decision -- and an operator command
+    // has no use for any of them. Parsing after `Config::from_env` would make a
+    // tenancy backfill demand provider credentials to satisfy a check with no
+    // bearing on the work it does, so `memoryos tenancy backfill` would be
+    // unrunnable on exactly the database-only host it exists for.
+    //
+    // With no subcommand this yields `None` and falls through, so a bare
+    // `memoryos` still starts the server exactly as it always has.
+    if let Some(command) = <cli::Cli as clap::Parser>::parse().command {
+        return cli::dispatch(command).await;
+    }
 
     let config = Arc::new(Config::from_env()?);
     let role = config::ProcessRole::from_env()?;
