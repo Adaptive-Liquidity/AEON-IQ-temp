@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::backfill::{
     abandon_tranche_backfill, run_tranche_backfill, targets_for, tranche_backfill_status,
     BackfillOptions, BackfillOutcome, LockCleanup, TrancheLock, MIN_BACKFILL_CONNECTIONS,
+    RECONCILIATION_LOCK_ORDER,
 };
 use super::inventory::Tranche;
 use super::plan::CheckpointStatus;
@@ -35,6 +36,7 @@ fn options(batch_size: i64, max_batches: Option<u64>) -> BackfillOptions {
     BackfillOptions {
         batch_size,
         max_batches,
+        ..BackfillOptions::default()
     }
 }
 
@@ -886,6 +888,14 @@ async fn an_empty_database_completes_the_tranche(pool: PgPool) {
 /// races: it is direct evidence that the run has reached `finish`, taken the
 /// reconciliation lock's place in the queue, and is blocked there -- so anything
 /// committed after this returns is committed strictly inside the window.
+///
+/// The `l.database` predicate is what makes that true rather than merely
+/// intended. `pg_locks` is cluster-wide and `#[sqlx::test]` gives every test its
+/// own database in a shared cluster, so without it a relation OID from another
+/// test's database can match a local `pg_class` row on `relname` and satisfy the
+/// wait. The failure mode is the bad one: this returns *early*, the caller's
+/// COMMIT lands outside the window, and the interleaving tests below pass
+/// without testing anything.
 async fn await_blocked_share_lock(pool: &PgPool, table: &str) {
     // ~10s: generous for a loaded CI runner to batch a handful of rows and
     // reach `finish`, short enough that a regression fails promptly.
@@ -894,7 +904,8 @@ async fn await_blocked_share_lock(pool: &PgPool, table: &str) {
             "SELECT count(*)::bigint \
                FROM pg_locks l \
                JOIN pg_class c ON c.oid = l.relation \
-              WHERE c.relname = $1 AND l.mode = 'ShareLock' AND NOT l.granted",
+              WHERE c.relname = $1 AND l.mode = 'ShareLock' AND NOT l.granted \
+                AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         )
         .bind(table)
         .fetch_one(pool)
@@ -1244,6 +1255,46 @@ async fn an_unlock_that_cannot_be_confirmed_discards_the_connection(pool: PgPool
 }
 
 #[sqlx::test]
+async fn dropping_a_lock_without_releasing_it_does_not_poison_the_pool(pool: PgPool) {
+    // This is where a cancelled run lands. If a caller aborts the task while
+    // `pg_advisory_unlock` is in flight, `release` never finishes and `Drop` is
+    // the only thing that runs -- so `Drop` has to detach the connection and
+    // close it rather than let a `PoolConnection` drop return it to the pool
+    // still holding the session lock.
+    //
+    // It is also why `release` keeps the connection inside `self` across the
+    // unlock await instead of taking it out first: taking it out moves it to a
+    // local, and cancelling then drops that local straight back into the pool
+    // with `Drop` powerless to intervene.
+    let lock = TrancheLock::acquire(&pool).await.expect("acquire");
+    assert!(tranche_lock_is_held(&pool).await, "the lock is held");
+
+    drop(lock);
+
+    // The detached connection is closed on a background task, so the lock dies
+    // with its session rather than at a defined instant.
+    for _ in 0..200 {
+        if !tranche_lock_is_held(&pool).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        !tranche_lock_is_held(&pool).await,
+        "a dropped lock must not leave its session lock held; the connection was returned to the \
+         pool instead of being detached and closed"
+    );
+
+    // The observable consequence of getting this wrong: every later run refuses
+    // to start, reporting a backfill that is not running.
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("the pool is not poisoned");
+    assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+}
+
+#[sqlx::test]
 async fn a_second_run_is_refused_while_the_first_holds_the_lock(pool: PgPool) {
     let lock = TrancheLock::acquire(&pool).await.expect("acquire");
 
@@ -1272,4 +1323,206 @@ async fn the_lock_id_these_tests_watch_is_the_one_the_engine_takes(pool: PgPool)
         "the engine's lock id and TRANCHE_LOCK_ID have drifted apart"
     );
     assert!(matches!(lock.release().await, LockCleanup::Unlocked));
+}
+
+// ── Lock ordering ────────────────────────────────────────────────────────────
+
+/// The tables `memory::store::delete_agent` deletes, in source order.
+///
+/// Parsed from the source rather than restated, because a restated copy is a
+/// copy that drifts: the ordering only prevents a deadlock while it matches the
+/// path it was derived from, and nothing about a stale duplicate would look
+/// wrong.
+fn delete_agent_table_order() -> Vec<String> {
+    let source = std::fs::read_to_string("src/memory/store.rs").expect("read store.rs");
+    let start = source
+        .find("pub async fn delete_agent")
+        .expect("delete_agent exists");
+    let rest = &source[start + 10..];
+    let end = rest
+        .find("\npub async fn")
+        .map_or(source.len(), |i| start + 10 + i);
+    let body = &source[start..end];
+
+    let mut tables = Vec::new();
+    for line in body.lines() {
+        if let Some(after) = line.split("DELETE FROM ").nth(1) {
+            let table = after
+                .split_whitespace()
+                .next()
+                .expect("a table name follows DELETE FROM");
+            tables.push(table.to_string());
+        }
+    }
+    assert!(
+        tables.len() >= 5,
+        "parsed too few deletes from delete_agent ({tables:?}); the parser has drifted from the \
+         source it reads"
+    );
+    tables
+}
+
+#[test]
+fn the_lock_order_matches_the_live_deletion_path() {
+    // `delete_agent` is a live multi-table write path taking ROW EXCLUSIVE on
+    // these tables in its own order. Reconciliation takes SHARE on the same
+    // tables, so if the two orders disagree anywhere the pair can deadlock and
+    // PostgreSQL kills one side -- an operator's agent deletion, or the
+    // backfill. This asserts the orders agree; the deadlock itself is exercised
+    // for real by `reconciliation_does_not_deadlock_with_a_concurrent_deletion`.
+    let deletion = delete_agent_table_order();
+    let locked: std::collections::BTreeSet<&str> =
+        RECONCILIATION_LOCK_ORDER.iter().copied().collect();
+
+    let deletion_order: Vec<&str> = deletion
+        .iter()
+        .map(String::as_str)
+        .filter(|t| locked.contains(t))
+        .collect();
+    let lock_order: Vec<&str> = RECONCILIATION_LOCK_ORDER
+        .iter()
+        .copied()
+        .filter(|t| deletion_order.contains(t))
+        .collect();
+
+    assert_eq!(
+        lock_order, deletion_order,
+        "RECONCILIATION_LOCK_ORDER must acquire these tables in the same relative order as \
+         delete_agent, or the two paths can deadlock"
+    );
+
+    // `archival_batches` is reached by ON DELETE CASCADE from `DELETE FROM
+    // agents` rather than by a statement of its own, so it has no place in the
+    // parsed list -- but the cascade takes its lock after the parent's, and the
+    // lock order has to say the same.
+    let pos = |t: &str| {
+        RECONCILIATION_LOCK_ORDER
+            .iter()
+            .position(|x| *x == t)
+            .unwrap_or_else(|| panic!("{t} is in the lock order"))
+    };
+    assert!(
+        pos("archival_batches") > pos("agents"),
+        "archival_batches is cascaded by the agents delete, so it must be locked after agents"
+    );
+}
+
+#[sqlx::test]
+async fn reconciliation_does_not_deadlock_with_a_concurrent_deletion(pool: PgPool) {
+    // The real thing, not only the source-order assertion: reproduce the exact
+    // interleaving that deadlocked under the previous alphabetical order.
+    //
+    // Under that order reconciliation took `audit_logs` before `entities`. A
+    // deletion holding `entities` and then reaching for `audit_logs` closed the
+    // cycle, and PostgreSQL resolved it by aborting one side. Under
+    // delete_agent's order reconciliation blocks on `entities` first, holding
+    // nothing the deletion needs, so the deletion runs to completion and the
+    // backfill proceeds behind it.
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    // Seeded *through* the bridges, so every row is already owned and the run
+    // has nothing to batch. That matters: an unsettled row would put the batch
+    // UPDATE behind the deletion's row lock, and the run would stall there
+    // instead of reaching the reconciliation lock this test is about.
+    seed_row_everywhere(&pool, "agent-a").await;
+
+    // A deletion in flight, holding ROW EXCLUSIVE on `entities` exactly as
+    // delete_agent does at that point in its sequence.
+    let mut deleter = pool.acquire().await.expect("second connection");
+    sqlx::query("BEGIN").execute(&mut *deleter).await.unwrap();
+    sqlx::query("DELETE FROM entities WHERE agent_id = $1")
+        .bind("agent-a")
+        .execute(&mut *deleter)
+        .await
+        .expect("delete entities");
+
+    let runner = pool.clone();
+    let run =
+        tokio::spawn(
+            async move { run_tranche_backfill(&runner, TRANCHE, options(10, None)).await },
+        );
+
+    // Reconciliation is now queued on `entities` -- its first lock.
+    await_blocked_share_lock(&pool, "entities").await;
+
+    // The step that used to close the cycle. It must succeed, because
+    // reconciliation is blocked before ever taking `audit_logs`.
+    sqlx::query("DELETE FROM audit_logs WHERE agent_id = $1")
+        .bind("agent-a")
+        .execute(&mut *deleter)
+        .await
+        .expect("a compatible lock order lets the deletion continue past entities");
+
+    sqlx::query("COMMIT").execute(&mut *deleter).await.unwrap();
+    drop(deleter);
+
+    let done = run
+        .await
+        .expect("run task joins")
+        .expect("neither side was aborted by the deadlock detector");
+    assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+}
+
+// ── Bounded reconciliation window ────────────────────────────────────────────
+
+#[sqlx::test]
+async fn a_lock_timeout_abandons_the_window_and_keeps_the_checkpoint_in_progress(pool: PgPool) {
+    // The window holds SHARE on six tables, so an unbounded wait parks the
+    // backfill behind somebody's long transaction and takes the write path down
+    // with it. What matters just as much is what a timeout leaves behind: the
+    // window is one transaction, so it rolls back, and the checkpoint must still
+    // be IN_PROGRESS with no completion recorded anywhere.
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        seed_row_everywhere(&p, "agent-a").await;
+    })
+    .await;
+
+    let mut blocker = pool.acquire().await.expect("second connection");
+    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'held', 'x')")
+        .bind("agent-a")
+        .execute(&mut *blocker)
+        .await
+        .expect("hold ROW EXCLUSIVE on entities");
+
+    let err = run_tranche_backfill(
+        &pool,
+        TRANCHE,
+        BackfillOptions {
+            batch_size: 10,
+            reconcile_lock_timeout_secs: 1,
+            ..BackfillOptions::default()
+        },
+    )
+    .await
+    .expect_err("the reconciliation lock cannot be taken");
+
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("lock timeout") && chain.contains("IN_PROGRESS"),
+        "the error must name the timeout and say what state it left behind: {chain}"
+    );
+
+    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+    drop(blocker);
+
+    // Nothing completed, and the checkpoint is still open and resumable.
+    let (status, completed_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT status, completed_at FROM tenancy_backfill_checkpoints")
+            .fetch_one(&pool)
+            .await
+            .expect("one checkpoint exists");
+    assert_eq!(status, CheckpointStatus::InProgress.as_str());
+    assert_eq!(
+        completed_at, None,
+        "a timeout must never record a completion"
+    );
+
+    // And re-running finishes it, which is what makes the timeout a retry rather
+    // than a dead end.
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("the retry succeeds once the blocker is gone");
+    assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+    assert!(done.is_finalizable());
 }

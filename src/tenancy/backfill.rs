@@ -308,13 +308,35 @@ pub struct BackfillOptions {
     /// the tests use it to stop mid-table and prove the next run picks up from
     /// the persisted cursor instead of from the beginning.
     pub max_batches: Option<u64>,
+    /// How long final reconciliation waits for its table locks before giving up.
+    ///
+    /// The window holds `SHARE` on six tables, so every `INSERT`, `UPDATE` and
+    /// `DELETE` against them queues behind it. Waiting for the locks is the
+    /// cheap half; a wait with no bound is a backfill that parks itself behind
+    /// somebody's long transaction and takes the write path down with it.
+    pub reconcile_lock_timeout_secs: u64,
+    /// How long any one statement inside the window may run.
+    ///
+    /// This is the bound that matters for the *outage*, because the locks are
+    /// held while the counts and the full-registry audit run. Generous by
+    /// default -- the audit is a whole-schema scan and a large deployment should
+    /// not have the command fail out from under it -- but bounded, so a
+    /// pathological plan cannot hold the write path indefinitely.
+    pub reconcile_statement_timeout_secs: u64,
 }
+
+/// Conservative: long enough that a healthy database finishes comfortably,
+/// short enough that a stuck window is measured in seconds, not shifts.
+pub const DEFAULT_RECONCILE_LOCK_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_RECONCILE_STATEMENT_TIMEOUT_SECS: u64 = 300;
 
 impl Default for BackfillOptions {
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
             max_batches: None,
+            reconcile_lock_timeout_secs: DEFAULT_RECONCILE_LOCK_TIMEOUT_SECS,
+            reconcile_statement_timeout_secs: DEFAULT_RECONCILE_STATEMENT_TIMEOUT_SECS,
         }
     }
 }
@@ -333,6 +355,21 @@ impl BackfillOptions {
         }
         if self.max_batches == Some(0) {
             bail!("max_batches must be positive when set; 0 would do nothing and report progress");
+        }
+        // Zero disables the timeout in PostgreSQL rather than making it instant,
+        // so accepting it here would quietly restore the unbounded window these
+        // settings exist to prevent.
+        if self.reconcile_lock_timeout_secs == 0 {
+            bail!(
+                "reconcile_lock_timeout_secs must be positive; PostgreSQL reads 0 as \"no \
+                 timeout\", which is the unbounded lock wait this setting exists to bound"
+            );
+        }
+        if self.reconcile_statement_timeout_secs == 0 {
+            bail!(
+                "reconcile_statement_timeout_secs must be positive; PostgreSQL reads 0 as \"no \
+                 timeout\", which is the unbounded window this setting exists to bound"
+            );
         }
         Ok(())
     }
@@ -654,11 +691,42 @@ async fn run_locked(
         digest,
         state.id,
         targets,
+        options,
         batches_executed,
         settled_this_run,
     )
     .await
 }
+
+/// The order the reconciliation window takes its table locks in.
+///
+/// **Not** the registry's alphabetical order, and the difference is a deadlock.
+/// `memory::store::delete_agent` is a live multi-table write path that takes
+/// `ROW EXCLUSIVE` on `entities`, `memory_graph`, `audit_logs` and
+/// `rmk_policies` in that order, then on `agents` and — by `ON DELETE CASCADE`
+/// from that same statement — `archival_batches`. Alphabetical order put
+/// `audit_logs` before `entities`, so reconciliation could hold `audit_logs`
+/// and wait for `entities` while a deletion held `entities` and waited for
+/// `audit_logs`. PostgreSQL breaks that by aborting one of them, which means
+/// either an operator's agent deletion or the backfill dies for no reason
+/// either of them can see.
+///
+/// This list is therefore `delete_agent`'s order, and
+/// `the_lock_order_matches_the_live_deletion_path` parses `store.rs` to fail if
+/// the two ever drift apart. Locking in a compatible order does not make the two
+/// stop waiting on each other — one still waits — but a wait that resolves is a
+/// different thing from a cycle that cannot.
+pub(super) const RECONCILIATION_LOCK_ORDER: &[&str] = &[
+    "entities",
+    "memory_graph",
+    "audit_logs",
+    "rmk_policies",
+    // `agents` and then `archival_batches`: `delete_agent` reaches both in its
+    // final `DELETE FROM agents`, which takes the parent's lock before the
+    // cascade takes the child's.
+    "agents",
+    "archival_batches",
+];
 
 /// Take the reconciliation window's table locks, in one fixed order.
 ///
@@ -679,20 +747,71 @@ async fn lock_reconciliation_window(
     conn: &mut sqlx::PgConnection,
     targets: &[BackfillTarget],
 ) -> Result<()> {
-    let mut relations = vec![format!("public.{}", SqlIdentifier::new("agents")?.as_sql())];
-    for target in targets {
-        relations.push(format!(
-            "public.{}",
-            SqlIdentifier::new(target.table)?.as_sql()
-        ));
+    // The order is the constant's, but the *set* is still checked against the
+    // tranche, so a target added to the registry without a place in the order
+    // fails here rather than silently going unlocked -- which would leave
+    // exactly the window this whole path exists to close.
+    let expected: std::collections::BTreeSet<&str> = targets
+        .iter()
+        .map(|t| t.table)
+        .chain(std::iter::once("agents"))
+        .collect();
+    let ordered: std::collections::BTreeSet<&str> =
+        RECONCILIATION_LOCK_ORDER.iter().copied().collect();
+    if expected != ordered {
+        bail!(
+            "RECONCILIATION_LOCK_ORDER covers {ordered:?} but this tranche needs {expected:?}; a \
+             table with no place in the order would go unlocked during reconciliation"
+        );
+    }
+
+    let mut relations = Vec::with_capacity(RECONCILIATION_LOCK_ORDER.len());
+    for table in RECONCILIATION_LOCK_ORDER {
+        relations.push(format!("public.{}", SqlIdentifier::new(table)?.as_sql()));
     }
 
     let sql = format!("LOCK TABLE {} IN SHARE MODE", relations.join(", "));
     sqlx::query(AssertSqlSafe(sql))
         .execute(conn)
         .await
-        .context("locking the tranche's tables for final reconciliation")?;
+        .map_err(|e| lock_window_error(e, "acquiring the reconciliation locks"))?;
     Ok(())
+}
+
+/// Turn a timeout inside the reconciliation window into something an operator
+/// can act on.
+///
+/// `lock_timeout` surfaces as SQLSTATE 55P03 and `statement_timeout` as 57014.
+/// Both mean "the window was abandoned", and both matter because the reflex on
+/// seeing a failed backfill is to re-run it -- which is the right thing here and
+/// the wrong thing for most other failures, so the message says so.
+fn lock_window_error(error: sqlx::Error, doing: &str) -> anyhow::Error {
+    let code = error
+        .as_database_error()
+        .and_then(|e| e.code())
+        .unwrap_or_default()
+        .to_string();
+
+    let hint = match code.as_str() {
+        "55P03" => Some(
+            "the reconciliation lock timeout expired: another transaction holds a conflicting \
+             lock on one of the tranche's tables",
+        ),
+        "57014" => Some(
+            "the reconciliation statement timeout expired: counting and auditing the tranche \
+             took longer than the configured budget",
+        ),
+        _ => None,
+    };
+
+    match hint {
+        Some(hint) => anyhow!(error).context(format!(
+            "{doing}: {hint}. Nothing was committed and the checkpoint is still IN_PROGRESS, so \
+             re-running the backfill resumes from where it stopped. Retry in a quieter window, \
+             or raise the timeout."
+        )),
+        None => anyhow!(error).context(doing.to_string()),
+    }
 }
 
 /// Reconcile the accounting against the live tables, consult the audit, and
@@ -722,20 +841,52 @@ async fn lock_reconciliation_window(
 /// serialization-failure mode on the checkpoint row (deliberately *not* locked,
 /// so the row stays reachable) while excluding nothing the locks do not already
 /// exclude.
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     pool: &PgPool,
     tranche: Tranche,
     digest: String,
     checkpoint_id: Uuid,
     targets: &[BackfillTarget],
+    options: BackfillOptions,
     batches_executed: u64,
     settled_this_run: i64,
 ) -> Result<TrancheBackfillReport> {
     let mut tx = pool.begin().await?;
 
+    // Transaction-local, and only here. The batches deliberately run without
+    // either bound: they take ordinary row locks, they are already bounded by
+    // `batch_size`, and a batch that fails a timeout would strand the run
+    // mid-scan for no gain. This window is the one that holds table locks.
+    //
+    // `set_config(.., true)` rather than an interpolated `SET LOCAL`: the value
+    // is a bind parameter, so no number this function computed is ever spliced
+    // into SQL text.
+    for (setting, seconds) in [
+        ("lock_timeout", options.reconcile_lock_timeout_secs),
+        (
+            "statement_timeout",
+            options.reconcile_statement_timeout_secs,
+        ),
+    ] {
+        sqlx::query("SELECT set_config($1, $2, true)")
+            .bind(setting)
+            .bind(format!("{seconds}s"))
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("setting {setting} for the reconciliation window"))?;
+    }
+
     lock_reconciliation_window(&mut tx, targets).await?;
 
-    let counts = count_rows_within(&mut tx, targets).await?;
+    let counts = count_rows_within(&mut tx, targets).await.map_err(|e| {
+        match e.downcast::<sqlx::Error>() {
+            Ok(db) => {
+                lock_window_error(db, "counting the tranche inside the reconciliation window")
+            }
+            Err(other) => other,
+        }
+    })?;
 
     // The authoritative verdict. Derived from the audit's own tranche readiness
     // rather than recomputed from `findings`, so `blocking_count == 0` and
@@ -1292,31 +1443,63 @@ impl TrancheLock {
     /// means the state is not what this type believed, so it is treated the same
     /// as a failed query.
     pub(super) async fn release(mut self) -> LockCleanup {
-        let Some(mut conn) = self.conn.take() else {
+        // The connection stays inside `self` across the unlock await, and that
+        // is the whole point of this shape.
+        //
+        // Taking it out first -- into a local `PoolConnection` -- looks
+        // equivalent and is not. If the future is cancelled while
+        // `pg_advisory_unlock` is in flight (a caller aborting the task, a
+        // future management request being cancelled), the local is dropped and
+        // a `PoolConnection` drop *returns it to the pool*, still holding the
+        // lock; `Drop` below then sees `None` and cannot rescue it. Leaving it
+        // in `self` means cancellation runs `Drop` with the connection still
+        // present, which detaches and closes it. Same poisoning this type
+        // exists to prevent, reached by cancellation rather than by error.
+        let Some(conn) = self.conn.as_mut() else {
             // Unreachable while `release` consumes `self`, and cheap to state.
             return LockCleanup::Unlocked;
         };
 
         let unlock_error = match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(TRANCHE_BACKFILL_ADVISORY_LOCK_ID)
-            .fetch_one(&mut *conn)
+            .fetch_one(&mut **conn)
             .await
         {
-            Ok(true) => return LockCleanup::Unlocked,
+            Ok(true) => {
+                // Proven released. Only now is handing the connection back
+                // safe, so only now is it taken out of the guard.
+                drop(self.conn.take());
+                return LockCleanup::Unlocked;
+            }
             Ok(false) => "pg_advisory_unlock returned false: this session did not hold the \
                           tranche backfill lock, so the lock state is not what this run assumed"
                 .to_string(),
             Err(e) => format!("pg_advisory_unlock failed: {e}"),
         };
 
-        // Unlock unproven. Take the connection out of the pool and end its
-        // session, which releases every session-level lock it held. Closing one
-        // connection is a far smaller price than a pool that can never run a
-        // backfill again.
-        match conn.close().await {
+        // Unlock unproven, so the connection must not go back to the pool.
+        //
+        // `detach` first and synchronously: it removes the connection from the
+        // pool's accounting with no await in between, so from here on no
+        // cancellation can hand it to another borrower. Only then is the close
+        // awaited -- and if *that* is cancelled, dropping a detached connection
+        // closes it rather than returning it.
+        let raw = self
+            .conn
+            .take()
+            .expect("still held: `as_mut` above succeeded and nothing took it since")
+            .detach();
+
+        match sqlx::Connection::close(raw).await {
             Ok(()) => LockCleanup::ConnectionClosed { why: unlock_error },
+            // The connection is detached either way, so the pool is not
+            // poisoned; what is unproven is whether the backend has gone yet,
+            // and until it does the lock may still be held.
             Err(close) => LockCleanup::Leaked {
-                why: format!("{unlock_error}; closing the connection also failed: {close}"),
+                why: format!(
+                    "{unlock_error}; closing the connection also failed: {close}. The connection \
+                     was detached from the pool, so no later borrower can inherit it"
+                ),
             },
         }
     }
@@ -1506,19 +1689,34 @@ mod tests {
         assert!(BackfillOptions::default().validate().is_ok());
         assert!(BackfillOptions {
             batch_size: 0,
-            max_batches: None
+            ..BackfillOptions::default()
         }
         .validate()
         .is_err());
         assert!(BackfillOptions {
             batch_size: MAX_BATCH_SIZE + 1,
-            max_batches: None
+            ..BackfillOptions::default()
         }
         .validate()
         .is_err());
         assert!(BackfillOptions {
             batch_size: DEFAULT_BATCH_SIZE,
-            max_batches: Some(0)
+            max_batches: Some(0),
+            ..BackfillOptions::default()
+        }
+        .validate()
+        .is_err());
+
+        // Zero disables the timeout in PostgreSQL, so it must be refused too.
+        assert!(BackfillOptions {
+            reconcile_lock_timeout_secs: 0,
+            ..BackfillOptions::default()
+        }
+        .validate()
+        .is_err());
+        assert!(BackfillOptions {
+            reconcile_statement_timeout_secs: 0,
+            ..BackfillOptions::default()
         }
         .validate()
         .is_err());

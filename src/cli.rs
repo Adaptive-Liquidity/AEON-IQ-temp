@@ -315,6 +315,10 @@ pub async fn run(pool: &PgPool, command: Command) -> Result<String> {
                 BackfillOptions {
                     batch_size,
                     max_batches,
+                    // The reconciliation timeouts are engine defaults. The CLI
+                    // carries no opinion of its own about them, so there is no
+                    // second place for them to drift from.
+                    ..BackfillOptions::default()
                 },
             )
             .await?;
