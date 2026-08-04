@@ -1462,6 +1462,101 @@ async fn reconciliation_does_not_deadlock_with_a_concurrent_deletion(pool: PgPoo
     assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
 }
 
+/// Wait until a backend in *this* database is blocked on a lock.
+///
+/// Row locks do not appear in `pg_locks` the way table locks do -- a waiter
+/// shows up against a transaction id or a tuple -- so the batch-level
+/// interleaving is observed through `pg_stat_activity` instead. Scoped to this
+/// database for the same reason every other lock query here is: parallel
+/// `#[sqlx::test]` databases share one cluster.
+async fn await_blocked_backend(pool: &PgPool, ignore_pid_of: &PgPool) {
+    let _ = ignore_pid_of;
+    for _ in 0..400 {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pg_stat_activity \
+              WHERE datname = current_database() \
+                AND state = 'active' \
+                AND wait_event_type = 'Lock' \
+                AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("inspect pg_stat_activity");
+        if blocked > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("no backend ever blocked on a lock");
+}
+
+#[sqlx::test]
+async fn a_batch_does_not_deadlock_with_a_concurrent_agent_deletion(pool: PgPool) {
+    // The second deadlock, and a different one from the reconciliation ordering:
+    // this cycle closes during `run_batch`, before the reconciliation table
+    // locks are ever taken.
+    //
+    // Migration 0041 gives the tranche-1 tables a composite foreign key to
+    // `agents`, and a NOT VALID key still enforces on update -- so the batch's
+    // write of `agent_uuid`/`tenant_id` fires an FK check that takes FOR KEY
+    // SHARE on the parent. Before the fix the batch locked the child row first
+    // and reached for the parent second, while `delete_agent` takes the parent
+    // FOR UPDATE first and the children second. This reproduces that exact
+    // interleaving.
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        for _ in 0..4 {
+            sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, $2, 'x')")
+                .bind("agent-a")
+                .bind(Uuid::new_v4().to_string())
+                .execute(&p)
+                .await
+                .expect("seed entity");
+        }
+    })
+    .await;
+
+    // `delete_agent`'s first statement, verbatim in effect: the parent row,
+    // FOR UPDATE, held open.
+    let mut deleter = pool.acquire().await.expect("second connection");
+    sqlx::query("BEGIN").execute(&mut *deleter).await.unwrap();
+    sqlx::query("SELECT 1 FROM agents WHERE agent_id = $1 FOR UPDATE")
+        .bind("agent-a")
+        .fetch_all(&mut *deleter)
+        .await
+        .expect("hold the agent row");
+
+    let runner = pool.clone();
+    let run =
+        tokio::spawn(async move { run_tranche_backfill(&runner, TRANCHE, options(2, None)).await });
+
+    // The batch is now blocked acquiring FOR KEY SHARE on the agent -- holding
+    // no child rows, which is the property that breaks the cycle.
+    await_blocked_backend(&pool, &pool).await;
+
+    // The step that used to close it. It must succeed: the batch holds nothing
+    // this deletion needs.
+    sqlx::query("DELETE FROM entities WHERE agent_id = $1")
+        .bind("agent-a")
+        .execute(&mut *deleter)
+        .await
+        .expect("locking parents first lets the deletion proceed");
+
+    sqlx::query("COMMIT").execute(&mut *deleter).await.unwrap();
+    drop(deleter);
+
+    let done = run
+        .await
+        .expect("run task joins")
+        .expect("neither side was aborted by the deadlock detector");
+    assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+    assert_eq!(
+        unowned_count(&pool, "entities").await,
+        0,
+        "the deletion removed them; nothing is left unowned"
+    );
+}
+
 // ── Bounded reconciliation window ────────────────────────────────────────────
 
 #[sqlx::test]

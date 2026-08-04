@@ -1023,46 +1023,131 @@ async fn run_batch(
     let agent = SqlIdentifier::new(target.agent_column)?;
     let settled = target.settled_predicate("x", &agent);
 
-    // `last_id` is taken as the batch's own last row rather than with `max()`:
-    // PostgreSQL ships no `max(uuid)` aggregate (measured on pg16 — `function
-    // max(uuid) does not exist`), and every tranche-1 key is a UUID. Reading it
-    // back off the ordered, limited CTE is also the more direct statement of
-    // what the cursor means: the last key this batch scanned.
-    let sql = format!(
-        "WITH batch AS ( \
-             SELECT x.\"id\" \
-               FROM public.{table} x \
-              WHERE ($1::uuid IS NULL OR x.\"id\" > $1::uuid) \
-                AND NOT {settled} \
-              ORDER BY x.\"id\" \
-              LIMIT $2 \
-         ), \
-         updated AS ( \
-             UPDATE public.{table} AS x \
-                SET \"agent_uuid\" = a.\"id\", \"tenant_id\" = a.\"tenant_id\" \
-               FROM public.agents a \
-              WHERE x.\"id\" IN (SELECT \"id\" FROM batch) \
-                AND a.\"agent_id\" = x.{agent} \
-          RETURNING ({settled}) AS is_settled \
-         ) \
-         SELECT (SELECT count(*) FROM batch)::bigint AS scanned, \
-                (SELECT count(*) FROM updated WHERE is_settled)::bigint AS settled, \
-                (SELECT \"id\" FROM batch ORDER BY \"id\" DESC LIMIT 1) AS last_id",
+    // One transaction, three statements, in an order that is the whole point.
+    //
+    // A single `UPDATE` was a deadlock against `memory::store::delete_agent`.
+    // Migration 0041 gives every tranche-1 table a composite foreign key to
+    // `agents`, and a `NOT VALID` key still enforces on update — so writing
+    // `agent_uuid`/`tenant_id` fires an FK check that takes `FOR KEY SHARE` on
+    // the parent row. The batch therefore locked a child row and *then* reached
+    // for the parent, while `delete_agent` takes the parent `FOR UPDATE` first
+    // (`store.rs:110`) and then deletes the children. Child-then-parent against
+    // parent-then-child is a cycle, and PostgreSQL breaks it by aborting one
+    // side: either an operator's agent deletion or this backfill.
+    //
+    // Locking the parents first makes the two paths agree on direction. When
+    // `delete_agent` holds the agent, this blocks at step 2 holding no child
+    // rows at all, so there is nothing for it to wait on and it completes; when
+    // this holds the agent, the deletion waits for a batch that is about to
+    // commit. A wait either way — but a wait that resolves, rather than a cycle
+    // that cannot.
+    //
+    // Deliberately no `lock_timeout` here: the batches take ordinary row locks,
+    // are already bounded by `batch_size`, and a timeout would strand a run
+    // mid-scan. The bounded window is final reconciliation, which holds *table*
+    // locks.
+    let mut tx = pool.begin().await?;
+
+    // 1. Choose the batch. Reads only, so no lock is taken and no ordering
+    //    obligation is incurred yet.
+    let pick = format!(
+        "SELECT x.\"id\" AS id, x.{agent} AS agent_id \
+           FROM public.{table} x \
+          WHERE ($1::uuid IS NULL OR x.\"id\" > $1::uuid) \
+            AND NOT {settled} \
+          ORDER BY x.\"id\" \
+          LIMIT $2",
         table = table.as_sql(),
         agent = agent.as_sql(),
     );
-
-    let row = sqlx::query(AssertSqlSafe(sql))
+    let picked = sqlx::query(AssertSqlSafe(pick))
         .bind(after_id)
         .bind(batch_size)
-        .fetch_one(pool)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| format!("selecting a batch of {}", target.table))?;
+
+    if picked.is_empty() {
+        tx.commit().await?;
+        return Ok(BatchResult {
+            scanned: 0,
+            settled: 0,
+            last_id: None,
+        });
+    }
+
+    let ids: Vec<Uuid> = picked
+        .iter()
+        .map(|r| r.try_get::<Uuid, _>("id"))
+        .collect::<Result<_, _>>()?;
+    // `last_id` is the batch's own last row rather than a `max()`: PostgreSQL
+    // ships no `max(uuid)` aggregate (measured on pg16 — `function max(uuid)
+    // does not exist`), and the rows are already in key order.
+    let last_id = ids.last().copied();
+
+    // The agents this batch touches. `agent_id` is NULL-able on `audit_logs`,
+    // and an agentless row has no parent to lock.
+    let mut agent_ids: Vec<String> = picked
+        .iter()
+        .filter_map(|r| r.try_get::<Option<String>, _>("agent_id").transpose())
+        .collect::<Result<_, _>>()?;
+    agent_ids.sort_unstable();
+    agent_ids.dedup();
+
+    // 2. Lock the parents, before any child row is touched.
+    //
+    // `FOR KEY SHARE` is exactly what the foreign-key check would take, so this
+    // adds no contention the `UPDATE` was not already going to create — it only
+    // moves it earlier, to a point where this transaction holds nothing.
+    // `ORDER BY` makes the acquisition order deterministic, so two batches can
+    // never take the same pair of agents in opposite orders.
+    if !agent_ids.is_empty() {
+        sqlx::query(
+            "SELECT 1 FROM public.agents WHERE agent_id = ANY($1) \
+              ORDER BY agent_id FOR KEY SHARE",
+        )
+        .bind(&agent_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .with_context(|| {
+            format!(
+                "locking the parent agents for a batch of {} before updating it",
+                target.table
+            )
+        })?;
+    }
+
+    // 3. Now the children.
+    let update = format!(
+        "UPDATE public.{table} AS x \
+            SET \"agent_uuid\" = a.\"id\", \"tenant_id\" = a.\"tenant_id\" \
+           FROM public.agents a \
+          WHERE x.\"id\" = ANY($1) \
+            AND a.\"agent_id\" = x.{agent} \
+      RETURNING ({settled}) AS is_settled",
+        table = table.as_sql(),
+        agent = agent.as_sql(),
+    );
+    let updated = sqlx::query(AssertSqlSafe(update))
+        .bind(&ids)
+        .fetch_all(&mut *tx)
         .await
         .with_context(|| format!("backfilling a batch of {}", target.table))?;
 
+    let settled_now = updated
+        .iter()
+        .map(|r| r.try_get::<bool, _>("is_settled"))
+        .collect::<Result<Vec<bool>, _>>()?
+        .into_iter()
+        .filter(|s| *s)
+        .count() as i64;
+
+    tx.commit().await?;
+
     Ok(BatchResult {
-        scanned: row.try_get("scanned")?,
-        settled: row.try_get("settled")?,
-        last_id: row.try_get("last_id")?,
+        scanned: ids.len() as i64,
+        settled: settled_now,
+        last_id,
     })
 }
 
