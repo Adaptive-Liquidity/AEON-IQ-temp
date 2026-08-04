@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::backfill::{
     abandon_tranche_backfill, run_tranche_backfill, targets_for, tranche_backfill_status,
-    BackfillOptions, BackfillOutcome,
+    BackfillOptions, BackfillOutcome, LockCleanup, TrancheLock, MIN_BACKFILL_CONNECTIONS,
 };
 use super::inventory::Tranche;
 use super::plan::CheckpointStatus;
@@ -25,6 +25,11 @@ use super::report;
 
 const TENANT: &str = "11111111-1111-1111-1111-111111111111";
 const TRANCHE: Tranche = Tranche::RootsAndDirectAgentChildren;
+
+/// Mirrors `backfill::TRANCHE_BACKFILL_ADVISORY_LOCK_ID`, which is private.
+/// `the_lock_id_these_tests_watch_is_the_one_the_engine_takes` fails if they
+/// drift, so these tests cannot end up watching a lock nobody takes.
+const TRANCHE_LOCK_ID: i64 = 0x4145_4F4E_5442;
 
 fn options(batch_size: i64, max_batches: Option<u64>) -> BackfillOptions {
     BackfillOptions {
@@ -862,4 +867,409 @@ async fn an_empty_database_completes_the_tranche(pool: PgPool) {
     assert_eq!(report.rows_total, 0);
     assert_eq!(report.rows_backfilled, 0);
     assert!(report.is_finalizable());
+}
+
+// ── Atomic final reconciliation ──────────────────────────────────────────────
+//
+// `finish` used to reconcile across three separately-committed snapshots: the
+// counts, then the audit, then the checkpoint write. Each gap was a window in
+// which a row could be inserted that the completion would never see, and the
+// bridge writes such a row with NULL ownership rather than refusing it -- so a
+// checkpoint claiming a clean tranche could be persisted over a table holding a
+// NULL, and FINALIZE would then validate a NOT NULL constraint against it.
+//
+// The tests below drive that window deliberately rather than hoping to hit it.
+
+/// Wait until PostgreSQL shows an ungranted `ShareLock` request on `table`.
+///
+/// This is what makes the interleaving tests deterministic instead of timing
+/// races: it is direct evidence that the run has reached `finish`, taken the
+/// reconciliation lock's place in the queue, and is blocked there -- so anything
+/// committed after this returns is committed strictly inside the window.
+async fn await_blocked_share_lock(pool: &PgPool, table: &str) {
+    // ~10s: generous for a loaded CI runner to batch a handful of rows and
+    // reach `finish`, short enough that a regression fails promptly.
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint \
+               FROM pg_locks l \
+               JOIN pg_class c ON c.oid = l.relation \
+              WHERE c.relname = $1 AND l.mode = 'ShareLock' AND NOT l.granted",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .expect("inspect pg_locks");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!(
+        "no session ever blocked waiting for a SHARE lock on {table}; the final reconciliation \
+         is not excluding concurrent writes"
+    );
+}
+
+#[sqlx::test]
+async fn a_blocker_committed_before_reconciliation_prevents_completion(pool: PgPool) {
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        for _ in 0..4 {
+            sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, $2, 'x')")
+                .bind("agent-a")
+                .bind(Uuid::new_v4().to_string())
+                .execute(&p)
+                .await
+                .expect("seed entity");
+        }
+    })
+    .await;
+
+    // Stop with work left, so the completing run's reconciliation happens after
+    // the blocker below rather than before it.
+    let paused = run_tranche_backfill(&pool, TRANCHE, options(2, Some(1)))
+        .await
+        .expect("bounded run");
+    assert_eq!(paused.outcome, BackfillOutcome::Paused);
+
+    // A row the bridge itself cannot own: the agent does not exist, so ownership
+    // is written NULL and the row is an ORPHANED_AGENT_REFERENCE.
+    sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'blocker', 'x')")
+        .bind("agent-that-does-not-exist")
+        .execute(&pool)
+        .await
+        .expect("commit the blocker");
+
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("resumed run");
+
+    assert_eq!(
+        done.outcome,
+        BackfillOutcome::Blocked,
+        "a blocker committed before reconciliation must be seen by it: {done:?}"
+    );
+    assert!(!done.is_finalizable());
+    assert!(
+        done.blocking_reasons.iter().any(|r| r.contains("entities")),
+        "{:?}",
+        done.blocking_reasons
+    );
+
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM tenancy_backfill_checkpoints WHERE status = 'COMPLETED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count completions");
+    assert_eq!(
+        completed, 0,
+        "no completion may exist over a blocked tranche"
+    );
+}
+
+#[sqlx::test]
+async fn a_write_cannot_slip_between_the_audit_and_the_checkpoint(pool: PgPool) {
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'e', 'x')")
+            .bind("agent-a")
+            .execute(&p)
+            .await
+            .expect("seed entity");
+    })
+    .await;
+
+    // Connection B holds an uncommitted INSERT, so it owns ROW EXCLUSIVE on
+    // `entities`. The backfill's batches do not conflict with that -- they touch
+    // different rows -- but `finish`'s SHARE lock does, so the run proceeds to
+    // reconciliation and stops there.
+    let mut blocker = pool.acquire().await.expect("second connection");
+    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'late', 'x')")
+        .bind("agent-that-does-not-exist")
+        .execute(&mut *blocker)
+        .await
+        .expect("uncommitted insert");
+
+    let runner = pool.clone();
+    let run =
+        tokio::spawn(
+            async move { run_tranche_backfill(&runner, TRANCHE, options(10, None)).await },
+        );
+
+    // Deterministic: the run is now inside `finish`, waiting for the lock.
+    await_blocked_share_lock(&pool, "entities").await;
+    assert!(
+        !run.is_finished(),
+        "the run must be blocked, not past the lock"
+    );
+
+    // Commit strictly inside the window the old code left open.
+    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+    drop(blocker);
+
+    let done = run
+        .await
+        .expect("run task joins")
+        .expect("run returns a report");
+
+    assert_eq!(
+        done.outcome,
+        BackfillOutcome::Blocked,
+        "the row committed during the window must be inside the verdict, not after it: {done:?}"
+    );
+    assert_eq!(
+        done.rows_total, 2,
+        "the late row must be counted, not missed by a snapshot taken before it"
+    );
+    assert!(!done.is_finalizable());
+
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM tenancy_backfill_checkpoints WHERE status = 'COMPLETED'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count completions");
+    assert_eq!(completed, 0);
+}
+
+#[sqlx::test]
+async fn no_completion_is_reported_when_the_guarded_update_writes_nothing(pool: PgPool) {
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'e', 'x')")
+            .bind("agent-a")
+            .execute(&p)
+            .await
+            .expect("seed entity");
+    })
+    .await;
+
+    // Same mechanism as above, used to open a window in the *checkpoint* rather
+    // than in the data: hold the run at the reconciliation lock, retire its
+    // checkpoint underneath it, then let it through.
+    let mut blocker = pool.acquire().await.expect("second connection");
+    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'x', 'x')")
+        .bind("agent-a")
+        .execute(&mut *blocker)
+        .await
+        .expect("uncommitted insert");
+
+    let runner = pool.clone();
+    let run =
+        tokio::spawn(
+            async move { run_tranche_backfill(&runner, TRANCHE, options(10, None)).await },
+        );
+
+    await_blocked_share_lock(&pool, "entities").await;
+
+    // The checkpoint table is deliberately not locked, so this succeeds.
+    let retired = sqlx::query(
+        "UPDATE tenancy_backfill_checkpoints SET status = 'ABANDONED' WHERE status = 'IN_PROGRESS'",
+    )
+    .execute(&pool)
+    .await
+    .expect("retire the checkpoint");
+    assert_eq!(retired.rows_affected(), 1, "there was one open checkpoint");
+
+    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+    drop(blocker);
+
+    let err = run
+        .await
+        .expect("run task joins")
+        .expect_err("a completion that wrote no row must not be reported");
+    let message = err.to_string();
+    assert!(
+        message.contains("no longer IN_PROGRESS") && message.contains("0 rows"),
+        "the refusal must say the guarded update matched nothing: {message}"
+    );
+
+    // And nothing was committed: the retired checkpoint is untouched.
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM tenancy_backfill_checkpoints \
+          WHERE status = 'COMPLETED' OR completed_at IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count completions");
+    assert_eq!(
+        completed, 0,
+        "a rolled-back finish must leave no completion"
+    );
+}
+
+// ── Pool sizing ──────────────────────────────────────────────────────────────
+
+#[sqlx::test]
+async fn a_single_connection_pool_is_refused_by_the_engine(pool: PgPool) {
+    // The CLI checks this too, but the engine is where it has to hold: a future
+    // management endpoint is a second caller, and a check that lives only in the
+    // command handler is one the endpoint would have to remember to repeat.
+    // Without it the run acquires the pool's only connection for the advisory
+    // lock and then deadlocks against itself until the acquire timeout expires.
+    let connect_options = (*pool.connect_options()).clone();
+    let single = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect_with(connect_options)
+        .await
+        .expect("one-connection pool");
+
+    let started = std::time::Instant::now();
+    let err = run_tranche_backfill(&single, TRANCHE, options(10, None))
+        .await
+        .expect_err("a pool of one cannot run a backfill");
+    let message = err.to_string();
+
+    assert!(
+        message.contains("DB_MAX_CONNECTIONS") && message.contains("advisory lock"),
+        "the refusal must name the variable and the reason: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "the refusal must be immediate, not an acquire timeout"
+    );
+    const { assert!(MIN_BACKFILL_CONNECTIONS >= 2) };
+
+    single.close().await;
+}
+
+// ── Advisory-lock cleanup ────────────────────────────────────────────────────
+
+/// Whether *this database* holds the tranche backfill advisory lock.
+///
+/// The `database` predicate is load-bearing, not tidiness. An advisory lock's
+/// key space is per-database, so two databases in one cluster can hold the same
+/// id at once -- and `#[sqlx::test]` gives every test its own database inside a
+/// shared cluster. Without the filter this reads every concurrent test's lock as
+/// its own, which is how the first version of these tests both failed spuriously
+/// and, worse, terminated other tests' backends.
+async fn tranche_lock_is_held(pool: &PgPool) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*)::bigint FROM pg_locks \
+          WHERE locktype = 'advisory' AND granted \
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+            AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(TRANCHE_LOCK_ID)
+    .fetch_one(pool)
+    .await
+    .expect("inspect advisory locks")
+        > 0
+}
+
+#[sqlx::test]
+async fn a_completed_run_leaves_no_advisory_lock_behind(pool: PgPool) {
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    without_bridges(&pool, |p| async move {
+        seed_row_everywhere(&p, "agent-a").await;
+    })
+    .await;
+
+    assert!(!tranche_lock_is_held(&pool).await, "nothing holds it yet");
+
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("backfill runs");
+    assert_eq!(done.outcome, BackfillOutcome::Completed);
+
+    assert!(
+        !tranche_lock_is_held(&pool).await,
+        "the session lock must be released, not carried back into the pool on a recycled \
+         connection where nothing can ever release it"
+    );
+
+    // The observable consequence of a leak: acquire refuses. Proving it still
+    // works is what says the release was real rather than merely attempted.
+    let again = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("a later run can still take the lock");
+    assert_eq!(again.outcome, BackfillOutcome::AlreadyCompleted);
+}
+
+#[sqlx::test]
+async fn an_unlock_that_cannot_be_confirmed_discards_the_connection(pool: PgPool) {
+    // Induces a real unlock failure rather than asserting about one: the
+    // lock-holding backend is terminated, so `pg_advisory_unlock` cannot run on
+    // it. The old lifecycle set `released = true` before awaiting that query, so
+    // this path returned a connection to the pool marked clean; the rewritten
+    // one has to report that it could not confirm the unlock and take the
+    // connection out of circulation instead.
+    let lock = TrancheLock::acquire(&pool).await.expect("acquire the lock");
+    assert!(tranche_lock_is_held(&pool).await, "the lock is held");
+
+    // Scoped to this test's own database for the reason `tranche_lock_is_held`
+    // documents: an unscoped terminate would kill the backends of every other
+    // test running concurrently in the same cluster.
+    let killed: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM (\
+             SELECT pg_terminate_backend(l.pid) \
+               FROM pg_locks l \
+              WHERE l.locktype = 'advisory' AND l.granted \
+                AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                AND ((l.classid::bigint << 32) | l.objid::bigint) = $1 \
+                AND l.pid <> pg_backend_pid()\
+         ) t",
+    )
+    .bind(TRANCHE_LOCK_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("terminate the lock holder");
+    assert_eq!(
+        killed, 1,
+        "exactly one backend in this database held the lock"
+    );
+
+    let cleanup = lock.release().await;
+    assert!(
+        !matches!(cleanup, LockCleanup::Unlocked),
+        "an unlock issued on a terminated backend must not be reported as confirmed: {cleanup:?}"
+    );
+    assert!(
+        cleanup.is_guaranteed(),
+        "closing the connection still proves the lock is gone: {cleanup:?}"
+    );
+
+    // The terminated session took the lock with it, and the pool is usable.
+    assert!(!tranche_lock_is_held(&pool).await);
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("the pool is not poisoned");
+    assert_eq!(done.outcome, BackfillOutcome::Completed);
+}
+
+#[sqlx::test]
+async fn a_second_run_is_refused_while_the_first_holds_the_lock(pool: PgPool) {
+    let lock = TrancheLock::acquire(&pool).await.expect("acquire");
+
+    let err = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect_err("the lock is held");
+    assert!(
+        err.to_string().contains("already running"),
+        "the refusal must say why: {err}"
+    );
+
+    assert!(matches!(lock.release().await, LockCleanup::Unlocked));
+    assert!(!tranche_lock_is_held(&pool).await);
+}
+
+#[sqlx::test]
+async fn the_lock_id_these_tests_watch_is_the_one_the_engine_takes(pool: PgPool) {
+    // `TRANCHE_LOCK_ID` is a copy of a private constant. A copy that drifts
+    // would make every lock assertion above vacuously true -- watching an id
+    // nothing ever takes reports "no lock held" forever. Rather than widen the
+    // engine's constant to `pub(super)` for this, hold the real lock and check
+    // that the id these tests watch is the one that lights up.
+    let lock = TrancheLock::acquire(&pool).await.expect("acquire");
+    assert!(
+        tranche_lock_is_held(&pool).await,
+        "the engine's lock id and TRANCHE_LOCK_ID have drifted apart"
+    );
+    assert!(matches!(lock.release().await, LockCleanup::Unlocked));
 }

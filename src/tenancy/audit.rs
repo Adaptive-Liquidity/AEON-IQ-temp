@@ -1209,6 +1209,33 @@ pub async fn run(
     }
 }
 
+/// Run the audit inside a transaction the caller already owns.
+///
+/// [`run`] is the public surface and keeps its own `REPEATABLE READ READ ONLY`
+/// transaction; this exists for the one caller that needs the audit's verdict to
+/// be part of a *larger* atomic step. `backfill::finish` locks the tranche's
+/// tables, counts them, audits them and writes the checkpoint in a single
+/// transaction, and an audit that opened and committed its own snapshot in the
+/// middle of that would be describing a different database than the one being
+/// completed.
+///
+/// `pub(super)` rather than `pub`: this hands the caller a connection mid-flight,
+/// so it is only sound for a caller that already understands the transaction it
+/// is inside. Two consequences that caller inherits:
+///
+/// * The transaction is the caller's, so **nothing here commits or rolls back**.
+///   An error leaves that transaction alive and abortable, which is what lets
+///   `finish` refuse to commit rather than half-complete.
+/// * `SET LOCAL search_path = pg_catalog, public` is applied below and lasts to
+///   the end of the *caller's* transaction. Every statement the caller runs
+///   afterwards must therefore be schema-qualified, which `finish` is.
+pub(super) async fn run_within(
+    conn: &mut sqlx::PgConnection,
+    generated_at: Option<String>,
+) -> Result<TenancyAuditReport, AuditError> {
+    audit_within_snapshot(conn, generated_at).await
+}
+
 async fn audit_within_snapshot(
     conn: &mut sqlx::PgConnection,
     generated_at: Option<String>,

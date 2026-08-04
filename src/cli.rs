@@ -27,6 +27,7 @@ use sqlx::PgPool;
 
 use crate::tenancy::backfill::{
     self, BackfillOptions, TrancheBackfillReport, DEFAULT_BATCH_SIZE, MAX_BATCH_SIZE,
+    MIN_BACKFILL_CONNECTIONS,
 };
 use crate::tenancy::inventory::Tranche;
 
@@ -98,6 +99,23 @@ pub enum TenancyCommand {
         #[arg(long, default_value = DEFAULT_ABANDON_REASON)]
         reason: String,
     },
+}
+
+impl TenancyCommand {
+    /// Connections this command needs before it is worth opening a pool.
+    ///
+    /// Only the backfill holds a connection for the length of the run: its
+    /// session advisory lock sits on one while the batches use another. `status`
+    /// reads a single row and `abandon` does its work inside one transaction
+    /// with `pg_advisory_xact_lock`, so both are genuinely fine on a pool of
+    /// one, and demanding two from them would refuse a deployment that can
+    /// actually serve them.
+    const fn min_connections(&self) -> u32 {
+        match self {
+            Self::Backfill { .. } => MIN_BACKFILL_CONNECTIONS,
+            Self::BackfillStatus { .. } | Self::BackfillAbandon { .. } => 1,
+        }
+    }
 }
 
 /// The tranche argument.
@@ -179,30 +197,58 @@ pub struct DbSettings {
 
 impl DbSettings {
     pub fn from_env() -> Result<Self> {
-        fn parsed<T: std::str::FromStr>(key: &str, default: T) -> Result<T>
-        where
-            T::Err: std::fmt::Display,
-        {
-            match std::env::var(key) {
-                Ok(raw) => raw
-                    .parse()
-                    .map_err(|e| anyhow::anyhow!("{key} must be a positive integer: {e}")),
-                Err(_) => Ok(default),
-            }
-        }
-
         Ok(Self {
             database_url: std::env::var("DATABASE_URL")
                 .context("DATABASE_URL is required to run a tenancy command")?,
             // A smaller default pool than the server's: an operator command runs
             // its batches sequentially and holds one extra connection for the
             // advisory lock, so a server-sized pool would reserve connections it
-            // can never use.
-            max_connections: parsed("DB_MAX_CONNECTIONS", 4)?,
-            acquire_timeout_secs: parsed("DB_ACQUIRE_TIMEOUT_SECS", 5)?,
-            idle_timeout_secs: parsed("DB_IDLE_TIMEOUT_SECS", 300)?,
+            // can never use. Still >= MIN_BACKFILL_CONNECTIONS, so the default
+            // can run every command.
+            max_connections: positive("DB_MAX_CONNECTIONS", read_env, 4)?,
+            acquire_timeout_secs: positive("DB_ACQUIRE_TIMEOUT_SECS", read_env, 5)?,
+            idle_timeout_secs: positive("DB_IDLE_TIMEOUT_SECS", read_env, 300)?,
         })
     }
+}
+
+fn read_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// Parse a positive integer, and mean it.
+///
+/// `u32` and `u64` both parse `"0"` quite happily, so the error text's promise
+/// of "a positive integer" used to be advisory. Zero is not a harmless setting
+/// for any of the three variables this reads: `DB_MAX_CONNECTIONS=0` builds a
+/// pool that can never hand out a connection, so the command fails an acquire
+/// timeout several seconds later instead of a configuration error immediately,
+/// and a zero timeout is a pool that gives up before it has tried.
+///
+/// The lookup is a parameter rather than a direct `std::env::var` so the rule
+/// can be tested without mutating process-global state — env-var tests race
+/// against every other test in the binary, and a flaky guard is worse than the
+/// bug it guards.
+fn positive<T>(key: &str, lookup: impl Fn(&str) -> Option<String>, default: T) -> Result<T>
+where
+    T: std::str::FromStr + PartialEq + Default + std::fmt::Display,
+    T::Err: std::fmt::Display,
+{
+    let Some(raw) = lookup(key) else {
+        return Ok(default);
+    };
+    let value: T = raw
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{key} must be a positive integer, got {raw:?}: {e}"))?;
+    if value == T::default() {
+        bail!(
+            "{key} must be a positive integer, got {value}. Zero would build a pool that can \
+             never serve a request, which surfaces as an acquire timeout rather than as the \
+             configuration error it is."
+        );
+    }
+    Ok(value)
 }
 
 // ── Dispatch ─────────────────────────────────────────────────────────────────
@@ -215,6 +261,21 @@ impl DbSettings {
 /// report. A missing checkpoint table is reported as the missing stage it is.
 pub async fn dispatch(command: Command) -> Result<()> {
     let settings = DbSettings::from_env()?;
+
+    // Checked before the pool is built, so an under-provisioned deployment gets
+    // a sentence naming the variable rather than an acquire timeout several
+    // seconds later. The engine enforces its own minimum too — this one exists
+    // so the operator hears about it before anything connects.
+    let Command::Tenancy { command: ref inner } = command;
+    let required = inner.min_connections();
+    if settings.max_connections < required {
+        bail!(
+            "this command needs at least {required} database connection(s) but \
+             DB_MAX_CONNECTIONS is {}. Raise it to {required} or more.",
+            settings.max_connections,
+        );
+    }
+
     let pool = crate::db::connect(
         &settings.database_url,
         settings.max_connections,
@@ -604,6 +665,75 @@ mod tests {
         assert!(
             parse(&["memoryos", "tenancy", "backfill"]).is_err(),
             "--tranche is required"
+        );
+    }
+
+    #[test]
+    fn zero_is_refused_for_every_pool_setting() {
+        // `u32`/`u64` parse "0" successfully, so nothing but this check stands
+        // between DB_MAX_CONNECTIONS=0 and a pool that can never hand out a
+        // connection. The failure that produces is an acquire timeout seconds
+        // later, which reads as a busy database rather than a typo.
+        for key in [
+            "DB_MAX_CONNECTIONS",
+            "DB_ACQUIRE_TIMEOUT_SECS",
+            "DB_IDLE_TIMEOUT_SECS",
+        ] {
+            let err = positive::<u64>(key, |_| Some("0".into()), 7).expect_err("zero is refused");
+            let message = err.to_string();
+            assert!(
+                message.contains(key) && message.contains("positive"),
+                "the refusal must name the variable and the rule: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn positive_accepts_values_and_falls_back_to_the_default() {
+        assert_eq!(positive::<u32>("K", |_| Some("12".into()), 4).unwrap(), 12);
+        assert_eq!(positive::<u32>("K", |_| None, 4).unwrap(), 4);
+        assert_eq!(positive::<u32>("K", |_| Some(" 9 ".into()), 4).unwrap(), 9);
+        assert!(positive::<u32>("K", |_| Some("nope".into()), 4).is_err());
+        assert!(positive::<u32>("K", |_| Some("-1".into()), 4).is_err());
+    }
+
+    #[test]
+    fn only_the_backfill_demands_a_second_connection() {
+        // The backfill parks one connection on the session advisory lock for the
+        // whole run. `status` and `abandon` do not, and demanding two from them
+        // would refuse a deployment that can actually serve them.
+        assert_eq!(
+            TenancyCommand::Backfill {
+                tranche: TrancheArg::Tranche1,
+                batch_size: DEFAULT_BATCH_SIZE,
+                max_batches: None,
+            }
+            .min_connections(),
+            MIN_BACKFILL_CONNECTIONS,
+        );
+        const { assert!(MIN_BACKFILL_CONNECTIONS >= 2, "one connection is the bug") };
+
+        for command in [
+            TenancyCommand::BackfillStatus {
+                tranche: TrancheArg::Tranche1,
+            },
+            TenancyCommand::BackfillAbandon {
+                tranche: TrancheArg::Tranche1,
+                reason: "r".into(),
+            },
+        ] {
+            assert_eq!(command.min_connections(), 1, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_pool_can_run_every_command() {
+        // The default has to satisfy the strictest command, or an operator who
+        // sets nothing at all gets a refusal for a pool they never chose.
+        let default_max = positive::<u32>("DB_MAX_CONNECTIONS", |_| None, 4).unwrap();
+        assert!(
+            default_max >= MIN_BACKFILL_CONNECTIONS,
+            "default pool of {default_max} cannot run a backfill"
         );
     }
 

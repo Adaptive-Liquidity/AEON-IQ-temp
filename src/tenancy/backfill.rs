@@ -92,6 +92,19 @@ pub const MAX_BATCH_SIZE: i64 = 50_000;
 
 pub const DEFAULT_BATCH_SIZE: i64 = 1_000;
 
+/// Connections a backfill needs before it can make any progress at all.
+///
+/// One is held for the whole run by the session advisory lock and never issues
+/// another statement; every batch, every checkpoint write and the final
+/// reconciliation run on a second. With a pool of one, `acquire` takes the only
+/// connection and the first query after it waits out `DB_ACQUIRE_TIMEOUT_SECS`
+/// before failing with a timeout that says nothing about the cause.
+///
+/// Enforced in the engine rather than only in the CLI. The CLI is one caller of
+/// three — a management endpoint is coming — and a check that lives in the
+/// command handler is one the endpoint would have to remember to repeat.
+pub const MIN_BACKFILL_CONNECTIONS: u32 = 2;
+
 // ── Targets ──────────────────────────────────────────────────────────────────
 
 /// One table a tranche's backfill has to walk.
@@ -398,6 +411,25 @@ pub struct CheckpointRow {
 
 // ── Entry points ─────────────────────────────────────────────────────────────
 
+/// Refuse a pool that cannot serve a backfill, before anything is acquired.
+///
+/// The failure this prevents is not a crash but a hang: the run would sit on
+/// `DB_ACQUIRE_TIMEOUT_SECS` and then report a pool timeout, which reads as a
+/// busy database rather than as a configuration error the operator can fix in
+/// one variable.
+fn assert_pool_can_serve_a_backfill(pool: &PgPool) -> Result<()> {
+    let available = pool.options().get_max_connections();
+    if available < MIN_BACKFILL_CONNECTIONS {
+        bail!(
+            "a tranche backfill needs at least {MIN_BACKFILL_CONNECTIONS} database connections \
+             but this pool allows {available}: one is held for the whole run by the session \
+             advisory lock that stops two backfills interleaving, and the batches need another. \
+             Raise DB_MAX_CONNECTIONS to {MIN_BACKFILL_CONNECTIONS} or more."
+        );
+    }
+    Ok(())
+}
+
 /// Run (or resume) the backfill for one tranche.
 ///
 /// Idempotent at every granularity: a re-run over a `COMPLETED` tranche does
@@ -410,6 +442,7 @@ pub async fn run_tranche_backfill(
     options: BackfillOptions,
 ) -> Result<TrancheBackfillReport> {
     options.validate()?;
+    assert_pool_can_serve_a_backfill(pool)?;
     let targets = targets_for(tranche)?;
 
     // Held for the whole run rather than per transaction: the point is that two
@@ -417,10 +450,10 @@ pub async fn run_tranche_backfill(
     // would let them alternate batches and leave a cursor that describes
     // neither. `try` rather than a wait, so a second operator is told what is
     // happening instead of hanging on a lock with no message.
-    let mut lock = TrancheLock::acquire(pool).await?;
+    let lock = TrancheLock::acquire(pool).await?;
     let result = run_locked(pool, tranche, options, &targets).await;
-    lock.release().await?;
-    result
+    let cleanup = lock.release().await;
+    resolve_run_outcome(result, cleanup)
 }
 
 /// Retire a checkpoint an operator has decided not to finish.
@@ -627,8 +660,68 @@ async fn run_locked(
     .await
 }
 
+/// Take the reconciliation window's table locks, in one fixed order.
+///
+/// `SHARE` is the weakest mode that does what the window needs: it conflicts
+/// with `ROW EXCLUSIVE`, which is what `INSERT`, `UPDATE` and `DELETE` take, and
+/// not with `ACCESS SHARE`, so concurrent readers are untouched. Nothing here
+/// writes to these tables — the batches finished before `finish` was called — so
+/// a stronger mode would only widen the outage without excluding anything more.
+///
+/// `agents` is locked as well as the targets. It is the authority every one of
+/// them resolves through, so a row that stops being settled because its agent's
+/// `tenant_id` changed mid-window is the same race in a different table.
+///
+/// The order is fixed and total — `agents`, then the targets in registry order —
+/// because two sessions taking these locks in different orders is the textbook
+/// deadlock. One `LOCK` statement listing them acquires in the order written.
+async fn lock_reconciliation_window(
+    conn: &mut sqlx::PgConnection,
+    targets: &[BackfillTarget],
+) -> Result<()> {
+    let mut relations = vec![format!("public.{}", SqlIdentifier::new("agents")?.as_sql())];
+    for target in targets {
+        relations.push(format!(
+            "public.{}",
+            SqlIdentifier::new(target.table)?.as_sql()
+        ));
+    }
+
+    let sql = format!("LOCK TABLE {} IN SHARE MODE", relations.join(", "));
+    sqlx::query(AssertSqlSafe(sql))
+        .execute(conn)
+        .await
+        .context("locking the tranche's tables for final reconciliation")?;
+    Ok(())
+}
+
 /// Reconcile the accounting against the live tables, consult the audit, and
 /// complete only if both agree the tranche is done.
+///
+/// ## Why this is one transaction
+///
+/// It used to be three: `count_rows` committed its own snapshot, `audit::run`
+/// opened and committed a second, and only then did a third transaction write
+/// the checkpoint. On a live database that leaves two windows, and a row
+/// inserted in either one is invisible to the completion that follows it. The
+/// bridge accepts a row naming an unknown agent with NULL ownership, so it
+/// appears in neither the counts nor the blocking reasons, and a checkpoint
+/// claiming a clean tranche is persisted over it. That checkpoint then satisfies
+/// the FINALIZE guard, and FINALIZE validates a `NOT NULL` constraint against a
+/// table holding a NULL.
+///
+/// So: one transaction, opened here and owned here. It locks every table the
+/// verdict depends on, counts inside the lock, audits inside the same
+/// transaction via [`audit::run_within`], writes the checkpoint, and commits
+/// only once all three agree. Anything that fails leaves the transaction
+/// uncommitted, which is the difference between "no completion was recorded" and
+/// "a completion was recorded for a state that no longer holds".
+///
+/// The isolation level is the default. It is the locks, not the snapshot
+/// semantics, that make the window exclusive — `REPEATABLE READ` would add a
+/// serialization-failure mode on the checkpoint row (deliberately *not* locked,
+/// so the row stays reachable) while excluding nothing the locks do not already
+/// exclude.
 async fn finish(
     pool: &PgPool,
     tranche: Tranche,
@@ -638,14 +731,23 @@ async fn finish(
     batches_executed: u64,
     settled_this_run: i64,
 ) -> Result<TrancheBackfillReport> {
-    let counts = count_rows(pool, targets).await?;
+    let mut tx = pool.begin().await?;
+
+    lock_reconciliation_window(&mut tx, targets).await?;
+
+    let counts = count_rows_within(&mut tx, targets).await?;
 
     // The authoritative verdict. Derived from the audit's own tranche readiness
     // rather than recomputed from `findings`, so `blocking_count == 0` and
     // `ready == true` cannot come apart: they are the same list. Re-deriving it
     // here would be a second definition of "blocking for this tranche", and the
     // second definition is the one that eventually disagrees.
-    let audited = audit::run(pool, None)
+    //
+    // `run_within` rather than `run`: the verdict has to describe the same
+    // locked, counted state the checkpoint is about to claim. It also applies
+    // `SET LOCAL search_path = pg_catalog, public` for the rest of this
+    // transaction, which is why the statements below are schema-qualified.
+    let audited = audit::run_within(&mut tx, None)
         .await
         .context("running the tenancy audit to establish the tranche's blocking count")?;
     let readiness = audited
@@ -660,10 +762,9 @@ async fn finish(
     let clean =
         accounting_balances && blocking_count <= plan::FINALIZE_PRECONDITION.max_blocking_count;
 
-    let mut tx = pool.begin().await?;
-    let status = if clean {
-        sqlx::query(
-            "UPDATE tenancy_backfill_checkpoints \
+    let (status, written) = if clean {
+        let done = sqlx::query(
+            "UPDATE public.tenancy_backfill_checkpoints \
                 SET status = $1, resume_cursor = NULL, completed_at = now(), updated_at = now(), \
                     rows_total = $2, rows_backfilled = $3, blocking_count = $4 \
               WHERE id = $5 AND status = $6",
@@ -680,14 +781,14 @@ async fn finish(
             "completing the checkpoint; a CHECK violation here means the reconciled accounting \
              did not actually balance",
         )?;
-        CheckpointStatus::Completed
+        (CheckpointStatus::Completed, done.rows_affected())
     } else {
         // Stays IN_PROGRESS, and keeps a cursor of NULL: the scan did reach the
         // end, so there is no position to resume from. What is left is not more
         // scanning but a decision about rows the backfill is not permitted to
         // guess at.
-        sqlx::query(
-            "UPDATE tenancy_backfill_checkpoints \
+        let done = sqlx::query(
+            "UPDATE public.tenancy_backfill_checkpoints \
                 SET resume_cursor = NULL, updated_at = now(), \
                     rows_total = $1, rows_backfilled = $2, blocking_count = $3 \
               WHERE id = $4 AND status = $5",
@@ -700,8 +801,23 @@ async fn finish(
         .execute(&mut *tx)
         .await
         .context("recording the blocked checkpoint")?;
-        CheckpointStatus::InProgress
+        (CheckpointStatus::InProgress, done.rows_affected())
     };
+
+    // The `AND status = 'IN_PROGRESS'` guard above is only half a guard while
+    // nothing reads the row count back. Without this, a checkpoint that stopped
+    // being `IN_PROGRESS` between `open_checkpoint` and here matches zero rows
+    // and the function still returns `Completed` — so `is_finalizable()` reports
+    // true for a checkpoint carrying no `COMPLETED` row and no `completed_at`,
+    // and the report describes a database state that was never written.
+    if written != 1 {
+        bail!(
+            "checkpoint {checkpoint_id} is no longer IN_PROGRESS ({written} rows matched the \
+             guarded update, expected 1); it was completed or abandoned while this run was \
+             reconciling. Nothing was committed and no completion is being reported."
+        );
+    }
+
     tx.commit().await?;
 
     Ok(TrancheBackfillReport {
@@ -815,7 +931,28 @@ async fn count_rows(pool: &PgPool, targets: &[BackfillTarget]) -> Result<Counts>
     let mut tx = pool
         .begin_with("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await?;
+    let counts = count_rows_within(&mut tx, targets).await?;
+    tx.commit().await?;
+    Ok(counts)
+}
 
+/// The counting itself, on a connection the caller owns.
+///
+/// Split out for [`finish`], which must count inside the same transaction that
+/// holds the table locks, runs the audit and writes the checkpoint. Counting on
+/// the pool there would open a second transaction and re-introduce exactly the
+/// gap the locks exist to close.
+///
+/// The consistency of the counts is the *caller's* to establish, and the two
+/// callers establish it differently: [`count_rows`] wraps this in a
+/// `REPEATABLE READ READ ONLY` snapshot because it only ever reads, while
+/// `finish` holds `SHARE` on every table so nothing can write during the window.
+/// Either way all five targets are counted against one state of the database
+/// rather than five states a few milliseconds apart.
+async fn count_rows_within(
+    conn: &mut sqlx::PgConnection,
+    targets: &[BackfillTarget],
+) -> Result<Counts> {
     let mut total = 0i64;
     let mut settled = 0i64;
     for target in targets {
@@ -829,14 +966,12 @@ async fn count_rows(pool: &PgPool, targets: &[BackfillTarget]) -> Result<Counts>
             table = table.as_sql(),
         );
         let row = sqlx::query(AssertSqlSafe(sql))
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await
             .with_context(|| format!("counting {}", target.table))?;
         total += row.try_get::<i64, _>("total")?;
         settled += row.try_get::<i64, _>("settled")?;
     }
-
-    tx.commit().await?;
     Ok(Counts { total, settled })
 }
 
@@ -1079,16 +1214,55 @@ fn checkpoint_from_row(row: &sqlx::postgres::PgRow) -> Result<CheckpointRow> {
 ///
 /// Session-level rather than transaction-level because the run spans many
 /// transactions and the thing being protected is the sequence, not any one of
-/// them. Released explicitly: a session lock survives the connection going back
-/// to the pool, so dropping this without unlocking would leave the tranche
-/// locked until that connection is recycled.
-struct TrancheLock {
-    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
-    released: bool,
+/// them.
+///
+/// A session-level lock outlives the transaction that took it and is released
+/// only by `pg_advisory_unlock` or by the session ending. A `PoolConnection`
+/// returning to the pool does **not** end its session, so a connection handed
+/// back while still holding this lock poisons the pool: the lock is held by
+/// nobody in particular, `pg_try_advisory_lock` fails for every later run, and
+/// the backfill is permanently unavailable until the process restarts. Every
+/// path out of this type therefore ends in one of two proofs — the unlock
+/// returned `true`, or the connection was closed — and nothing else counts.
+pub(super) struct TrancheLock {
+    /// `None` once ownership has been handed to `release`. Kept as an `Option`
+    /// so `Drop` can tell "already dealt with" from "leaked by a panic" and take
+    /// the connection out of the pool in the second case.
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+
+/// How a lock's cleanup ended. Not an alias for `Result`: two of the three are
+/// success, and the difference between them matters to the log even though it
+/// does not matter to the caller's return value.
+#[derive(Debug)]
+pub(super) enum LockCleanup {
+    /// `pg_advisory_unlock` returned `true`. The lock is gone and the connection
+    /// is clean, so it goes back to the pool.
+    Unlocked,
+    /// The unlock could not be confirmed, so the connection was closed instead.
+    /// Ending the session releases every session-level lock it held, which makes
+    /// this an equally good proof — bought by discarding a connection.
+    ConnectionClosed { why: String },
+    /// Neither proof could be obtained. The lock may still be held.
+    Leaked { why: String },
+}
+
+impl LockCleanup {
+    /// Whether the session lock is provably gone.
+    pub(super) fn is_guaranteed(&self) -> bool {
+        !matches!(self, Self::Leaked { .. })
+    }
+
+    fn why(&self) -> Option<&str> {
+        match self {
+            Self::Unlocked => None,
+            Self::ConnectionClosed { why } | Self::Leaked { why } => Some(why),
+        }
+    }
 }
 
 impl TrancheLock {
-    async fn acquire(pool: &PgPool) -> Result<Self> {
+    pub(super) async fn acquire(pool: &PgPool) -> Result<Self> {
         let mut conn = pool.acquire().await?;
         let row = sqlx::query("SELECT pg_try_advisory_lock($1) AS acquired")
             .bind(TRANCHE_BACKFILL_ADVISORY_LOCK_ID)
@@ -1102,38 +1276,134 @@ impl TrancheLock {
                  that describes neither"
             );
         }
-        Ok(Self {
-            conn,
-            released: false,
-        })
+        Ok(Self { conn: Some(conn) })
     }
 
-    async fn release(&mut self) -> Result<()> {
-        if self.released {
-            return Ok(());
-        }
-        self.released = true;
-        sqlx::query("SELECT pg_advisory_unlock($1)")
+    /// Give the lock up, and say what was actually proved.
+    ///
+    /// Consumes `self` so there is no "released" flag to get out of step with
+    /// reality. The previous version set that flag *before* awaiting the unlock,
+    /// so a failed unlock left a connection marked clean and returned it to the
+    /// pool still holding the lock — the exact poisoning this type exists to
+    /// prevent, reached by the error path rather than the happy one.
+    ///
+    /// `pg_advisory_unlock` returns a boolean rather than raising, and `false`
+    /// means "this session did not hold that lock". That is not a success: it
+    /// means the state is not what this type believed, so it is treated the same
+    /// as a failed query.
+    pub(super) async fn release(mut self) -> LockCleanup {
+        let Some(mut conn) = self.conn.take() else {
+            // Unreachable while `release` consumes `self`, and cheap to state.
+            return LockCleanup::Unlocked;
+        };
+
+        let unlock_error = match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
             .bind(TRANCHE_BACKFILL_ADVISORY_LOCK_ID)
-            .execute(&mut *self.conn)
+            .fetch_one(&mut *conn)
             .await
-            .context("releasing the tranche backfill advisory lock")?;
-        Ok(())
+        {
+            Ok(true) => return LockCleanup::Unlocked,
+            Ok(false) => "pg_advisory_unlock returned false: this session did not hold the \
+                          tranche backfill lock, so the lock state is not what this run assumed"
+                .to_string(),
+            Err(e) => format!("pg_advisory_unlock failed: {e}"),
+        };
+
+        // Unlock unproven. Take the connection out of the pool and end its
+        // session, which releases every session-level lock it held. Closing one
+        // connection is a far smaller price than a pool that can never run a
+        // backfill again.
+        match conn.close().await {
+            Ok(()) => LockCleanup::ConnectionClosed { why: unlock_error },
+            Err(close) => LockCleanup::Leaked {
+                why: format!("{unlock_error}; closing the connection also failed: {close}"),
+            },
+        }
     }
 }
 
 impl Drop for TrancheLock {
     fn drop(&mut self) {
-        if !self.released {
-            // Reached only when the run panicked or returned without going
-            // through `release`. Nothing async can run here, so the lock stays
-            // held until the connection is closed or recycled. Say so, loudly:
-            // a silently stuck lock looks exactly like a hung backfill.
+        if let Some(conn) = self.conn.take() {
+            // Reached only when the run panicked or unwound past `release`.
+            // Nothing async can run here, so the unlock cannot be issued — but
+            // the connection can still be kept out of the pool. `detach` removes
+            // it from the pool's accounting, and dropping the detached
+            // connection closes it, ending the session and with it the lock.
+            //
+            // Returning it to the pool instead would hand the next borrower a
+            // session still holding the tranche lock, and every subsequent
+            // backfill would refuse to start with a message about another run
+            // that is not running.
+            drop(conn.detach());
             tracing::error!(
-                "tenancy tranche backfill lock dropped without release; it is held until this \
-                 connection is recycled"
+                "tenancy tranche backfill lock dropped without release; its connection has been \
+                 detached and closed rather than returned to the pool"
             );
         }
+    }
+}
+
+/// Decide what a run returns, given its result and what cleanup could prove.
+///
+/// Separated from [`run_tranche_backfill`] because the interesting part is the
+/// six-way decision and not the plumbing, and because the two failure axes are
+/// independent: the backfill can succeed or fail, and cleanup can prove the lock
+/// is gone or not.
+///
+/// The rule is that a report is returned only when the lock is provably gone.
+/// CodeRabbit suggested logging any release failure and returning the report
+/// regardless, which is right about the first half — a committed completion must
+/// not be hidden behind a cleanup error — and wrong about the second: a report
+/// returned over a still-held session lock reads as "this succeeded, carry on",
+/// while the next run and every run after it refuses to start. When the lock
+/// cannot be accounted for, the caller is told both things.
+fn resolve_run_outcome(
+    result: Result<TrancheBackfillReport>,
+    cleanup: LockCleanup,
+) -> Result<TrancheBackfillReport> {
+    if let Some(why) = cleanup.why() {
+        if cleanup.is_guaranteed() {
+            tracing::warn!(
+                reason = %why,
+                "tenancy tranche backfill lock could not be released normally; its connection \
+                 was closed instead, which released the lock",
+            );
+        } else {
+            tracing::error!(
+                reason = %why,
+                "tenancy tranche backfill lock may still be held; further runs will refuse to \
+                 start until the holding session ends",
+            );
+        }
+    }
+
+    match (result, cleanup) {
+        (result, LockCleanup::Unlocked) | (result, LockCleanup::ConnectionClosed { .. }) => result,
+
+        // The backfill's own error is the more actionable of the two, so it
+        // leads; the leak is attached rather than replacing it.
+        (Err(run), LockCleanup::Leaked { why }) => Err(run.context(format!(
+            "the tranche backfill lock was also left held: {why}"
+        ))),
+
+        // The work committed and the report is true, but returning it alone
+        // would let an operator walk away from a database that cannot run
+        // another backfill. Both facts, in one error.
+        (Ok(report), LockCleanup::Leaked { why }) => Err(anyhow!(
+            "the backfill COMMITTED and its checkpoint is real — tranche {tranche}, checkpoint \
+             {checkpoint}, outcome {outcome}, {backfilled}/{total} rows settled, blocking count \
+             {blocking} — but the advisory lock could not be released and may still be held, so \
+             later runs will refuse to start until the holding session ends. Do not re-run the \
+             backfill to \"fix\" this; check the checkpoint and clear the stale session. Cause: \
+             {why}",
+            tranche = report.tranche,
+            checkpoint = report.checkpoint_id,
+            outcome = report.outcome.as_str(),
+            backfilled = report.rows_backfilled,
+            total = report.rows_total,
+            blocking = report.blocking_count,
+        )),
     }
 }
 
@@ -1252,6 +1522,106 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    fn sample_report() -> TrancheBackfillReport {
+        TrancheBackfillReport {
+            tranche: Tranche::RootsAndDirectAgentChildren,
+            contract_digest: "sha256:abc".into(),
+            checkpoint_id: Uuid::nil(),
+            status: CheckpointStatus::Completed,
+            outcome: BackfillOutcome::Completed,
+            rows_total: 5,
+            rows_backfilled: 5,
+            blocking_count: 0,
+            blocking_reasons: Vec::new(),
+            resume_cursor: None,
+            batches_executed: 1,
+            rows_settled_this_run: 5,
+        }
+    }
+
+    #[test]
+    fn a_confirmed_unlock_lets_a_successful_run_report_normally() {
+        let out = resolve_run_outcome(Ok(sample_report()), LockCleanup::Unlocked)
+            .expect("a clean run with a clean unlock reports");
+        assert_eq!(out.outcome, BackfillOutcome::Completed);
+    }
+
+    #[test]
+    fn closing_the_connection_is_as_good_a_proof_as_unlocking() {
+        // Ending the session releases every session-level lock it held, so the
+        // guarantee holds and the committed work is still reported. Paying one
+        // connection for that is the point of the discard path.
+        let out = resolve_run_outcome(
+            Ok(sample_report()),
+            LockCleanup::ConnectionClosed {
+                why: "unlock failed".into(),
+            },
+        )
+        .expect("a closed connection still guarantees the lock is gone");
+        assert_eq!(out.outcome, BackfillOutcome::Completed);
+    }
+
+    #[test]
+    fn a_leaked_lock_turns_a_successful_run_into_a_combined_error() {
+        // The alternative — CodeRabbit's suggestion of logging and returning the
+        // report — reads as "this succeeded, carry on" while every later run
+        // refuses to start. Both facts have to reach the operator.
+        let err = resolve_run_outcome(
+            Ok(sample_report()),
+            LockCleanup::Leaked {
+                why: "connection wedged".into(),
+            },
+        )
+        .expect_err("an unaccounted-for lock is not a clean success");
+        let message = err.to_string();
+
+        assert!(
+            message.contains("COMMITTED") && message.contains("checkpoint"),
+            "the committed result must survive the error: {message}"
+        );
+        assert!(
+            message.contains("connection wedged"),
+            "the cleanup cause must survive too: {message}"
+        );
+        assert!(
+            message.contains("Do not re-run"),
+            "an operator needs to be told what NOT to do: {message}"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_keeps_its_own_error_whatever_cleanup_did() {
+        for cleanup in [
+            LockCleanup::Unlocked,
+            LockCleanup::ConnectionClosed { why: "x".into() },
+        ] {
+            let err = resolve_run_outcome(Err(anyhow!("the backfill itself failed")), cleanup)
+                .expect_err("a failed run stays failed");
+            assert!(err.to_string().contains("the backfill itself failed"));
+        }
+
+        // With a leak, the run's own error still leads -- it is the more
+        // actionable of the two -- and the leak is attached rather than
+        // replacing it.
+        let err = resolve_run_outcome(
+            Err(anyhow!("the backfill itself failed")),
+            LockCleanup::Leaked {
+                why: "wedged".into(),
+            },
+        )
+        .expect_err("a failed run stays failed");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("the backfill itself failed"), "{chain}");
+        assert!(chain.contains("wedged"), "{chain}");
+    }
+
+    #[test]
+    fn only_a_leak_is_an_unguaranteed_cleanup() {
+        assert!(LockCleanup::Unlocked.is_guaranteed());
+        assert!(LockCleanup::ConnectionClosed { why: "x".into() }.is_guaranteed());
+        assert!(!LockCleanup::Leaked { why: "x".into() }.is_guaranteed());
     }
 
     #[test]
