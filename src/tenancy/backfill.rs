@@ -1499,20 +1499,51 @@ impl LockCleanup {
 
 impl TrancheLock {
     pub(super) async fn acquire(pool: &PgPool) -> Result<Self> {
-        let mut conn = pool.acquire().await?;
-        let row = sqlx::query("SELECT pg_try_advisory_lock($1) AS acquired")
-            .bind(TRANCHE_BACKFILL_ADVISORY_LOCK_ID)
-            .fetch_one(&mut *conn)
-            .await?;
-        let acquired: bool = row.try_get("acquired")?;
+        let conn = pool.acquire().await?;
+
+        // The guard is built *before* the lock query, and that ordering is the
+        // point -- the same lesson as `release`, at the other end of the
+        // lifecycle.
+        //
+        // While the connection is a bare local `PoolConnection`, a cancellation
+        // between PostgreSQL evaluating `pg_try_advisory_lock` and the result
+        // reaching this client drops that local, and dropping one *returns it to
+        // the pool* with the session lock held. No `TrancheLock` exists yet, so
+        // nothing runs the detach-and-close cleanup. Worse than a plain leak:
+        // session advisory locks are counted, so a later checkout of that same
+        // session re-enters the lock rather than blocking on it, and a single
+        // unlock then leaves it held.
+        //
+        // Constructing the guard first means any cancellation from here on runs
+        // `Drop`, which detaches and closes.
+        let mut guard = Self { conn: Some(conn) };
+
+        let acquired: bool = {
+            let held = guard.conn.as_mut().expect("just constructed with Some");
+            sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+                .bind(TRANCHE_BACKFILL_ADVISORY_LOCK_ID)
+                .fetch_one(&mut **held)
+                .await
+                // On a query error the lock's state is unknown, so `guard` drops
+                // here and burns the connection rather than risk returning a
+                // holder to the pool.
+                .context("asking PostgreSQL for the tranche backfill advisory lock")?
+        };
+
         if !acquired {
+            // `false` is PostgreSQL stating this session does *not* hold the
+            // lock. That is a proof, so the connection is clean and goes back to
+            // the pool -- taking it out of the guard is what stops `Drop` from
+            // needlessly burning a connection on every contended run.
+            drop(guard.conn.take());
             bail!(
                 "another tenancy tranche backfill is already running against this database; \
                  concurrent runs would interleave their cursor writes and leave a checkpoint \
                  that describes neither"
             );
         }
-        Ok(Self { conn: Some(conn) })
+
+        Ok(guard)
     }
 
     /// Give the lock up, and say what was actually proved.

@@ -1255,6 +1255,46 @@ async fn an_unlock_that_cannot_be_confirmed_discards_the_connection(pool: PgPool
 }
 
 #[sqlx::test]
+async fn a_contended_acquire_returns_its_connection_instead_of_burning_it(pool: PgPool) {
+    // `acquire` builds its drop-guard *before* asking for the lock, so a
+    // cancellation mid-query runs the detach-and-close cleanup instead of
+    // returning a lock holder to the pool. The cost of that ordering is that the
+    // guard also covers the ordinary contended path -- and there PostgreSQL has
+    // answered `false`, which is a proof that this session holds nothing. The
+    // connection is clean and must go back to the pool.
+    //
+    // Getting that wrong is not cosmetic: every refused run would permanently
+    // burn a connection, so a busy deployment would drain its own pool by
+    // politely declining to start.
+    let holder = TrancheLock::acquire(&pool).await.expect("first acquire");
+    assert!(tranche_lock_is_held(&pool).await);
+
+    let before = pool.size();
+    for _ in 0..3 {
+        let err = match TrancheLock::acquire(&pool).await {
+            Ok(_) => panic!("the lock is held; a second acquire must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("already running"), "{err}");
+    }
+    assert!(
+        pool.size() >= before,
+        "a refused acquire must not consume a pool connection: {before} -> {}",
+        pool.size()
+    );
+
+    assert!(matches!(holder.release().await, LockCleanup::Unlocked));
+    assert!(!tranche_lock_is_held(&pool).await);
+
+    // And the pool is still usable for real work.
+    insert_agent(&pool, "agent-a", Some(TENANT)).await;
+    let done = run_tranche_backfill(&pool, TRANCHE, options(10, None))
+        .await
+        .expect("the pool was not drained");
+    assert_eq!(done.outcome, BackfillOutcome::Completed, "{done:?}");
+}
+
+#[sqlx::test]
 async fn dropping_a_lock_without_releasing_it_does_not_poison_the_pool(pool: PgPool) {
     // This is where a cancelled run lands. If a caller aborts the task while
     // `pg_advisory_unlock` is in flight, `release` never finishes and `Drop` is
