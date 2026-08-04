@@ -996,8 +996,11 @@ async fn a_write_cannot_slip_between_the_audit_and_the_checkpoint(pool: PgPool) 
     // `entities`. The backfill's batches do not conflict with that -- they touch
     // different rows -- but `finish`'s SHARE lock does, so the run proceeds to
     // reconciliation and stops there.
-    let mut blocker = pool.acquire().await.expect("second connection");
-    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    // `pool.begin()` rather than a manual BEGIN on a raw pooled connection: the
+    // transaction guard rolls back if this test panics mid-way, where a skipped
+    // COMMIT would leave the connection returned to the pool still in a
+    // transaction and poison every later test that borrowed it.
+    let mut blocker = pool.begin().await.expect("second connection");
     sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'late', 'x')")
         .bind("agent-that-does-not-exist")
         .execute(&mut *blocker)
@@ -1018,8 +1021,7 @@ async fn a_write_cannot_slip_between_the_audit_and_the_checkpoint(pool: PgPool) 
     );
 
     // Commit strictly inside the window the old code left open.
-    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
-    drop(blocker);
+    blocker.commit().await.expect("commit the blocker");
 
     let done = run
         .await
@@ -1061,8 +1063,11 @@ async fn no_completion_is_reported_when_the_guarded_update_writes_nothing(pool: 
     // Same mechanism as above, used to open a window in the *checkpoint* rather
     // than in the data: hold the run at the reconciliation lock, retire its
     // checkpoint underneath it, then let it through.
-    let mut blocker = pool.acquire().await.expect("second connection");
-    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    // `pool.begin()` rather than a manual BEGIN on a raw pooled connection: the
+    // transaction guard rolls back if this test panics mid-way, where a skipped
+    // COMMIT would leave the connection returned to the pool still in a
+    // transaction and poison every later test that borrowed it.
+    let mut blocker = pool.begin().await.expect("second connection");
     sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'x', 'x')")
         .bind("agent-a")
         .execute(&mut *blocker)
@@ -1086,8 +1091,7 @@ async fn no_completion_is_reported_when_the_guarded_update_writes_nothing(pool: 
     .expect("retire the checkpoint");
     assert_eq!(retired.rows_affected(), 1, "there was one open checkpoint");
 
-    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
-    drop(blocker);
+    blocker.commit().await.expect("commit the blocker");
 
     let err = run
         .await
@@ -1254,6 +1258,18 @@ async fn an_unlock_that_cannot_be_confirmed_discards_the_connection(pool: PgPool
     assert_eq!(done.outcome, BackfillOutcome::Completed);
 }
 
+/// The backend pid behind whichever pooled connection serves one query.
+///
+/// Stable while the pool keeps handing back the same connection, and it changes
+/// the moment one is discarded and replaced -- which is exactly the difference
+/// between returning a connection and burning it.
+async fn pool_backend_pid(pool: &PgPool) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(pool)
+        .await
+        .expect("read backend pid")
+}
+
 #[sqlx::test]
 async fn a_contended_acquire_returns_its_connection_instead_of_burning_it(pool: PgPool) {
     // `acquire` builds its drop-guard *before* asking for the lock, so a
@@ -1269,7 +1285,13 @@ async fn a_contended_acquire_returns_its_connection_instead_of_burning_it(pool: 
     let holder = TrancheLock::acquire(&pool).await.expect("first acquire");
     assert!(tranche_lock_is_held(&pool).await);
 
-    let before = pool.size();
+    // Compared by backend pid rather than by `pool.size()`. Size does detect
+    // this -- nothing refills after the final refusal, so a burn leaves the
+    // count low -- but it detects it by way of the pool's replacement timing,
+    // which is a property of sqlx rather than of this code. A returned
+    // connection keeps its backend; a burned one is replaced by a new one, and
+    // the pid says so directly.
+    let before = pool_backend_pid(&pool).await;
     for _ in 0..3 {
         let err = match TrancheLock::acquire(&pool).await {
             Ok(_) => panic!("the lock is held; a second acquire must be refused"),
@@ -1277,10 +1299,11 @@ async fn a_contended_acquire_returns_its_connection_instead_of_burning_it(pool: 
         };
         assert!(err.to_string().contains("already running"), "{err}");
     }
-    assert!(
-        pool.size() >= before,
-        "a refused acquire must not consume a pool connection: {before} -> {}",
-        pool.size()
+    assert_eq!(
+        pool_backend_pid(&pool).await,
+        before,
+        "a refused acquire must hand its connection back, not burn it; a new backend pid means \
+         the pool replaced a connection that was discarded"
     );
 
     assert!(matches!(holder.release().await, LockCleanup::Unlocked));
@@ -1467,8 +1490,7 @@ async fn reconciliation_does_not_deadlock_with_a_concurrent_deletion(pool: PgPoo
 
     // A deletion in flight, holding ROW EXCLUSIVE on `entities` exactly as
     // delete_agent does at that point in its sequence.
-    let mut deleter = pool.acquire().await.expect("second connection");
-    sqlx::query("BEGIN").execute(&mut *deleter).await.unwrap();
+    let mut deleter = pool.begin().await.expect("second connection");
     sqlx::query("DELETE FROM entities WHERE agent_id = $1")
         .bind("agent-a")
         .execute(&mut *deleter)
@@ -1492,8 +1514,7 @@ async fn reconciliation_does_not_deadlock_with_a_concurrent_deletion(pool: PgPoo
         .await
         .expect("a compatible lock order lets the deletion continue past entities");
 
-    sqlx::query("COMMIT").execute(&mut *deleter).await.unwrap();
-    drop(deleter);
+    deleter.commit().await.expect("commit the deletion");
 
     let done = run
         .await
@@ -1509,8 +1530,7 @@ async fn reconciliation_does_not_deadlock_with_a_concurrent_deletion(pool: PgPoo
 /// interleaving is observed through `pg_stat_activity` instead. Scoped to this
 /// database for the same reason every other lock query here is: parallel
 /// `#[sqlx::test]` databases share one cluster.
-async fn await_blocked_backend(pool: &PgPool, ignore_pid_of: &PgPool) {
-    let _ = ignore_pid_of;
+async fn await_blocked_backend(pool: &PgPool) {
     for _ in 0..400 {
         let blocked: i64 = sqlx::query_scalar(
             "SELECT count(*)::bigint FROM pg_stat_activity \
@@ -1558,8 +1578,7 @@ async fn a_batch_does_not_deadlock_with_a_concurrent_agent_deletion(pool: PgPool
 
     // `delete_agent`'s first statement, verbatim in effect: the parent row,
     // FOR UPDATE, held open.
-    let mut deleter = pool.acquire().await.expect("second connection");
-    sqlx::query("BEGIN").execute(&mut *deleter).await.unwrap();
+    let mut deleter = pool.begin().await.expect("second connection");
     sqlx::query("SELECT 1 FROM agents WHERE agent_id = $1 FOR UPDATE")
         .bind("agent-a")
         .fetch_all(&mut *deleter)
@@ -1572,7 +1591,7 @@ async fn a_batch_does_not_deadlock_with_a_concurrent_agent_deletion(pool: PgPool
 
     // The batch is now blocked acquiring FOR KEY SHARE on the agent -- holding
     // no child rows, which is the property that breaks the cycle.
-    await_blocked_backend(&pool, &pool).await;
+    await_blocked_backend(&pool).await;
 
     // The step that used to close it. It must succeed: the batch holds nothing
     // this deletion needs.
@@ -1582,8 +1601,7 @@ async fn a_batch_does_not_deadlock_with_a_concurrent_agent_deletion(pool: PgPool
         .await
         .expect("locking parents first lets the deletion proceed");
 
-    sqlx::query("COMMIT").execute(&mut *deleter).await.unwrap();
-    drop(deleter);
+    deleter.commit().await.expect("commit the deletion");
 
     let done = run
         .await
@@ -1612,8 +1630,11 @@ async fn a_lock_timeout_abandons_the_window_and_keeps_the_checkpoint_in_progress
     })
     .await;
 
-    let mut blocker = pool.acquire().await.expect("second connection");
-    sqlx::query("BEGIN").execute(&mut *blocker).await.unwrap();
+    // `pool.begin()` rather than a manual BEGIN on a raw pooled connection: the
+    // transaction guard rolls back if this test panics mid-way, where a skipped
+    // COMMIT would leave the connection returned to the pool still in a
+    // transaction and poison every later test that borrowed it.
+    let mut blocker = pool.begin().await.expect("second connection");
     sqlx::query("INSERT INTO entities (agent_id, name, entity_type) VALUES ($1, 'held', 'x')")
         .bind("agent-a")
         .execute(&mut *blocker)
@@ -1638,8 +1659,7 @@ async fn a_lock_timeout_abandons_the_window_and_keeps_the_checkpoint_in_progress
         "the error must name the timeout and say what state it left behind: {chain}"
     );
 
-    sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
-    drop(blocker);
+    blocker.commit().await.expect("commit the blocker");
 
     // Nothing completed, and the checkpoint is still open and resumable.
     let (status, completed_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
