@@ -30,6 +30,14 @@
 pub mod audit;
 #[cfg(test)]
 mod audit_db_tests;
+// Step 4B-2: the BACKFILL stage's engine. Library-first deliberately — a CLI
+// subcommand drives it today and a management endpoint will drive it later, and
+// the invariants (batching, cursor persistence, reconciliation, the refusal to
+// complete over a dirty audit) belong to the behaviour rather than to either
+// front door.
+pub mod backfill;
+#[cfg(test)]
+mod backfill_db_tests;
 pub mod inventory;
 // Step 4B-0: the typed migration contract. Planning data only — it creates no
 // column, no index, no constraint and no migration file.
