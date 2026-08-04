@@ -24,6 +24,68 @@ permissions:
   contents: read
 
 jobs:
+  # ── The serialized lane for issue #27 ───────────────────────────────────────
+  #
+  # `a_policy_inserted_during_cleanup_cannot_break_agent_deletion` is `#[ignore]`d
+  # out of the ordinary parallel suite, so this job is the ONLY thing that runs
+  # it. It is a separate job rather than a step of `benchmark-proof` so that it
+  # reports its own required status: a serialized concurrency proof folded into a
+  # 45-minute benchmark run is a proof whose result nobody can read.
+  #
+  # It deliberately does NOT lower parallelism anywhere else. Pinning the whole
+  # suite was considered and rejected in #27; exactly one test is serialized here.
+  #
+  # The runner script refuses to pass on an empty filter -- `cargo test` exits 0
+  # when it matches nothing, which would make this gate silently vacuous. See the
+  # header of `benchmarks/scripts/ci_deletion_interleaving_gate.sh`.
+  deletion-interleaving-gate:
+    name: Deletion-interleaving gate (serialized)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-integration-
+
+      - name: Deletion-interleaving gate, single-threaded
+        run: bash benchmarks/scripts/ci_deletion_interleaving_gate.sh
+
+      - name: Upload serialized-run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deletion-interleaving-gate-${{ github.sha }}
+          path: ci-artifacts/deletion-interleaving-gate
+          if-no-files-found: warn
+          retention-days: 14
+
   benchmark-proof:
     name: Benchmark proof
     runs-on: ubuntu-latest
