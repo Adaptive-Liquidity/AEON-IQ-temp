@@ -87,11 +87,84 @@
 -- byte-identical; `the_provenance_marker_is_identical_everywhere_it_appears`
 -- fails if they drift.
 
+-- ── THE TRUSTED RESOLUTION PATH, PINNED FOR THE WHOLE FILE ──────────────────
+--
+-- Everything below resolves under `pg_catalog` alone.  This is transaction-local
+-- and 0032 is a transactional migration (no `-- no-transaction` first line), so
+-- PostgreSQL restores the caller's path automatically at COMMIT or ROLLBACK.
+-- Nothing in this file restores it early, and nothing should: an early restore
+-- is exactly what left the ownership columns and the bridge declarations exposed.
+--
+-- WHY A PIN AND NOT ONLY QUALIFICATION.  `pg_catalog` is searched first only
+-- while it is IMPLICIT.  A caller who names it explicitly and late --
+-- `hostile, public, pg_catalog` -- demotes it, and every unqualified identifier
+-- becomes capturable.  Three separate captures were measured on pg16 against
+-- earlier heads of this file:
+--
+--   * `hostile.gen_random_uuid()` bound into the checkpoint table's `id`
+--     DEFAULT, on BOTH the live table and the canonical reference, so the
+--     comparator agreed while both sides were wrong.  Second defaulted insert
+--     died on the primary key.
+--   * `CREATE DOMAIN hostile.uuid AS pg_catalog.uuid CHECK (VALUE IS NULL)`
+--     captured all ten `ADD COLUMN ... UUID` declarations.  The nullable ADDs
+--     succeed, 0032 applies clean, and the first real ownership assignment then
+--     fails the domain constraint.
+--   * `CREATE DOMAIN hostile.trigger` captured `RETURNS TRIGGER`, so the bridge
+--     function was created returning the wrong type and `CREATE TRIGGER` then
+--     refused it with "must return type trigger".
+--
+-- WHICH TYPE NAMES ARE ACTUALLY CAPTURABLE was measured rather than assumed,
+-- because it decides what qualification is worth writing.  On pg16, with a
+-- shadow schema ahead of an explicitly-listed `pg_catalog`:
+--
+--   CAPTURED  : uuid, text, timestamptz, oid, jsonb, date, "char", trigger
+--   NOT CAPTURED (the grammar maps these straight to pg_catalog, so a shadow
+--   of the same name is simply not consulted):
+--               bigint, boolean, integer, varchar, numeric
+--
+-- So every capturable type name below is written qualified as well, and the
+-- grammar-level ones are left in their conventional spelling deliberately --
+-- qualifying `BIGINT` would suggest a protection that is not what protects it.
+--
+-- OPERATORS AND CASTS are search_path-resolved too, and there is no readable way
+-- to qualify every `=` as `OPERATOR(pg_catalog.=)` across a file this size.  The
+-- pin is what covers them, which is the other reason it is file-wide rather than
+-- wrapped around individual statements.
+--
+-- Relation and created-object targets stay explicitly schema-qualified
+-- regardless -- `public.<object>`, and the resolved temporary schema for the
+-- canonical reference.  Neither the pin nor the qualification is load-bearing
+-- alone.
+--
+-- WHY THE CALLER'S PATH IS HANDED BACK AT THE FOOT OF THIS FILE, and not left
+-- to COMMIT.  A transaction-local `SET LOCAL` is undone when the transaction
+-- ends -- but sqlx's migrator records this migration by running
+-- `INSERT INTO _sqlx_migrations ...`, UNQUALIFIED, inside this very
+-- transaction, after the last statement here and before COMMIT.  Measured: with
+-- the path left pinned to `pg_catalog` alone, every migration-applying test
+-- fails with `relation "_sqlx_migrations" does not exist` (SQLSTATE 42P01).
+-- So the pin covers the whole file and is released only once there is no more
+-- of this file to protect.  The caller's exact path is stashed in a
+-- transaction-local custom GUC rather than assumed to be `public`, so a
+-- deployment that runs migrations under some other schema gets its own path
+-- back rather than one this file guessed.
+SELECT pg_catalog.set_config('aeon.saved_search_path',
+                             pg_catalog.current_setting('search_path'), true);
+SET LOCAL search_path = pg_catalog;
+
 DO $provenance_guard$
 DECLARE
     -- Declared once.  Duplicated verbatim in the stamping block at the foot of
     -- this file and in rollback/0032_tenancy_tranche1_prepare_down.sql; the test
     -- `the_provenance_marker_is_identical_everywhere_it_appears` fails on drift.
+    -- Left UNQUALIFIED deliberately -- the only declaration in this file that
+    -- is.  `the_provenance_marker_is_identical_everywhere_it_appears` parses
+    -- this declaration's exact prefix out of three files to prove the marker
+    -- text has not drifted, and expects to find exactly three of them, so the
+    -- prefix is not written anywhere else in this file -- not even in prose --
+    -- and qualifying it here alone would break the parse outright.  It is a
+    -- PL/pgSQL local whose type is never persisted, so the file-wide pin is the
+    -- whole of its protection, and is sufficient.
     marker CONSTANT TEXT :=
         'AEON tenancy tranche 1 (migration 0032). Provenance marker: rollback/0032 '
         'destroys only objects carrying exactly this comment, and refuses to touch '
@@ -102,7 +175,7 @@ DECLARE
     -- this as a fourth declaration of a string that differs from the other
     -- three.  Duplicated verbatim in the stamping block at the foot of this
     -- file; `the_checkpoint_stamp_is_identical_in_both_places` fails on drift.
-    checkpoint_stamp CONSTANT TEXT :=
+    checkpoint_stamp CONSTANT pg_catalog.text :=
         'AEON tenancy tranche 1 (migration 0032). Idempotency stamp for the checkpoint '
         'table: it records that this migration created this table, so that a re-run over '
         'its own work is a no-op. It is NOT evidence that the rows are authentic.';
@@ -111,19 +184,23 @@ DECLARE
     -- table in `public`, and to build the canonical reference in `pg_temp`
     -- that an occupant is compared against.  Two hand-maintained definitions
     -- could drift, and a drifted reference would validate the wrong contract.
-    checkpoint_body CONSTANT TEXT := $ckbody$(
-    id              UUID        DEFAULT gen_random_uuid(),
-    tranche         TEXT        NOT NULL,
-    contract_digest TEXT        NOT NULL,
-    status          TEXT        NOT NULL,
+    checkpoint_body CONSTANT pg_catalog.text := $ckbody$(
+    -- Every capturable type name and every default function is written
+    -- qualified.  `BIGINT` below is deliberately NOT qualified: it is
+    -- grammar-level and a shadow of that name is never consulted (measured).
+    id              pg_catalog.uuid
+                        DEFAULT pg_catalog.gen_random_uuid(),
+    tranche         pg_catalog.text        NOT NULL,
+    contract_digest pg_catalog.text        NOT NULL,
+    status          pg_catalog.text        NOT NULL,
     -- NULL once the tranche completes: there is nothing left to resume.
-    resume_cursor   TEXT,
+    resume_cursor   pg_catalog.text,
     rows_total      BIGINT      NOT NULL DEFAULT 0,
     rows_backfilled BIGINT      NOT NULL DEFAULT 0,
     blocking_count  BIGINT      NOT NULL DEFAULT 0,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at    TIMESTAMPTZ,
+    started_at      pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now(),
+    updated_at      pg_catalog.timestamptz NOT NULL DEFAULT pg_catalog.now(),
+    completed_at    pg_catalog.timestamptz,
     -- Named explicitly.  An implicit PRIMARY KEY would be called
     -- `<table>_pkey`, and the canonical reference is deliberately named
     -- differently, so the two sides would otherwise disagree about this
@@ -171,16 +248,16 @@ DECLARE
         CHECK (status <> 'COMPLETED' OR rows_backfilled = rows_total)
 )$ckbody$;
 
-    idx_completed_tmpl CONSTANT TEXT :=
+    idx_completed_tmpl CONSTANT pg_catalog.text :=
         'CREATE UNIQUE INDEX %s ON %s (tranche, contract_digest) '
         'WHERE status = ''COMPLETED''';
-    idx_tranche_tmpl CONSTANT TEXT :=
+    idx_tranche_tmpl CONSTANT pg_catalog.text :=
         'CREATE INDEX %s ON %s (tranche, started_at DESC)';
 
     -- THE comparator, likewise written once and executed twice -- tolerant on
     -- the first pass, zero-tolerance on the second.  $1 live oid, $2 reference
     -- oid, $3 whether to tolerate an owned index that is absent entirely.
-    checkpoint_diff_sql CONSTANT TEXT := $ckdiff$
+    checkpoint_diff_sql CONSTANT pg_catalog.text := $ckdiff$
 WITH targets(side, relid) AS (
     VALUES ('reference'::text, $2::oid), ('live'::text, $1::oid)
 ),
@@ -387,17 +464,16 @@ lines AS (
 SELECT pg_catalog.string_agg(line, pg_catalog.chr(10) ORDER BY line) FROM lines
 $ckdiff$;
 
-    live_oid OID;
-    ref_oid OID;
-    ref_ident TEXT;
-    live_kind "char";
-    live_persistence "char";
-    diffs TEXT;
-    privileges TEXT;
-    saved_search_path TEXT;
+    live_oid pg_catalog.oid;
+    ref_oid pg_catalog.oid;
+    ref_ident pg_catalog.text;
+    live_kind pg_catalog."char";
+    live_persistence pg_catalog."char";
+    diffs pg_catalog.text;
+    privileges pg_catalog.text;
     live_has_rows BOOLEAN;
     live_is_stamped BOOLEAN;
-    occupied TEXT;
+    occupied pg_catalog.text;
 BEGIN
     -- Ten ownership columns.
     SELECT pg_catalog.string_agg(
@@ -516,36 +592,6 @@ BEGIN
     -- instead: PRIVILEGES (ALTER DEFAULT PRIVILEGES can grant on the reference
     -- too, so a reference-versus-live comparison would be unsound) and the
     -- AUTHENTICITY OF EXISTING ROWS (no schema comparison can establish that).
-
-    -- ── The trusted resolution path, pinned BEFORE anything is created ──────
-    --
-    -- `checkpoint_body` writes `gen_random_uuid()` and `NOW()` unqualified, and
-    -- a stored default is resolved to a specific function AT CREATE TIME.  A
-    -- caller whose search_path names pg_catalog explicitly and late --
-    -- `hostile, public, pg_catalog` -- moves pg_catalog out of its implicit
-    -- first position, so an attacker-owned `gen_random_uuid()` in `hostile` is
-    -- what gets bound into the column default.
-    --
-    -- The comparison CANNOT catch this, and that is the point: the same DDL
-    -- builds both sides, so the same hostile function is bound into the
-    -- reference and into the live table, the two agree exactly, and the
-    -- migration reports success over a table whose `id` default is
-    -- attacker-controlled.  Measured consequence: a shadow returning a constant
-    -- UUID makes the second defaulted insert die on the primary key.  This is
-    -- the same blind-spot class that privileges are held to an ABSOLUTE policy
-    -- for -- anything poisoning both sides identically is invisible to a
-    -- two-sided diff, so it has to be excluded before either side is built
-    -- rather than detected afterwards.
-    --
-    -- Pinned here, ahead of the lock, and held through reference creation,
-    -- public creation, both index creations, the index repair, fingerprint
-    -- rendering and the final comparison; restored once after the last of them.
-    -- SET LOCAL is transaction-scoped rather than statement-scoped and cannot
-    -- take a parameter, so `set_config(..., true)` is used for both directions.
-    -- Every relation target below stays explicitly schema-qualified regardless:
-    -- neither the pin nor the qualification is load-bearing alone.
-    saved_search_path := pg_catalog.current_setting('search_path', true);
-    PERFORM pg_catalog.set_config('search_path', 'pg_catalog', true);
 
     -- Serialise concurrent runs.  Transaction-scoped, and it covers what the
     -- table lock cannot: when the table does not exist there is nothing to
@@ -707,12 +753,6 @@ Nothing has been changed. Drop or rename the occupant, then re-run.',
     -- friends qualify names according to search_path.
     EXECUTE checkpoint_diff_sql INTO diffs USING live_oid, ref_oid, FALSE;
 
-    -- Last consumer of the trusted path; everything after this point is either
-    -- explicitly qualified or reads no names at all.  Restored rather than left
-    -- pinned so that the rest of this migration, and anything sharing the
-    -- transaction, sees the search_path it was invoked with.
-    PERFORM pg_catalog.set_config('search_path', COALESCE(saved_search_path, ''), true);
-
     IF diffs IS NOT NULL THEN
         RAISE EXCEPTION
             'the checkpoint table does not match the contract this migration builds:
@@ -836,24 +876,24 @@ COMMENT ON COLUMN public.tenancy_backfill_checkpoints.blocking_count IS
 -- tightening it would make the schema reject valid audit history.
 
 ALTER TABLE public.archival_batches
-    ADD COLUMN IF NOT EXISTS agent_uuid UUID,
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID;
+    ADD COLUMN IF NOT EXISTS agent_uuid pg_catalog.uuid,
+    ADD COLUMN IF NOT EXISTS tenant_id  pg_catalog.uuid;
 
 ALTER TABLE public.audit_logs
-    ADD COLUMN IF NOT EXISTS agent_uuid UUID,
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID;
+    ADD COLUMN IF NOT EXISTS agent_uuid pg_catalog.uuid,
+    ADD COLUMN IF NOT EXISTS tenant_id  pg_catalog.uuid;
 
 ALTER TABLE public.entities
-    ADD COLUMN IF NOT EXISTS agent_uuid UUID,
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID;
+    ADD COLUMN IF NOT EXISTS agent_uuid pg_catalog.uuid,
+    ADD COLUMN IF NOT EXISTS tenant_id  pg_catalog.uuid;
 
 ALTER TABLE public.memory_graph
-    ADD COLUMN IF NOT EXISTS agent_uuid UUID,
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID;
+    ADD COLUMN IF NOT EXISTS agent_uuid pg_catalog.uuid,
+    ADD COLUMN IF NOT EXISTS tenant_id  pg_catalog.uuid;
 
 ALTER TABLE public.rmk_policies
-    ADD COLUMN IF NOT EXISTS agent_uuid UUID,
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID;
+    ADD COLUMN IF NOT EXISTS agent_uuid pg_catalog.uuid,
+    ADD COLUMN IF NOT EXISTS tenant_id  pg_catalog.uuid;
 
 -- ── Transitional write bridges ──────────────────────────────────────────────
 -- A database bridge trigger is chosen over exhaustive application dual-write.
@@ -871,14 +911,14 @@ ALTER TABLE public.rmk_policies
 -- Neither the pin nor the qualification is load-bearing alone.
 
 CREATE OR REPLACE FUNCTION public.fn_archival_batches_tenancy_bridge()
-RETURNS TRIGGER
+RETURNS pg_catalog.trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    resolved_uuid   UUID;
-    resolved_tenant UUID;
+    resolved_uuid   pg_catalog.uuid;
+    resolved_tenant pg_catalog.uuid;
 BEGIN
     SELECT a.id, a.tenant_id
       INTO resolved_uuid, resolved_tenant
@@ -932,14 +972,14 @@ CREATE OR REPLACE TRIGGER trg_archival_batches_tenancy_bridge
     FOR EACH ROW EXECUTE FUNCTION public.fn_archival_batches_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_entities_tenancy_bridge()
-RETURNS TRIGGER
+RETURNS pg_catalog.trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    resolved_uuid   UUID;
-    resolved_tenant UUID;
+    resolved_uuid   pg_catalog.uuid;
+    resolved_tenant pg_catalog.uuid;
 BEGIN
     SELECT a.id, a.tenant_id
       INTO resolved_uuid, resolved_tenant
@@ -993,14 +1033,14 @@ CREATE OR REPLACE TRIGGER trg_entities_tenancy_bridge
     FOR EACH ROW EXECUTE FUNCTION public.fn_entities_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_memory_graph_tenancy_bridge()
-RETURNS TRIGGER
+RETURNS pg_catalog.trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    resolved_uuid   UUID;
-    resolved_tenant UUID;
+    resolved_uuid   pg_catalog.uuid;
+    resolved_tenant pg_catalog.uuid;
 BEGIN
     SELECT a.id, a.tenant_id
       INTO resolved_uuid, resolved_tenant
@@ -1054,14 +1094,14 @@ CREATE OR REPLACE TRIGGER trg_memory_graph_tenancy_bridge
     FOR EACH ROW EXECUTE FUNCTION public.fn_memory_graph_tenancy_bridge();
 
 CREATE OR REPLACE FUNCTION public.fn_rmk_policies_tenancy_bridge()
-RETURNS TRIGGER
+RETURNS pg_catalog.trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    resolved_uuid   UUID;
-    resolved_tenant UUID;
+    resolved_uuid   pg_catalog.uuid;
+    resolved_tenant pg_catalog.uuid;
 BEGIN
     SELECT a.id, a.tenant_id
       INTO resolved_uuid, resolved_tenant
@@ -1141,14 +1181,14 @@ CREATE OR REPLACE TRIGGER trg_rmk_policies_tenancy_bridge
 --                          Refused: a contradicted audit row is not evidence of
 --                          anything.
 CREATE OR REPLACE FUNCTION public.fn_audit_logs_tenancy_bridge()
-RETURNS TRIGGER
+RETURNS pg_catalog.trigger
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    resolved_uuid   UUID;
-    resolved_tenant UUID;
+    resolved_uuid   pg_catalog.uuid;
+    resolved_tenant pg_catalog.uuid;
 BEGIN
     -- AGENTLESS_ALLOWED.
     IF NEW.agent_id IS NULL THEN
@@ -1291,3 +1331,13 @@ BEGIN
         'table: it records that this migration created this table, so that a re-run over '
         'its own work is a no-op. It is NOT evidence that the rows are authentic.');
 END $provenance_stamp$;
+
+-- ── The caller's search_path, handed back ───────────────────────────────────
+-- Everything this file creates or inspects is above this line, so the pin has
+-- nothing left to protect.  It is released HERE rather than at COMMIT because
+-- sqlx's own `INSERT INTO _sqlx_migrations` is unqualified and runs inside this
+-- transaction -- see the note at the head of this file.  Transaction-local, so
+-- a rollback still discards it.
+SELECT pg_catalog.set_config('search_path',
+                             pg_catalog.current_setting('aeon.saved_search_path'),
+                             true);

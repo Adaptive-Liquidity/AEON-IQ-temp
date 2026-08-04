@@ -4262,6 +4262,292 @@ async fn a_shadow_schema_cannot_capture_the_prepare_migrations_ddl(pool: PgPool)
     assert_eq!(owned, 10, "all ten ownership columns must land in public");
 }
 
+/// One hostile schema, every capture this file knows about, all at once.
+///
+/// The comprehensive fixture for the whole search_path class. Earlier rounds
+/// fixed captures one at a time, and each fix was followed by a reviewer finding
+/// the next unqualified identifier: `gen_random_uuid`/`now` in the checkpoint
+/// DEFAULTs (round 8), then `uuid` on the ten ownership columns and `trigger` on
+/// the five bridge return types (round 9). Enumerating capture sites one per
+/// round has the same non-termination problem the checkpoint comparator was
+/// rewritten to escape, so this plants every shadow together and asserts the
+/// outcome for every object 0032 creates.
+///
+/// Both confirmed findings are covered as end states rather than as symptoms:
+///
+/// * `CREATE DOMAIN hostile.uuid AS pg_catalog.uuid CHECK (VALUE IS NULL)`
+///   captured all ten `ADD COLUMN ... UUID` declarations. The nullable ADDs
+///   succeed and 0032 applies CLEAN, so nothing fails until the first real
+///   ownership assignment -- which is why this checks the catalog type AND
+///   drives a real write through every bridge.
+/// * `CREATE DOMAIN hostile.trigger` captured `RETURNS TRIGGER`, so the function
+///   was created returning the wrong type and `CREATE TRIGGER` refused it with
+///   "must return type trigger".
+///
+/// `typtype` is asserted, not just the type name: a domain over `pg_catalog.uuid`
+/// is still *called* uuid and still holds uuids. `d` versus `b` is the whole
+/// difference, and a name-only comparison would pass over the exact defect.
+#[sqlx::test(migrations = "./migrations")]
+async fn a_hostile_schema_cannot_capture_any_of_migration_0032(pool: PgPool) {
+    unwind_to_pre_prepare(&pool).await;
+
+    let mut conn = pool.acquire().await.unwrap();
+
+    // `pg_catalog` named EXPLICITLY and LAST -- the demotion is the attack.
+    sqlx::raw_sql(
+        "DROP TABLE public.tenancy_backfill_checkpoints; \
+         CREATE SCHEMA hostile; \
+         CREATE DOMAIN hostile.uuid AS pg_catalog.uuid CHECK (VALUE IS NULL); \
+         CREATE DOMAIN hostile.trigger AS pg_catalog.int4; \
+         CREATE DOMAIN hostile.text AS pg_catalog.text; \
+         CREATE DOMAIN hostile.timestamptz AS pg_catalog.timestamptz; \
+         CREATE FUNCTION hostile.gen_random_uuid() RETURNS pg_catalog.uuid \
+             LANGUAGE sql IMMUTABLE AS $f$ \
+                 SELECT '11111111-1111-4111-8111-111111111111'::pg_catalog.uuid $f$; \
+         CREATE FUNCTION hostile.now() RETURNS pg_catalog.timestamptz \
+             LANGUAGE sql STABLE AS $f$ \
+                 SELECT '2000-01-01T00:00:00Z'::pg_catalog.timestamptz $f$; \
+         SET search_path = hostile, public, pg_catalog",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    // POTENCY CONTROL. Every assertion below is about a capture NOT happening,
+    // so the fixture has to be shown capable of capturing first -- otherwise a
+    // typo in the schema name would make this whole test vacuously green.
+    sqlx::raw_sql(
+        "CREATE TABLE public.zz_control (u UUID, t TEXT, ts TIMESTAMPTZ, \
+             d UUID DEFAULT gen_random_uuid()); \
+         CREATE FUNCTION public.zz_control_fn() RETURNS TRIGGER \
+             LANGUAGE plpgsql AS $b$ BEGIN RETURN NEW; END $b$",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let (captured_cols, captured_ret): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM pg_catalog.pg_attribute a \
+                   JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid \
+                   JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace \
+                  WHERE a.attrelid = 'public.zz_control'::regclass AND a.attnum > 0 \
+                    AND n.nspname = 'hostile'), \
+                (SELECT count(*) FROM pg_catalog.pg_proc p \
+                   JOIN pg_catalog.pg_type ty ON ty.oid = p.prorettype \
+                   JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace \
+                  WHERE p.proname = 'zz_control_fn' AND n.nspname = 'hostile')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        (captured_cols, captured_ret),
+        (4, 1),
+        "the fixture must actually capture unqualified DDL, or this test proves \
+         nothing: {captured_cols} columns and {captured_ret} return types captured"
+    );
+    sqlx::raw_sql("DROP TABLE public.zz_control; DROP FUNCTION public.zz_control_fn()")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+    // Explicit transaction so the `ON COMMIT DROP` canonical reference is still
+    // alive to be inspected alongside the live table.
+    sqlx::raw_sql("BEGIN").execute(&mut *conn).await.unwrap();
+    sqlx::raw_sql(PREPARE_UP_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("0032 must apply under a hostile search_path, and must not be captured");
+
+    // 1. ALL TEN OWNERSHIP COLUMNS are exactly pg_catalog.uuid, base type.
+    let cols: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text, n.nspname::text, ty.typtype::text \
+           FROM pg_catalog.pg_attribute a \
+           JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+           JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace \
+          WHERE c.relnamespace = 'public'::regnamespace \
+            AND c.relname IN ('archival_batches', 'audit_logs', 'entities', \
+                              'memory_graph', 'rmk_policies') \
+            AND a.attname IN ('agent_uuid', 'tenant_id') \
+            AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY c.relname, a.attname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        cols.len(),
+        10,
+        "all ten ownership columns must exist: {cols:?}"
+    );
+    for (table, column, schema, typtype) in &cols {
+        assert_eq!(
+            (schema.as_str(), typtype.as_str()),
+            ("pg_catalog", "b"),
+            "public.{table}.{column} must be the pg_catalog.uuid BASE type, not a \
+             domain wearing the name: schema={schema} typtype={typtype}"
+        );
+    }
+
+    // 2. ALL FIVE BRIDGE FUNCTIONS return exactly pg_catalog.trigger.
+    let rets: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT p.proname::text, n.nspname::text, ty.typname::text, ty.typtype::text \
+           FROM pg_catalog.pg_proc p \
+           JOIN pg_catalog.pg_type ty ON ty.oid = p.prorettype \
+           JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace \
+          WHERE p.pronamespace = 'public'::regnamespace \
+            AND p.proname LIKE 'fn\\_%\\_tenancy\\_bridge' \
+          ORDER BY p.proname",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        rets.len(),
+        5,
+        "all five bridge functions must exist: {rets:?}"
+    );
+    for (name, schema, typname, typtype) in &rets {
+        assert_eq!(
+            (schema.as_str(), typname.as_str(), typtype.as_str()),
+            ("pg_catalog", "trigger", "p"),
+            "public.{name}() must return pg_catalog.trigger: {schema}.{typname} ({typtype})"
+        );
+    }
+
+    // 3. CHECKPOINT DEFAULTS bind to the intended catalog functions, and the
+    //    canonical reference is held to the same standard as the live table.
+    let temp_reference: String = sqlx::query_scalar(
+        "SELECT pg_catalog.quote_ident(pg_catalog.pg_my_temp_schema()::regnamespace::text) \
+             || '.tenancy_backfill_checkpoints_reference'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    for target in [
+        "public.tenancy_backfill_checkpoints",
+        temp_reference.as_str(),
+    ] {
+        let bindings: Vec<(String, String)> = sqlx::query_as(DEFAULT_BINDINGS_SQL)
+            .bind(target)
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            bindings.iter().all(|(_, schema)| schema == "pg_catalog"),
+            "{target} must bind every default in pg_catalog: {bindings:?}"
+        );
+        for column in ["id", "started_at", "updated_at"] {
+            assert!(
+                bindings.iter().any(|(c, _)| c == column),
+                "{target}.{column} must still carry a function-backed default: {bindings:?}"
+            );
+        }
+    }
+
+    // ...and the checkpoint table's own columns escaped the text/timestamptz
+    // shadows too. Those two are planted WITHOUT a CHECK, deliberately: a
+    // `CHECK (VALUE IS NULL)` on `text` breaks CREATE FUNCTION itself, because
+    // the function body literal is coerced to `text` through the same
+    // search_path -- too blunt to isolate what is being tested here. A bare
+    // domain still captures, and `typtype` still shows it.
+    let ck_foreign: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_catalog.pg_attribute a \
+           JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid \
+           JOIN pg_catalog.pg_namespace n ON n.oid = ty.typnamespace \
+          WHERE a.attrelid = 'public.tenancy_backfill_checkpoints'::regclass \
+            AND a.attnum > 0 AND n.nspname <> 'pg_catalog'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        ck_foreign, 0,
+        "no checkpoint column may resolve outside pg_catalog"
+    );
+
+    sqlx::raw_sql("COMMIT").execute(&mut *conn).await.unwrap();
+
+    // 4. NORMAL MAPPED WRITES still succeed through EVERY bridge. This is what
+    //    the uuid-domain capture actually broke: the migration applied clean and
+    //    only the first real ownership assignment failed.
+    sqlx::raw_sql(
+        "INSERT INTO public.agents (agent_id, tenant_id, external_agent_id) \
+         VALUES ('hostile-probe', \
+                 '33333333-3333-4333-8333-333333333333'::pg_catalog.uuid, \
+                 'ext-hostile-probe')",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+
+    for (table, insert) in AGENT_BRIDGE_TABLES {
+        sqlx::query(*insert)
+            .bind("hostile-probe")
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("the {table} bridge must still map an insert: {e}"));
+
+        let (agent_uuid, tenant): (Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "SELECT agent_uuid, tenant_id FROM public.{table} \
+                  WHERE agent_id = 'hostile-probe'"
+            )))
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(
+            agent_uuid.is_some() && tenant.is_some(),
+            "the {table} bridge must have assigned real ownership, not NULL"
+        );
+
+        // An UPDATE re-fires the bridge and re-assigns, which is the second half
+        // of what a CHECK (VALUE IS NULL) domain would refuse.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE public.{table} SET agent_id = 'hostile-probe' \
+              WHERE agent_id = 'hostile-probe'"
+        )))
+        .execute(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("the {table} bridge must still map an update: {e}"));
+    }
+
+    // audit_logs carries no agent_id foreign key and is exercised separately.
+    sqlx::raw_sql(
+        "INSERT INTO public.audit_logs (agent_id, event_type) \
+         VALUES ('hostile-probe', 'resolved'); \
+         UPDATE public.audit_logs SET event_type = 'resolved' \
+          WHERE agent_id = 'hostile-probe'",
+    )
+    .execute(&mut *conn)
+    .await
+    .expect("the audit_logs bridge must still map an insert and an update");
+
+    let (au, at): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT agent_uuid, tenant_id FROM public.audit_logs \
+          WHERE agent_id = 'hostile-probe'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap();
+    assert!(
+        au.is_some() && at.is_some(),
+        "the audit_logs bridge must have assigned real ownership"
+    );
+
+    // 5. The caller's path is handed back rather than left pinned to pg_catalog
+    //    -- which is what lets sqlx's own unqualified `_sqlx_migrations`
+    //    bookkeeping run in this same transaction.
+    let path: String = sqlx::query_scalar("SHOW search_path")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        path, "hostile, public, pg_catalog",
+        "0032 must hand back the caller's search_path once it is done with it"
+    );
+}
+
 /// Every function bound into any DEFAULT of `$1`, as `(column, function schema)`.
 ///
 /// Read from `pg_attrdef.adbin` -- the stored, already-resolved expression --
