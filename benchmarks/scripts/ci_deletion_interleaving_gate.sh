@@ -61,11 +61,24 @@ if ! grep -qxF "test ${TEST} ... ok" "$LOG"; then
     exit 1
 fi
 
-# EVIDENCE 2: exactly one test ran. Guards the other direction -- a filter that
-# widened to match siblings would mean this lane is no longer serializing only
-# what it claims to, and '1 passed; 0 failed' is the only shape that is.
-if ! grep -qE "^test result: ok\. 1 passed; 0 failed;" "$LOG"; then
-    echo "::error::the serialized lane must run exactly one test and pass it." >&2
+# EVIDENCE 2: exactly one test ran, in exactly one test binary. Guards the other
+# direction -- a filter that widened to match siblings would mean this lane is no
+# longer serializing only what it claims to, and '1 passed; 0 failed' is the only
+# shape that is.
+#
+# COUNTED, not merely matched. CodeRabbit, on `6463ca0`: a presence test is
+# satisfied by the FIRST matching summary, so if `cargo test` ever produced more
+# than one test binary -- a second `[[bin]]`, a `[lib]`, an integration test
+# target -- each could report its own `1 passed; 0 failed` and this lane would
+# pass while running the test more than once, single-threaded within each binary
+# but not once overall. Not reachable in this crate today (one `[[bin]]`, no
+# `[lib]`, so one binary and one summary line), which is exactly why it would go
+# unnoticed the day a target is added.
+result_lines="$(grep -cE "^test result: ok\. 1 passed; 0 failed;" "$LOG" || true)"
+if [[ "$result_lines" -ne 1 ]]; then
+    echo "::error::the serialized lane must run exactly one test, in exactly one" >&2
+    echo "test binary, and pass it -- found ${result_lines} matching result lines," >&2
+    echo "expected 1." >&2
     grep -E "^test result:" "$LOG" >&2 || echo "(no 'test result:' line at all)" >&2
     exit 1
 fi
